@@ -143,7 +143,7 @@ test("new-project onboarding supports product shortcuts and Excel import", async
 
 test("survey door inspection records measurements, gap, evidence, photos, and Excel fields", async () => {
   const page = await read("app/page.tsx");
-  for (const value of ["doorInspection", "thresholdCm", "meetsThreshold", "hasGap", "rationale", "至少 1.5 cm", "為什麼合格", "如何改善", "門檢查照片", "門檢查結果"]) {
+  for (const value of ["doorInspection", "thresholdCm", "meetsThreshold", "hasGap", "rationale", "至少 1.5 cm", "判斷依據（選填）", "如何改善", "門檢查照片", "門檢查結果"]) {
     assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assert.match(page, /Number\(door\.thresholdCm\) >= 1\.5/);
@@ -154,7 +154,9 @@ test("survey uses responsive launchers and one combined door workflow", async ()
   const css = await read("app/globals.css");
   for (const value of ["doorSurveyLabels", "門與門檻", "door-combined-checks", "updateDoorItem", "doorCombinedResult"])
     assert.match(page, new RegExp(value));
-  assert.match(page, /items=\{s\.items\.filter\(\(item\) => !doorSurveyLabels\.includes\(item\.label\)\)\}/);
+  assert.match(page, /const doorSurveyLabels = \["門框是否完成", "門扇是否已安裝", "廁所門框狀態"\]/);
+  assert.match(page, /surveyChecklistItems = \[[\s\S]*!doorSurveyLabels\.includes\(item\.label\)[\s\S]*item\.label !== "其他異常"[\s\S]*item\.label === "其他異常"/);
+  assert.match(page, /items=\{surveyChecklistItems\}/);
   assert.match(page, /panel form survey-tab/);
   assert.match(css, /\.survey-tab \.survey-section-grid\{grid-template-columns:repeat\(5,minmax\(0,1fr\)\)/);
   assert.match(css, /@media\(min-width:701px\) and \(max-width:1099px\)/);
@@ -191,6 +193,25 @@ test("survey includes silicone, divider, parking, staging area, and two signatur
   assert.match(page, /surveySignatures\.filter\(\(signature\) => signature\.valid\)\.length < 2/);
   assert.match(page, /survey-section-grid/);
   for (const detail of ["door", "silicone", "divider", "parking", "staging", "signatures"]) assert.match(page, new RegExp(`setSurveyDetail\\(\\"${detail}\\"\\)`));
+});
+
+test("divider note stays visible and optional for every needed state", async () => {
+  const page = await read("app/page.tsx");
+  const dividerModal = page.slice(page.indexOf('surveyDetail === "divider"'), page.indexOf('surveyDetail === "parking"'));
+  const conditionalStart = dividerModal.indexOf('{divider.needed === "是" && <div className="grid3">');
+  const conditionalFields = dividerModal.slice(conditionalStart, dividerModal.indexOf("</div>}", conditionalStart) + "</div>}".length);
+  const validationStart = page.indexOf("dividerInvalid =");
+  const dividerValidation = page.slice(validationStart, page.indexOf("\n", validationStart));
+
+  assert.match(page, /dividerInspection\?: \{[\s\S]*?note: string/);
+  assert.match(conditionalFields, /分隔條數量[\s\S]*分隔條位置/);
+  assert.doesNotMatch(conditionalFields, /分隔條備註/);
+  assert.match(dividerModal, /<Field label="分隔條備註（選填）" value=\{divider\.note\}/);
+  assert.match(dividerModal, /needed !== "是" \? \{ quantity: undefined, location: "" \} : \{\}/);
+  assert.doesNotMatch(dividerModal, /needed !== "是" \? \{[^}]*note/);
+  assert.match(dividerValidation, /divider\.needed === "是"[\s\S]*Number\(divider\.quantity\)[\s\S]*divider\.location\.trim\(\)/);
+  assert.doesNotMatch(dividerValidation, /divider\.note/);
+  assert.match(page, /分隔條備註: dividerInspection\?\.note \|\| ""/);
 });
 
 test("records share notes, photos, optional measurements, confirmation, reopen, and unit journals", async () => {
@@ -277,6 +298,52 @@ test("work journal Word export uses split first page and six fitted photos per p
   assert.doesNotMatch(exporter, /填寫人：|建立：|最後修改：/);
 });
 
+test("survey navigation inserts door inspection before the final other issue item", async () => {
+  const page = await read("app/page.tsx");
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  const checklist = page.slice(page.indexOf("function Checklist"), page.indexOf("function History"));
+  assert.match(survey, /onBeforeLast=\{\(\) => \{ setDoorFlowActive\(true\); setSurveyDetail\("door"\); \}\}/);
+  assert.match(survey, /resumeAtLast=\{doorFlowResume\}/);
+  assert.match(survey, /下一項：其他異常/);
+  assert.match(survey, /beforeLastItem=\{<button[\s\S]*門與門檻/);
+  assert.match(checklist, /beforeLastItem && i === items\.length - 1/);
+  assert.match(checklist, /if \(onBeforeLast && active === items\.length - 2\) onBeforeLast\(\)/);
+  assert.match(checklist, /if \(resumeAtLast > 0 && items\.length\) open\(items\.length - 1\)/);
+  assert.match(checklist, /onClick=\{\(\) => setActive\(Math\.max\(0, active - 1\)\)\}/);
+  assert.match(checklist, /else if \(active < items\.length - 1\) open\(active \+ 1\)/);
+});
+
+test("normal door inspection keeps measurement optional while defects require evidence", async () => {
+  const page = await read("app/page.tsx");
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  assert.match(survey, /doorThresholdFailed = doorMeasured && Number\(door\.thresholdCm\) < 1\.5/);
+  assert.match(survey, /doorInvalid = door\.hasGap === null \|\| \(doorResult === "不合格" && \(!door\.rationale\.trim\(\) \|\| !door\.photos\?\.length\)\)/);
+  assert.doesNotMatch(survey, /doorInvalid = !doorMeasured/);
+  assert.match(survey, /doorItemEvidenceInvalid = doorItems\.some\(\(item\) => item\.result === "不合格" && \(!item\.note\.trim\(\) \|\| !item\.photos\?\.length\)\)/);
+  assert.match(survey, /門檢查不合格時，必須說明如何改善並上傳至少 1 張照片/);
+  assert.match(survey, /thresholdCm/);
+  assert.match(survey, /doorInspection: \{ \.\.\.door, meetsThreshold:/);
+  assert.match(survey, /patch\(\{[\s\S]*surveys:/);
+});
+
+test("PhotoGrid thumbnails share one non-mutating lightbox while editing controls remain", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const grid = page.slice(page.indexOf("function ZoomablePhoto"), page.indexOf("function Field"));
+  assert.equal((grid.match(/<ZoomablePhoto photo=\{x\}/g) || []).length, 2);
+  assert.match(grid, /src=\{photo\.data\}/);
+  assert.match(grid, /className="photo-lightbox"/);
+  assert.match(grid, /onClick=\{\(\) => setOpen\(false\)\}/);
+  assert.match(grid, /aria-label="關閉放大照片"/);
+  assert.match(grid, /x\.caption|caption: e\.target\.value/);
+  assert.match(grid, /includeReport: e\.target\.checked/);
+  assert.match(grid, /set\(photos\.filter\(\(p\) => p\.id !== x\.id\)\)/);
+  assert.doesNotMatch(grid, /localStorage|indexedDB|fetch\(|compress\(/);
+  assert.match(page, /word-preview-photos[\s\S]*ZoomablePhoto key=\{photo\.id\} photo=\{photo\}/);
+  assert.match(css, /\.photo-lightbox \.photo-lightbox-image\{[^}]*max-width:[^;]+!important;[^}]*max-height:[^;]+!important;[^}]*object-fit:contain!important/);
+  assert.match(css, /\.photo-zoom-trigger\{cursor:zoom-in\}/);
+});
+
 test("storage cache failures are classified and do not block Supabase saving", async () => {
   const page = await read("app/page.tsx");
   const durability = await read("lib/storage-durability.ts");
@@ -307,6 +374,10 @@ test("unit and project journals reopen and update the same record without duplic
 
   assert.match(projectJournal, /const existing = p\.journals\.find\(\(item\) => item\.id === entry\.id\)/);
   assert.match(projectJournal, /journals: \[saved, \.\.\.p\.journals\.filter\(\(item\) => item\.id !== saved\.id\)\]/);
+  assert.match(projectJournal, /notes = \[\.\.\.p\.journals\]\.sort\(\(a, b\) => b\.date\.localeCompare\(a\.date\)\)/);
+  assert.doesNotMatch(projectJournal, /notes = p\.journals\.filter\(\(x\) => x\.date === date\)/);
+  assert.match(projectJournal, /施工紀錄日期/);
+  assert.match(projectJournal, /所有案場日誌/);
   assert.match(projectJournal, /createdAt: existing\?\.createdAt \|\| entry\.createdAt \|\| now/);
   assert.match(projectJournal, /updatedAt: now/);
   assert.match(projectJournal, /setEntry\(blank\(date\)\)/);
@@ -330,9 +401,12 @@ test("project daily acceptance view derives final history and reuses shipment wo
 
 test("checklist measurement fields require an explicit item flag", async () => {
   const page = await read("app/page.tsx");
+  const surveyInitialization = page.slice(page.indexOf("items: surveyLabels.map"), page.indexOf("photos: [],", page.indexOf("items: surveyLabels.map") + 100));
   assert.match(page, /requiresMeasurement\?: boolean/);
-  assert.match(page, /requiresMeasurement: label === "地坪平整度"/);
-  assert.match(page, /current\.requiresMeasurement === true && <div className="inspection-measure">/);
+  assert.doesNotMatch(surveyInitialization, /requiresMeasurement/);
+  assert.doesNotMatch(page, /requiresMeasurement: label === "地坪平整度"/);
+  assert.match(page, /currentRequiresMeasurement = current\?\.requiresMeasurement === true && current\.label !== "地坪平整度"/);
+  assert.match(page, /currentRequiresMeasurement && <div className="inspection-measure">/);
   assert.doesNotMatch(page, /current\.value.*&& <div className="inspection-measure">/);
   assert.doesNotMatch(page, /current\.result.*&& <div className="inspection-measure">/);
 });
