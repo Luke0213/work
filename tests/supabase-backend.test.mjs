@@ -30,7 +30,7 @@ test("monitoring, scheduled backups, and full Excel export are wired", async () 
   const monitoring = await read("lib/monitoring.ts");
   const sql = await read("supabase/migrations/202608240004_monitoring_and_schedule.sql");
   assert.match(page, /exportFullExcel/);
-  for (const sheet of ["專案","產品","戶別","場勘","施工","驗收","缺失","工作日誌","事件"]) assert.match(page, new RegExp(`add\\("${sheet}"`));
+  for (const sheet of ["專案","產品","戶別","場勘","施工","驗收","缺失","事件"]) assert.match(page, new RegExp(`add\\("${sheet}"`));
   assert.match(monitoring, /spc_system_health/);
   assert.match(monitoring, /spc_report_error/);
   assert.match(sql, /cron\.schedule/);
@@ -216,7 +216,7 @@ test("photo picker keeps separate camera and gallery inputs on one resilient han
   assert.match(page, /shouldUseEnvironmentCapture/);
   assert.match(photos, /for \(const file of selectedFiles\)/);
   assert.match(photos, /照片處理中…/);
-  assert.match(css, /\.visually-hidden-file\{position:absolute!important;width:1px!important/);
+  assert.match(css, /\.visually-hidden-file\{[^}]*position:absolute!important;[^}]*inset:0!important;[^}]*width:100%!important;[^}]*height:100%!important;[^}]*opacity:0!important;/);
   assert.doesNotMatch(css, /\.visually-hidden-file\{[^}]*display:none/);
 });
 
@@ -262,6 +262,48 @@ test("electronic acceptance excludes drafts and billing labels its CSV accuratel
   assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
 });
 
+test("work journal Word export uses split first page and six fitted photos per page", async () => {
+  const page = await read("app/page.tsx");
+  const exporter = page.slice(page.indexOf("async function buildJournalPhotoRun"), page.indexOf("function UnitJournalTab"));
+  assert.match(exporter, /columnWidths: \[4400, 4960\]/);
+  assert.match(exporter, /const PHOTO_PER_PAGE = 6/);
+  assert.match(exporter, /photos\.slice\(0, 2\)/);
+  assert.match(exporter, /photos\.slice\(2, PHOTO_PER_PAGE\)/);
+  assert.match(exporter, /index \+= PHOTO_PER_PAGE/);
+  assert.match(exporter, /photos\.slice\(index, index \+ PHOTO_PER_PAGE\)/);
+  assert.match(exporter, /Math\.min\(maxWidth \/ dimensions\.width, maxHeight \/ dimensions\.height\)/);
+  assert.match(exporter, /cantSplit: true/);
+  assert.match(exporter, /"無工作照片"/);
+  assert.doesNotMatch(exporter, /填寫人：|建立：|最後修改：/);
+});
+
+test("unit and project journals reopen and update the same record without duplicates", async () => {
+  const page = await read("app/page.tsx");
+  const unitJournal = page.slice(page.indexOf("function UnitJournalTab"), page.indexOf("function Journal("));
+  const projectJournal = page.slice(page.indexOf("function Journal("), page.indexOf("function Billing("));
+  const wordExporter = page.slice(page.indexOf("async function buildJournalPhotoRun"), page.indexOf("function UnitJournalTab"));
+
+  assert.match(unitJournal, /journals: \[record, \.\.\.u\.journals\.filter\(\(item\) => item\.id !== entry\.id\)\]/);
+  assert.match(unitJournal, /createdAt: entry\.createdAt \|\| now/);
+  assert.match(unitJournal, /updatedAt: now/);
+  assert.match(unitJournal, /createdBy: entry\.createdBy \|\|/);
+  assert.match(unitJournal, /actionLabel="查看／修改"/);
+  assert.match(unitJournal, /新增驗收日誌/);
+
+  assert.match(projectJournal, /const existing = p\.journals\.find\(\(item\) => item\.id === entry\.id\)/);
+  assert.match(projectJournal, /journals: \[saved, \.\.\.p\.journals\.filter\(\(item\) => item\.id !== saved\.id\)\]/);
+  assert.match(projectJournal, /createdAt: existing\?\.createdAt \|\| entry\.createdAt \|\| now/);
+  assert.match(projectJournal, /updatedAt: now/);
+  assert.match(projectJournal, /setEntry\(blank\(date\)\)/);
+  assert.match(projectJournal, /查看／修改/);
+  assert.match(projectJournal, /新增今日日誌/);
+  assert.match(projectJournal, /confirm\("刪除此筆當日日誌？"\)/);
+  assert.match(projectJournal, /removeOfflineDraft\(draftKey\(authUserId, "journal", p\.id\)\)/);
+
+  assert.match(wordExporter, /columnWidths: \[4400, 4960\]/);
+  assert.doesNotMatch(wordExporter, /正在修改|新增今日日誌|新增驗收日誌/);
+});
+
 test("project daily acceptance view derives final history and reuses shipment workbook", async () => {
   const page = await read("app/page.tsx");
   assert.match(page, /\["daily-acceptance", "✓", "今日驗收"\]/);
@@ -296,16 +338,44 @@ test("acceptance entry and formal sheet keep one completion mapping and three A4
     'a.completion?.boardDamaged === true',
     'printWithLifecycleCleanup("printing-completion")',
   ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const completionPrint = css.slice(css.lastIndexOf("@media print{"), css.indexOf(".area-input-row"));
   for (const value of [
     "body.printing-completion .completion-paper",
     "width:210mm",
-    "height:297mm",
     "height:87mm",
     "break-inside:avoid",
     "page-break-inside:avoid",
     ".acceptance-checklist .inspection-grid{grid-template-columns:repeat(3,minmax(0,1fr))}",
   ]) assert.match(css, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(completionPrint, /:not\([\s\S]*:has\(\.completion-report-page\)[\s\S]*\)\{display:none!important\}/);
+  assert.doesNotMatch(completionPrint, /visibility:hidden/);
+  assert.match(completionPrint, /\.completion-paper\{[\s\S]*height:auto;[\s\S]*min-height:0;[\s\S]*max-height:285mm[\s\S]*padding:6mm 8mm[\s\S]*overflow:hidden[\s\S]*box-sizing:border-box/);
+  assert.match(completionPrint, /\.completion-copy:last-child\{margin-bottom:0;padding-bottom:0/);
+  assert.match(completionPrint, /:is\(h1,span,small,th,td,b,p,label\)\{color:#000!important\}/);
+  assert.match(completionPrint, /border-color:#000!important/);
+  assert.doesNotMatch(completionPrint, /grayscale|filter:/);
   assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
+});
+
+test("completion export confirmation edits one temporary draft shared by all three copies", async () => {
+  const page = await read("app/page.tsx");
+  const report = page.slice(page.indexOf("type CompletionExportDraft"), page.indexOf("function Timeline"));
+  const css = await read("app/globals.css");
+  assert.match(report, /buildCompletionExportDraft\(project, unit, acceptance, completion\)/);
+  for (const value of ["project.name", "project.address", "unit.order", "acceptance.area", "unit.estimated", "completion.floorAbnormal", "completion.boardDamaged", "completion.trashCleared"])
+    assert.match(report, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(report, /const \[exportDraft, setExportDraft\]/);
+  assert.match(report, /\.map\(\(copy\) => <CompletionCopy key=\{copy\} copy=\{copy\} draft=\{exportDraft\} signatures=\{completion\.signatures\}/);
+  assert.match(report, /setText\("projectName"|\['projectName','案場名稱'\]/);
+  assert.match(report, /setText\("area"|\['area','坪數確認'\]/);
+  assert.match(report, /CompletionDraftBoolean label="地坪是否異常"/);
+  assert.match(report, /signatureNames/);
+  assert.match(report, /setExportDraft\(createDraft\(\)\)/);
+  assert.match(report, /printWithLifecycleCleanup\("printing-completion"\)/);
+  assert.doesNotMatch(report, /patch\(\{|patchProject|acceptances\[0\]/);
+  assert.match(css, /\.completion-report-page>:not\(\.completion-paper\)\{display:none!important\}/);
+  const billingPrint = css.slice(css.indexOf("body.printing-billing"), css.indexOf("Acceptance entry and its dedicated"));
+  assert.match(billingPrint, /body\.printing-billing/);
 });
 
 test("shipment preview exposes the company summary fields without changing other exporters", async () => {
@@ -324,6 +394,18 @@ test("tablet and phone layouts use drawers, stacked forms, and safe scrolling", 
   const css = await read("app/globals.css");
   for (const value of ["max-width:900px", "max-width:600px", "max-width:390px", "translateX(-105%)", "100dvh", "safe-area-inset-bottom", "-webkit-overflow-scrolling:touch"]) assert.match(css, new RegExp(value.replace(/[()]/g, "\\$&")));
   assert.match(css, /\.form-actions\{display:grid!important;grid-template-columns:1fr/);
+});
+
+test("final mobile unit manager override stays full-width with compact shrinkable floor rows", async () => {
+  const css = await read("app/globals.css");
+  const marker = "Final mobile unit-manager width and compact-floor override (#7/#8).";
+  const mobile = css.slice(css.indexOf(marker));
+  assert.match(mobile, /@media\(max-width:700px\)/);
+  assert.match(mobile, /\.unit-manager[\s\S]*\.unit-manager \.building-groups[\s\S]*\.unit-manager \.building-group[\s\S]*width:100%;[\s\S]*min-width:0;[\s\S]*max-width:100%/);
+  assert.match(mobile, /\.unit-manager \.floor-head\{[\s\S]*grid-template-columns:minmax\(0,1fr\);[\s\S]*min-height:46px/);
+  assert.match(mobile, /\.unit-manager \.floor-head\.bulk\{[\s\S]*grid-template-columns:28px minmax\(0,1fr\)/);
+  assert.match(mobile, /\.unit-manager \.floor-row-main\{[\s\S]*min-height:46px;[\s\S]*grid-template-columns:auto auto minmax\(0,1fr\) 18px/);
+  assert.doesNotMatch(mobile, /@media\(min-width:701px\)/);
 });
 
 test("every unfinished data-entry flow has durable drafts and notes", async () => {

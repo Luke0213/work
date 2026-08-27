@@ -328,9 +328,9 @@ const canUseSystem = (role: AppRole | null) => !!role,
   };
 const sideViews: [string, string, string][] = [
   ["dashboard", "⌂", "Dashboard"],
-  ["units", "▦", "戶別主資料"],
+  ["units", "▦", "戶名管理"],
   ["daily-acceptance", "✓", "今日驗收"],
-  ["journal", "▤", "工作日誌"],
+  ["journal", "▤", "今日日誌"],
   ["billing", "＄", "月結／計價"],
   ["project", "⚙", "專案資料"],
 ];
@@ -607,7 +607,7 @@ function exportFullExcel(projects: Project[], catalog: Product[]) {
   add("施工", projects.flatMap((p) => p.units.flatMap((u) => u.works.map(({ photos, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 照片數: photos.length })))));
   add("驗收", projects.flatMap((p) => p.units.flatMap((u) => u.acceptances.map(({ items, photos, signature, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 檢查項目: JSON.stringify(items), 簽名人: signature?.name || "" })))));
   add("缺失", projects.flatMap((p) => p.units.flatMap((u) => u.defects.map(({ before, after, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 改善前照片: before.length, 改善後照片: after.length })) )));
-  add("工作日誌", projects.flatMap((p) => p.journals.map(({ photos, ...x }) => ({ 專案: p.name, ...x, 照片數: photos.length }))));
+  add("今日日誌", projects.flatMap((p) => p.journals.map(({ photos, ...x }) => ({ 專案: p.name, ...x, 照片數: photos.length }))));
   add("事件", projects.flatMap((p) => p.units.flatMap((u) => u.events.map(({ photos, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 照片數: photos.length })) )));
   XLSX.writeFile(book, `SPC完整資料-${day()}.xlsx`, { compression: true });
 }
@@ -874,9 +874,9 @@ function LoginScreen({ initialError = "", onGuest }: { initialError?: string; on
 
 const guestFeatures = [
   ["Dashboard", "查看工程管理首頁與進度摘要的介面"],
-  ["戶別主資料", "了解戶別、產品及施工狀態的管理方式"],
+  ["戶名管理", "了解戶別、產品及施工狀態的管理方式"],
   ["場勘與驗收", "查看檢查流程、缺失追蹤及簽名功能說明"],
-  ["工作日誌", "了解每日施工紀錄與照片管理功能"],
+  ["今日日誌", "了解每日施工紀錄與照片管理功能"],
   ["月結／計價", "查看月結、計價與報表功能說明"],
   ["專案資料", "了解專案規則與產品資料庫的設定項目"],
 ];
@@ -1329,7 +1329,17 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
           >
             ☰
           </button>
-          <CompanyLogo />
+          <button
+            type="button"
+            className="brand-home-button"
+            onClick={() => {
+              setUid("");
+              setView("dashboard");
+            }}
+            aria-label="返回主頁"
+            >
+              <CompanyLogo className="home-logo" />
+          </button>
           <div>
             <b>連工帶料工程管理</b>
             <small>戶別全流程 MVP</small>
@@ -1782,9 +1792,9 @@ function ProjectArea({
         set={setView}
         items={[
           ["dashboard", "Dashboard"],
-          ["units", "戶別主資料"],
+          ["units", "戶名管理"],
           ["daily-acceptance", "今日驗收"],
-          ["journal", "工作日誌"],
+          ["journal", "今日日誌"],
           ["billing", "月結／計價"],
           ["project", "專案資料"],
         ]}
@@ -3126,7 +3136,7 @@ function ImportUnits({
       <div className="modal-card import-modal-card">
         <div className="panel-head">
           <div>
-            <p className="eyebrow">戶別主資料</p>
+            <p className="eyebrow">戶名管理</p>
             <h2>匯入 Excel</h2>
             <p>先預覽檢查，不會直接寫入既有資料。</p>
           </div>
@@ -3655,7 +3665,7 @@ function UnitDetail({
   return (
     <>
       <button className="back" onClick={back}>
-        ← 返回戶別主資料
+        ← 返回戶名管理
       </button>
       <div className="unit-head">
         <div className="unit-head-copy">
@@ -3683,7 +3693,7 @@ function UnitDetail({
             ["survey", "場勘"],
             ["work", "施工"],
             ["accept", "驗收／複驗"],
-            ["journal", "工作日誌"],
+            ["journal", "驗收日誌"],
             ["defect", "缺失改善"],
             ["timeline", "Timeline"],
             ["sheet", "電子驗收單"],
@@ -4817,42 +4827,71 @@ function DefectsTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
     </div>
   );
 }
-async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNote) {
-  const photoRuns = await Promise.all((entry.photos || []).map(async (photo) => {
-    try {
-      const response = await fetch(photo.data);
-      const data = await response.arrayBuffer();
-      const mime = response.headers.get("content-type") || (photo.data.startsWith("data:image/png") ? "image/png" : "image/jpeg");
-      const type = mime.includes("png") ? "png" : "jpg";
-      return new ImageRun({ data, type, transformation: { width: 235, height: 165 }, altText: { title: photo.caption || "工作照片", description: photo.caption || "工作日誌照片", name: "工作照片" } });
-    } catch {
-      return null;
-    }
-  }));
-  const photos = photoRuns.filter(Boolean) as ImageRun[];
-  const photoRows: TableRow[] = [];
-  for (let i = 0; i < photos.length; i += 2) {
-    photoRows.push(new TableRow({ children: [0, 1].map((offset) => new TableCell({ width: { size: 4560, type: WidthType.DXA }, margins: { top: 90, bottom: 90, left: 90, right: 90 }, children: photos[i + offset] ? [new Paragraph({ alignment: AlignmentType.CENTER, children: [photos[i + offset]] })] : [new Paragraph("")] })) }));
+async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number) {
+  try {
+    const dimensions = await new Promise<{ width: number; height: number }>((resolve) => {
+      const image = new Image();
+      image.onload = () => resolve({ width: image.naturalWidth || 4, height: image.naturalHeight || 3 });
+      image.onerror = () => resolve({ width: 4, height: 3 });
+      image.src = photo.data;
+    });
+    const scale = Math.min(maxWidth / dimensions.width, maxHeight / dimensions.height);
+    const width = Math.max(1, Math.round(dimensions.width * scale));
+    const height = Math.max(1, Math.round(dimensions.height * scale));
+    const response = await fetch(photo.data);
+    const data = await response.arrayBuffer();
+    const mime = response.headers.get("content-type") || (photo.data.startsWith("data:image/png") ? "image/png" : "image/jpeg");
+    const type = mime.includes("png") ? "png" : "jpg";
+    return new ImageRun({ data, type, transformation: { width, height }, altText: { title: photo.caption || "工作照片", description: photo.caption || "工作日誌照片", name: "工作照片" } });
+  } catch {
+    return null;
   }
-  if (!photoRows.length) photoRows.push(new TableRow({ children: [new TableCell({ columnSpan: 2, width: { size: 9120, type: WidthType.DXA }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "本筆日誌未附照片", color: "777777" })] })] })] }));
+}
+
+async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNote) {
+  const PHOTO_PER_PAGE = 6;
+  const photoRuns = await Promise.all((entry.photos || []).map((photo, index) => buildJournalPhotoRun(photo, index < 2 ? 300 : 285, index < 2 ? 170 : 190)));
+  const photos = photoRuns.filter(Boolean) as ImageRun[];
+  const photoCell = (photo: ImageRun, width = 4560) => new TableCell({ width: { size: width, type: WidthType.DXA }, margins: { top: 70, bottom: 70, left: 70, right: 70 }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [photo] })] });
+  const photoTable = (pagePhotos: ImageRun[], width = 9120) => new Table({
+    width: { size: width, type: WidthType.DXA },
+    columnWidths: [Math.floor(width / 2), Math.ceil(width / 2)],
+    rows: Array.from({ length: Math.ceil(pagePhotos.length / 2) }, (_, rowIndex) => new TableRow({
+      cantSplit: true,
+      children: pagePhotos.slice(rowIndex * 2, rowIndex * 2 + 2).map((photo) => photoCell(photo, Math.floor(width / 2))),
+    })),
+  });
+  const topPhotos = photos.slice(0, 2);
+  const firstPageLowerPhotos = photos.slice(2, PHOTO_PER_PAGE);
   const meta = [
     ["案場名稱", project.name], ["完工日期", entry.date], ["戶別", `${u.building} ${u.floor}-${u.number}`],
-    ["SPC 型號", `${u.model}${u.colorNo ? `／${u.colorNo}` : ""}`], ["坪數", `${u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪`],
+    ["SPC 型號／色號", `${u.model}${u.colorNo ? `／${u.colorNo}` : ""}`], ["坪數", `${u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪`],
+    ["工作內容", entry.content || "—"], ["備註", entry.note || "無"],
   ];
-  const doc = new Document({ sections: [{ properties: { page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } } }, children: [
-    new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 240 }, children: [new TextRun({ text: "SPC 工程工作日誌", bold: true, size: 36, font: "Microsoft JhengHei" })] }),
-    new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [2300, 7060], rows: meta.map(([label, value]) => new TableRow({ children: [new TableCell({ width: { size: 2300, type: WidthType.DXA }, margins: { top: 90, bottom: 90, left: 120, right: 120 }, children: [new Paragraph({ children: [new TextRun({ text: label, bold: true, font: "Microsoft JhengHei" })] })] }), new TableCell({ width: { size: 7060, type: WidthType.DXA }, margins: { top: 90, bottom: 90, left: 120, right: 120 }, children: [new Paragraph({ children: [new TextRun({ text: value || "—", font: "Microsoft JhengHei" })] })] })] })) }),
-    new Paragraph({ spacing: { before: 220, after: 100 }, children: [new TextRun({ text: "工作內容", bold: true, size: 26, font: "Microsoft JhengHei" })] }),
-    new Paragraph({ spacing: { after: 100 }, children: [new TextRun({ text: entry.content || "—", font: "Microsoft JhengHei" })] }),
-    new Paragraph({ spacing: { after: 180 }, children: [new TextRun({ text: `備註：${entry.note || "無"}`, font: "Microsoft JhengHei", color: "555555" })] }),
-    new Table({ width: { size: 9120, type: WidthType.DXA }, columnWidths: [4560, 4560], rows: photoRows }),
-    new Paragraph({ spacing: { before: 180 }, alignment: AlignmentType.RIGHT, children: [new TextRun({ text: `填寫人：${entry.createdBy || "—"}　建立：${entry.createdAt || "—"}　最後修改：${entry.updatedAt || entry.createdAt || "—"}`, size: 18, color: "666666", font: "Microsoft JhengHei" })] }),
-  ] }] });
+  const infoRows = meta.map(([label, value]) => new TableRow({ cantSplit: true, children: [
+    new TableCell({ width: { size: 1300, type: WidthType.DXA }, margins: { top: 75, bottom: 75, left: 90, right: 90 }, children: [new Paragraph({ children: [new TextRun({ text: label, bold: true, size: 19, font: "Microsoft JhengHei" })] })] }),
+    new TableCell({ width: { size: 3100, type: WidthType.DXA }, margins: { top: 75, bottom: 75, left: 90, right: 90 }, children: [new Paragraph({ children: [new TextRun({ text: value || "—", size: 19, font: "Microsoft JhengHei" })] })] }),
+  ] }));
+  const rightTopChildren = topPhotos.length
+    ? [photoTable(topPhotos, 4960)]
+    : [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "無工作照片", color: "777777", font: "Microsoft JhengHei" })] })];
+  const children: Array<Paragraph | Table> = [
+    new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 180 }, children: [new TextRun({ text: "SPC 工程工作日誌", bold: true, size: 36, font: "Microsoft JhengHei" })] }),
+    new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [4400, 4960], rows: [new TableRow({ cantSplit: true, children: [
+      new TableCell({ width: { size: 4400, type: WidthType.DXA }, margins: { top: 60, bottom: 60, left: 60, right: 80 }, children: [new Table({ width: { size: 4400, type: WidthType.DXA }, columnWidths: [1300, 3100], rows: infoRows })] }),
+      new TableCell({ width: { size: 4960, type: WidthType.DXA }, margins: { top: 40, bottom: 40, left: 80, right: 40 }, children: rightTopChildren }),
+    ] })] }),
+  ];
+  if (firstPageLowerPhotos.length) children.push(new Paragraph({ spacing: { before: 100, after: 50 }, children: [new TextRun({ text: "工作照片", bold: true, size: 22, font: "Microsoft JhengHei" })] }), photoTable(firstPageLowerPhotos));
+  for (let index = PHOTO_PER_PAGE; index < photos.length; index += PHOTO_PER_PAGE) {
+    children.push(new Paragraph({ pageBreakBefore: true, spacing: { after: 80 }, children: [new TextRun({ text: "SPC 工程工作日誌｜工作照片", bold: true, size: 26, font: "Microsoft JhengHei" })] }), photoTable(photos.slice(index, index + PHOTO_PER_PAGE)));
+  }
+  const doc = new Document({ sections: [{ properties: { page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } } }, children }] });
   const blob = await Packer.toBlob(doc);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${project.name}_${u.number}_${entry.date}_工作日誌.docx`.replace(/[\\/:*?"<>|]/g, "_");
+  link.download = `${project.name}_${u.number}_${entry.date}_驗收日誌.docx`.replace(/[\\/:*?"<>|]/g, "_");
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -4867,27 +4906,46 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
   const [saved, setSaved] = useState("");
   const [preview, setPreview] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const skipNextDraftWrite = useRef(false);
+  const editingExisting = u.journals.some((item) => item.id === entry.id);
   useOfflineDraftRestore(draftKey(authUserId, "unit-journal", u.id), setEntry);
-  useEffect(() => { writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), entry, authUserId); }, [entry, u.id, authUserId]);
+  useEffect(() => {
+    if (skipNextDraftWrite.current) { skipNextDraftWrite.current = false; return; }
+    writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), entry, authUserId);
+  }, [entry, u.id, authUserId]);
   const persist = async (draft: boolean) => {
     const { data } = await supabase.auth.getUser();
     const now = stamp();
     const record: DailyNote = { ...entry, draft, createdAt: entry.createdAt || now, updatedAt: now, createdBy: entry.createdBy || data.user?.email || "目前登入帳號" };
     patch({ journals: [record, ...u.journals.filter((item) => item.id !== entry.id)] });
+    if (!draft) skipNextDraftWrite.current = true;
     setEntry(record);
-    writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), record, authUserId);
+    if (draft) writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), record, authUserId);
+    else {
+      localStorage.removeItem(draftKey(authUserId, "unit-journal", u.id));
+      void removeOfflineDraft(draftKey(authUserId, "unit-journal", u.id));
+    }
     queueRecordChange(authUserId, "unit-journal", u.id, record, draft ? "upsert" : "complete");
-    setSaved(draft ? "✓ 工作日誌已暫存，可稍後或換裝置繼續" : "✓ 工作日誌已完成並儲存");
+    setSaved(draft ? "✓ 驗收日誌已暫存，可稍後或換裝置繼續" : editingExisting ? "✓ 既有驗收日誌已更新" : "✓ 驗收日誌已完成並儲存");
+  };
+  const startNew = () => {
+    const next = blank();
+    setEntry(next);
+    setSaved("");
+    localStorage.removeItem(draftKey(authUserId, "unit-journal", u.id));
+    void removeOfflineDraft(draftKey(authUserId, "unit-journal", u.id));
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
   return <div className="panel form">
-    <div className="panel-head"><div><h2>戶別工作日誌</h2><p>流程：新增 → 暫存 → 查看 → 修改 → 完成；照片可產生 Word 報告。</p></div></div>
+    <div className="panel-head"><div><h2>驗收日誌</h2><p>流程：新增 → 暫存 → 查看 → 修改 → 完成；照片可產生 Word 報告。</p></div>{editingExisting && <button className="ghost" type="button" onClick={startNew}>新增驗收日誌</button>}</div>
+    {editingExisting && <div className="warning">正在修改 {entry.date} 的既有驗收日誌；儲存會更新原紀錄。</div>}
     <div className="grid3"><Field label="日期／完工日期" type="date" value={entry.date} set={(date) => setEntry({ ...entry, date })} /><Field label="工作內容" value={entry.content} set={(content) => setEntry({ ...entry, content })} /><Field label="後續待處理" value={entry.pending} set={(pending) => setEntry({ ...entry, pending })} /><Field label="備註" value={entry.note} set={(note) => setEntry({ ...entry, note })} /></div>
     <Photos node="戶別工作日誌" label="工作照片" photos={entry.photos} set={(photos) => setEntry({ ...entry, photos })} />
     <div className="save-success">✓ 輸入內容會先保存在本機；按「暫存」後同步至資料庫</div>
     <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => setPreview(true)}>預覽／產生 Word</button></div>
     {saved && <div className="save-success">{saved}</div>}
     {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span></div><div className="word-preview-photos">{entry.photos.slice(0, 6).map((photo) => <img key={photo.id} src={photo.data} alt={photo.caption || "工作照片"} />)}</div><p><b>工作內容：</b>{entry.content}</p><p><b>備註：</b>{entry.note || "無"}</p></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); await downloadWorkJournalDocx(project, u, entry); setDownloading(false); }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
-    <History title="工作日誌紀錄" rows={u.journals.map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有工作日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
+    <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={u.journals.map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
   </div>;
 }
 
@@ -4899,48 +4957,69 @@ function Journal({
   patch: (x: Partial<Project>) => void;
 }) {
   const authUserId = useAuthOwner();
-  const blank = () => ({
+  const blank = (dateValue = day()): DailyNote => ({
       id: id(),
-      date: day(),
+      date: dateValue,
       content: "",
       pending: "",
       note: "",
       photos: [] as Photo[],
       createdAt: "",
+      updatedAt: "",
+      createdBy: "",
+      draft: true,
     }),
     [date, setDate] = useState(day()),
     [entry, setEntry] = useState<DailyNote>(() =>
       readDraft(draftKey(authUserId, "journal", p.id), blank()),
     ),
+    [savedMessage, setSavedMessage] = useState(""),
     rows = p.units.flatMap((u) =>
       u.works.filter((w) => w.date === date).map((w) => ({ u, w })),
     ),
     notes = p.journals.filter((x) => x.date === date);
+  const skipNextDraftWrite = useRef(false);
   useOfflineDraftRestore(draftKey(authUserId, "journal", p.id), setEntry);
-  const hasDraft =
+  const editingExisting = p.journals.some((item) => item.id === entry.id),
+    hasDraft =
     !!entry.content.trim() ||
     !!entry.pending.trim() ||
     !!entry.note.trim() ||
     entry.photos.length > 0;
   useEffect(() => {
     const key = draftKey(authUserId, "journal", p.id);
+    if (skipNextDraftWrite.current) { skipNextDraftWrite.current = false; return; }
     if (hasDraft) writeLocalDraft(key, entry, authUserId);
     else localStorage.removeItem(key);
   }, [entry, hasDraft, p.id]);
-  const save = () => {
+  const save = async () => {
     if (!hasDraft) return;
-    const saved = {
+    const existing = p.journals.find((item) => item.id === entry.id);
+    const { data } = await supabase.auth.getUser();
+    const now = stamp();
+    const saved: DailyNote = {
       ...entry,
+      draft: false,
       content: entry.content.trim() || "未填寫",
-      createdAt: stamp(),
+      createdAt: existing?.createdAt || entry.createdAt || now,
+      createdBy: existing?.createdBy || entry.createdBy || data.user?.email || "目前登入帳號",
+      updatedAt: now,
     };
-    patch({ journals: [saved, ...p.journals] });
+    patch({ journals: [saved, ...p.journals.filter((item) => item.id !== saved.id)] });
     queueRecordChange(authUserId, "journal", p.id, saved, "complete");
     setDate(entry.date);
-    const next = blank();
-    setEntry(next);
+    skipNextDraftWrite.current = true;
+    setEntry(saved);
+    setSavedMessage(existing ? "✓ 既有今日日誌已更新" : "✓ 今日日誌已建立");
     localStorage.removeItem(draftKey(authUserId, "journal", p.id));
     void removeOfflineDraft(draftKey(authUserId, "journal", p.id));
+  };
+  const startNew = () => {
+    setEntry(blank(date));
+    setSavedMessage("");
+    localStorage.removeItem(draftKey(authUserId, "journal", p.id));
+    void removeOfflineDraft(draftKey(authUserId, "journal", p.id));
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
   return (
     <div className="form">
@@ -4951,7 +5030,9 @@ function Journal({
             <h2>今日補充說明</h2>
             <p>補充全案事項或額外照片。</p>
           </div>
+          {editingExisting && <button className="ghost" type="button" onClick={startNew}>新增今日日誌</button>}
         </div>
+        {editingExisting && <div className="warning">正在修改 {entry.date} 的既有紀錄；儲存會更新原紀錄。</div>}
         <div className="grid3">
           <Field
             label="日期"
@@ -4995,10 +5076,11 @@ function Journal({
         <button
           className="primary save-journal"
           disabled={!hasDraft}
-          onClick={save}
+          onClick={() => void save()}
         >
-          儲存當日日誌
+          {editingExisting ? "儲存修改" : "儲存當日日誌"}
         </button>
+        {savedMessage && <div className="save-success">{savedMessage}</div>}
       </section>
       <section className="panel form">
         <div className="panel-head">
@@ -5020,15 +5102,18 @@ function Journal({
                 <b>{x.date}｜當日日誌</b>
                 <small>{x.createdAt}</small>
               </div>
-              <button
-                className="danger"
-                onClick={() =>
-                  confirm("刪除此筆當日日誌？") &&
-                  patch({ journals: p.journals.filter((n) => n.id !== x.id) })
-                }
-              >
-                刪除
-              </button>
+              <div className="actions">
+                <button className="ghost" type="button" onClick={() => { setEntry(x); setDate(x.date); setSavedMessage(`正在修改 ${x.date} 的既有紀錄`); window.scrollTo({ top: 0, behavior: "smooth" }); }}>查看／修改</button>
+                <button
+                  className="danger"
+                  onClick={() =>
+                    confirm("刪除此筆當日日誌？") &&
+                    patch({ journals: p.journals.filter((n) => n.id !== x.id) })
+                  }
+                >
+                  刪除
+                </button>
+              </div>
             </div>
             <p>{x.content}</p>
             {x.pending && (
@@ -5249,48 +5334,99 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
     </div>
   );
 }
-function Sheet({ project, u }: { project: Project; u: Unit }) {
-  const a = getLatestFinalAcceptance(u),
-    completion = a ? completionDefaults(a, u) : null;
-  if (!a || !completion) return <div className="panel empty"><h2>尚無正式驗收資料</h2><p>目前尚無正式驗收紀錄，完成驗收後即可產生電子驗收單。</p></div>;
-  return (
-    <div className="completion-report-page">
-      <div className="panel completion-report-toolbar">
-        <div>
-          <p className="eyebrow">A4 三聯式文件</p>
-          <h2>每日完工驗收表</h2>
-          <p className="muted">資料、勾選結果與簽名會自動複製到三聯。</p>
-        </div>
-        <button className="primary" onClick={() => printWithLifecycleCleanup("printing-completion")}>匯出／列印 PDF</button>
-      </div>
-      <div className="completion-paper">
-        {(["第一聯：客戶存根聯", "第二聯：公司收執聯", "第三聯：廠商收執聯"] as const).map((copy) => (
-          <CompletionCopy key={copy} copy={copy} project={project} unit={u} acceptance={a} completion={completion} />
-        ))}
-      </div>
-    </div>
-  );
+type CompletionExportDraft = {
+  department: string; officePerson: string; projectName: string; projectAddress: string;
+  order: string; constructionDate: string; highlights: string; area: string; unitDisplay: string;
+  floorAbnormal: boolean | null; abnormalUnit: string; boardDamaged: boolean | null;
+  damagedMaterialType: string; trashCleared: boolean | null; materialModel: string;
+  signatureNames: Record<"installer" | "office" | "siteManager" | "supervisor", string>;
+};
+
+function buildCompletionExportDraft(project: Project, unit: Unit, acceptance: Acceptance, completion: NonNullable<Acceptance["completion"]>): CompletionExportDraft {
+  const constructionDate = unit.works.map((work) => work.date).filter(Boolean).join("、") || acceptance.date;
+  return {
+    department: completion.department,
+    officePerson: completion.officePerson || acceptance.person,
+    projectName: project.name,
+    projectAddress: project.address,
+    order: unit.order,
+    constructionDate,
+    highlights: completion.floorLevel || "",
+    area: String(acceptance.area || unit.estimated || ""),
+    unitDisplay: `${unit.building}${unit.floor}${unit.number}`,
+    floorAbnormal: completion.floorAbnormal,
+    abnormalUnit: completion.abnormalUnit,
+    boardDamaged: completion.boardDamaged,
+    damagedMaterialType: completion.damagedMaterialType,
+    trashCleared: completion.trashCleared,
+    materialModel: completion.materialModel || unit.model,
+    signatureNames: {
+      installer: completion.signatures.installer?.name || "",
+      office: completion.signatures.office?.name || "",
+      siteManager: completion.signatures.siteManager?.name || "",
+      supervisor: completion.signatures.supervisor?.name || "",
+    },
+  };
 }
 
-function CompletionCopy({ copy, project, unit, acceptance, completion }: { copy: string; project: Project; unit: Unit; acceptance: Acceptance; completion: NonNullable<Acceptance["completion"]> }) {
+function Sheet({ project, u }: { project: Project; u: Unit }) {
+  const a = getLatestFinalAcceptance(u);
+  if (!a) return <div className="panel empty"><h2>尚無正式驗收資料</h2><p>目前尚無正式驗收紀錄，完成驗收後即可產生電子驗收單。</p></div>;
+  return <CompletionReport project={project} unit={u} acceptance={a} completion={completionDefaults(a, u)} />;
+}
+
+function CompletionReport({ project, unit, acceptance, completion }: { project: Project; unit: Unit; acceptance: Acceptance; completion: NonNullable<Acceptance["completion"]> }) {
+  const createDraft = () => buildCompletionExportDraft(project, unit, acceptance, completion);
+  const [exportDraft, setExportDraft] = useState<CompletionExportDraft>(createDraft);
+  const [stage, setStage] = useState<"preview" | "edit" | "confirm">("preview");
+  const setText = (key: keyof CompletionExportDraft, value: string) => setExportDraft((current) => ({ ...current, [key]: value }));
+  const setBoolean = (key: "floorAbnormal" | "boardDamaged" | "trashCleared", value: boolean | null) => setExportDraft((current) => ({ ...current, [key]: value }));
+  const signatureLabels = { installer: "施工人員", office: "工務人員", siteManager: "工地主任", supervisor: "神銀主管" } as const;
+  return <div className="completion-report-page">
+    <div className="panel completion-report-toolbar">
+      <div><p className="eyebrow">A4 三聯式文件</p><h2>每日完工驗收表</h2><p className="muted">三聯共用同一份匯出資料；文件修改不會寫回原始資料。</p></div>
+      {stage === "preview" && <button className="primary" onClick={() => setStage("edit")}>編輯／確認驗收單</button>}
+    </div>
+    {stage === "edit" && <section className="panel form completion-export-editor">
+      <div className="panel-head"><div><h2>編輯／確認驗收單</h2><p>所有修改只套用本次三聯匯出。</p></div><button className="ghost" type="button" onClick={() => setExportDraft(createDraft())}>還原自動資料</button></div>
+      <div className="grid3">
+        {([['department','部門別'],['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={exportDraft[key]} set={(value) => setText(key, value)} />)}
+        <CompletionDraftBoolean label="地坪是否異常" value={exportDraft.floorAbnormal} set={(value) => setBoolean("floorAbnormal", value)} />
+        <CompletionDraftBoolean label="現場板材是否損壞" value={exportDraft.boardDamaged} set={(value) => setBoolean("boardDamaged", value)} />
+        <CompletionDraftBoolean label="現場垃圾是否清運完畢" value={exportDraft.trashCleared} set={(value) => setBoolean("trashCleared", value)} />
+        {(Object.keys(signatureLabels) as Array<keyof typeof signatureLabels>).map((key) => <Field key={key} label={`${signatureLabels[key]}簽名人姓名`} value={exportDraft.signatureNames[key]} set={(value) => setExportDraft((current) => ({ ...current, signatureNames: { ...current.signatureNames, [key]: value } }))} />)}
+      </div>
+      <div className="form-actions"><button className="ghost" onClick={() => setStage("preview")}>取消</button><button className="primary" onClick={() => setStage("confirm")}>確認資料</button></div>
+    </section>}
+    {stage === "confirm" && <div className="panel completion-export-confirm"><div><h2>確認匯出</h2><p>請核對下方三聯內容；確認後才會開啟列印。</p></div><div className="actions"><button className="ghost" onClick={() => setStage("edit")}>返回修改</button><button className="primary" onClick={() => printWithLifecycleCleanup("printing-completion")}>確認匯出</button></div></div>}
+    <div className="completion-paper">
+      {(["第一聯：客戶存根聯", "第二聯：公司收執聯", "第三聯：廠商收執聯"] as const).map((copy) => <CompletionCopy key={copy} copy={copy} draft={exportDraft} signatures={completion.signatures} />)}
+    </div>
+  </div>;
+}
+
+function CompletionDraftBoolean({ label, value, set }: { label: string; value: boolean | null; set: (value: boolean | null) => void }) {
+  return <label className="field"><span>{label}</span><select value={value === null ? "" : value ? "yes" : "no"} onChange={(event) => set(event.target.value === "" ? null : event.target.value === "yes")}><option value="">未勾選</option><option value="yes">是</option><option value="no">否</option></select></label>;
+}
+
+function CompletionCopy({ copy, draft, signatures }: { copy: string; draft: CompletionExportDraft; signatures: NonNullable<Acceptance["completion"]>["signatures"] }) {
   const yn = (value: boolean | null) => value === true ? "☑ 是　☐ 否" : value === false ? "☐ 是　☑ 否" : "☐ 是　☐ 否";
-  const constructionDate = unit.works.map((work) => work.date).filter(Boolean).join("、") || acceptance.date;
-  const signatures = completion.signatures;
   return (
     <section className="completion-copy">
       <div className="completion-title"><div className="completion-logo"><CompanyLogo /></div><h1>每日完工驗收表</h1><span>{copy}</span></div>
       <table><tbody>
-        <tr><th>部門別</th><td>{completion.department}</td><th>工務人員</th><td>{completion.officePerson || acceptance.person}</td><th>案場名稱</th><td>{project.name}</td><th>案場地址</th><td>{project.address}</td></tr>
+        <tr className="completion-basic-labels"><th colSpan={2}>部門別</th><th colSpan={2}>工務人員</th><th colSpan={2}>案場名稱</th><th colSpan={2}>案場地址</th></tr>
+        <tr className="completion-basic-values"><td colSpan={2}>{draft.department}</td><td colSpan={2}>{draft.officePerson}</td><td colSpan={2}>{draft.projectName}</td><td colSpan={2}>{draft.projectAddress}</td></tr>
         <tr className="section-row"><th colSpan={8}>驗收前確認事項</th></tr>
-        <tr><th colSpan={2}>訂單編號</th><td colSpan={2}>{unit.order}</td><th colSpan={2}>施工日期</th><td colSpan={2}>{constructionDate}</td></tr>
-        <tr><th colSpan={2}>其他重點列示</th><td colSpan={6}>坪數確認：{acceptance.area || unit.estimated}（坪）　戶別：{unit.building}{unit.floor}{unit.number}　{completion.floorLevel}</td></tr>
-        <tr><th colSpan={2}>確認項目</th><th colSpan={2}>狀態</th><th colSpan={2}>確認項目</th><th colSpan={2}>內容</th></tr>
-        <tr><td colSpan={2}>地坪是否異常</td><td colSpan={2} className="completion-check-value">{yn(completion.floorAbnormal)}</td><td colSpan={2}>地坪異常戶別</td><td colSpan={2}>{completion.abnormalUnit}</td></tr>
-        <tr><td colSpan={2}>現場板材是否損壞</td><td colSpan={2} className="completion-check-value">{yn(completion.boardDamaged)}</td><td colSpan={2}>損壞板材種類</td><td colSpan={2}>{completion.damagedMaterialType}</td></tr>
-        <tr><td colSpan={2}>現場垃圾是否清運完畢</td><td colSpan={2} className="completion-check-value">{yn(completion.trashCleared)}</td><td colSpan={2}>板材型號</td><td colSpan={2}>{completion.materialModel || unit.model}</td></tr>
+        <tr className="completion-precheck-labels"><th colSpan={2}>訂單編號</th><th colSpan={2}>施工日期</th><th colSpan={4}>其他重點列示</th></tr>
+        <tr className="completion-precheck-values"><td colSpan={2}>{draft.order}</td><td colSpan={2}>{draft.constructionDate}</td><td colSpan={4}>{draft.highlights}{draft.highlights ? "　" : ""}坪數確認：{draft.area}（坪）　戶別：{draft.unitDisplay}</td></tr>
+        <tr><th colSpan={2}>確認項目</th><th colSpan={2}>狀態</th><th colSpan={2}>確認項目</th><th colSpan={2}>狀態</th></tr>
+        <tr><td colSpan={2}>地坪是否異常</td><td colSpan={2} className="completion-check-value">{yn(draft.floorAbnormal)}</td><td colSpan={2}>地坪異常戶別</td><td colSpan={2}>{draft.abnormalUnit}</td></tr>
+        <tr><td colSpan={2}>現場板材是否損壞</td><td colSpan={2} className="completion-check-value">{yn(draft.boardDamaged)}</td><td colSpan={2}>損壞板材種類</td><td colSpan={2}>{draft.damagedMaterialType}</td></tr>
+        <tr><td colSpan={2}>現場垃圾是否清運完畢</td><td colSpan={2} className="completion-check-value">{yn(draft.trashCleared)}</td><td colSpan={2}>板材型號</td><td colSpan={2}>{draft.materialModel}</td></tr>
         <tr className="section-row"><th colSpan={8}>調查確認結果</th></tr>
         <tr>{([['installer','施工人員'],['office','工務人員'],['siteManager','工地主任'],['supervisor','神銀主管']] as const).map(([key,label]) => <th colSpan={2} key={key}>{label}簽名</th>)}</tr>
-        <tr className="signature-row">{(["installer","office","siteManager","supervisor"] as const).map((key) => <td colSpan={2} key={key}>{signatures[key]?.data && <img src={signatures[key]!.data} alt={`${key}簽名`} />}<small>{signatures[key]?.name || ""}</small></td>)}</tr>
+        <tr className="signature-row">{(["installer","office","siteManager","supervisor"] as const).map((key) => <td colSpan={2} key={key}>{signatures[key]?.data && <img src={signatures[key]!.data} alt={`${key}簽名`} />}<small>{draft.signatureNames[key]}</small></td>)}</tr>
       </tbody></table>
     </section>
   );
@@ -5530,9 +5666,11 @@ function Checklist({
 function History({
   title,
   rows,
+  actionLabel = "查看",
 }: {
   title: string;
   rows: { a: string; b: string; c: string; onOpen?: () => void }[];
+  actionLabel?: string;
 }) {
   return (
     <div>
@@ -5542,7 +5680,7 @@ function History({
           <b>{r.a}</b>
           <span>{r.b}</span>
           <span>{r.c}</span>
-          {r.onOpen && <button className="ghost" type="button" onClick={r.onOpen}>查看／修改</button>}
+          {r.onOpen && <button className="ghost" type="button" onClick={r.onOpen}>{actionLabel}</button>}
         </div>
       ))}
     </div>
