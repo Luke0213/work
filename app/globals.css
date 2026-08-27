@@ -18,6 +18,50 @@
   text-align: center;
 }
 
+/* Unit acceptance journal photos only: larger thumbnails without card chrome. */
+.unit-journal-photos .photo-records{
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:18px;
+}
+.unit-journal-photos .photo-record{
+  grid-template-columns:minmax(220px,52%) minmax(0,1fr);
+  border:0;
+  border-radius:0;
+  background:transparent;
+  overflow:visible;
+}
+.unit-journal-photos .photo-record>.photo-zoom-trigger{
+  width:100%;
+  height:220px;
+  min-height:220px;
+  border-radius:0;
+  object-fit:cover;
+}
+.unit-journal-photos .photo-record figcaption{
+  min-width:0;
+  padding:0 0 0 14px;
+}
+
+@media(max-width:900px){
+  .unit-journal-photos .photo-records{grid-template-columns:1fr}
+}
+
+@media(max-width:700px){
+  .unit-journal-photos,
+  .unit-journal-photos .photo-uploader,
+  .unit-journal-photos .photo-records,
+  .unit-journal-photos .photo-record{width:100%;max-width:100%;min-width:0}
+  .unit-journal-photos .photo-records{grid-template-columns:minmax(0,1fr);gap:16px}
+  .unit-journal-photos .photo-record{grid-template-columns:minmax(0,1fr)}
+  .unit-journal-photos .photo-record>.photo-zoom-trigger{
+    width:100%;
+    height:clamp(220px,68vw,340px);
+    min-height:0;
+    object-fit:cover;
+  }
+  .unit-journal-photos .photo-record figcaption{padding:10px 0 0}
+}
+
 .auth-card p { color: #5f6f69; line-height: 1.7; }
 .auth-card .primary { width: 100%; margin-top: 16px; }
 .auth-logo {

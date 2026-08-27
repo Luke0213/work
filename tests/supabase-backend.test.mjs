@@ -298,6 +298,23 @@ test("work journal Word export uses split first page and six fitted photos per p
   assert.doesNotMatch(exporter, /填寫人：|建立：|最後修改：/);
 });
 
+test("IndexedDB photo drafts restore through markers without overriding full local drafts", async () => {
+  const page = await read("app/page.tsx");
+  const restore = page.slice(page.indexOf("function useOfflineDraftRestore"), page.indexOf("function queueRecordChange"));
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  const durability = await read("lib/storage-durability.ts");
+
+  assert.match(restore, /loadOfflineDraft<T>\(draftStorageKey\)/);
+  assert.match(restore, /if \(!active \|\| !draft\) return/);
+  assert.match(restore, /shouldRestoreIndexedDbDraft\(local\)\) setValue\(draft\.payload\)/);
+  assert.match(durability, /if \(!localValue\) return true/);
+  assert.match(durability, /return isIndexedDbMarker\(JSON\.parse\(localValue\)\)/);
+  assert.match(durability, /catch \(error\)[\s\S]*logStorageException\("localStorage", "read", error\)[\s\S]*return true/);
+  assert.match(survey, /readDraft\(draftKey\(authUserId, "survey", u\.id\)/);
+  assert.match(survey, /useOfflineDraftRestore\(draftKey\(authUserId, "survey", u\.id\), setS\)/);
+  assert.match(survey, /writeLocalDraft\(draftKey\(authUserId, "survey", u\.id\), s, authUserId\)/);
+});
+
 test("survey navigation inserts door inspection before the final other issue item", async () => {
   const page = await read("app/page.tsx");
   const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
@@ -342,6 +359,24 @@ test("PhotoGrid thumbnails share one non-mutating lightbox while editing control
   assert.match(page, /word-preview-photos[\s\S]*ZoomablePhoto key=\{photo\.id\} photo=\{photo\}/);
   assert.match(css, /\.photo-lightbox \.photo-lightbox-image\{[^}]*max-width:[^;]+!important;[^}]*max-height:[^;]+!important;[^}]*object-fit:contain!important/);
   assert.match(css, /\.photo-zoom-trigger\{cursor:zoom-in\}/);
+});
+
+test("unit acceptance journal alone uses larger frameless responsive photos", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const unitJournal = page.slice(page.indexOf("function UnitJournalTab"), page.indexOf("function Journal"));
+  const scopedStyles = css.slice(css.indexOf("Unit acceptance journal photos only"));
+
+  assert.match(unitJournal, /<div className="unit-journal-photos"><Photos node="戶別工作日誌"/);
+  assert.match(scopedStyles, /\.unit-journal-photos \.photo-records\{[\s\S]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/);
+  assert.match(scopedStyles, /\.unit-journal-photos \.photo-record\{[\s\S]*grid-template-columns:minmax\(220px,52%\) minmax\(0,1fr\);[\s\S]*border:0;[\s\S]*border-radius:0;[\s\S]*background:transparent;[\s\S]*overflow:visible/);
+  assert.match(scopedStyles, /\.unit-journal-photos \.photo-record>\.photo-zoom-trigger\{[\s\S]*width:100%;[\s\S]*height:220px;[\s\S]*object-fit:cover/);
+  assert.match(scopedStyles, /@media\(max-width:700px\)[\s\S]*\.unit-journal-photos \.photo-records\{grid-template-columns:minmax\(0,1fr\);[\s\S]*\.unit-journal-photos \.photo-record>\.photo-zoom-trigger\{[\s\S]*width:100%;/);
+  assert.match(css, /\.photo-record\{display:grid/);
+  assert.match(page, /function PhotoGrid[\s\S]*<ZoomablePhoto photo=\{x\}/);
+  assert.match(page, /function ZoomablePhoto[\s\S]*photo-lightbox/);
+  assert.match(unitJournal, /word-preview-photos/);
+  assert.match(page, /async function downloadWorkJournalDocx/);
 });
 
 test("storage cache failures are classified and do not block Supabase saving", async () => {

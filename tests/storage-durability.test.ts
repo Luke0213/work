@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { completedOutboxEntries, syncableOutboxEntries, type OfflineOutboxEntry } from "../lib/offline-drafts.ts";
-import { containsEmbeddedPhoto, durableStorageState, isIndexedDbMarker, localDraftValue, shouldAttemptCloudSave, storageErrorDetails } from "../lib/storage-durability.ts";
+import { containsEmbeddedPhoto, durableStorageState, isIndexedDbMarker, localDraftValue, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, storageErrorDetails } from "../lib/storage-durability.ts";
 
 const entry = (status: OfflineOutboxEntry["status"]): OfflineOutboxEntry => ({
   id: status,
@@ -59,12 +59,24 @@ test("embedded photos stay out of localStorage while pending IndexedDB data is r
   const fallback = localDraftValue(pending);
   assert.equal(fallback.includes("large-payload"), false);
   assert.equal(isIndexedDbMarker(JSON.parse(fallback)), true);
+  assert.equal(shouldRestoreIndexedDbDraft(fallback), true);
+  const restored = shouldRestoreIndexedDbDraft(fallback) ? pending : null;
+  assert.equal(restored?.photos[0]?.data, "data:image/jpeg;base64,large-payload");
 });
 
 test("small text drafts retain a local compatibility fallback", () => {
   const fallback = localDraftValue({ id: "draft-2", note: "尚未同步文字" });
   assert.equal(isIndexedDbMarker(JSON.parse(fallback)), false);
+  assert.equal(shouldRestoreIndexedDbDraft(fallback), false);
   assert.match(fallback, /尚未同步文字/);
+});
+
+test("missing or malformed local draft safely falls back to IndexedDB", () => {
+  assert.equal(shouldRestoreIndexedDbDraft(""), true);
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  try { assert.equal(shouldRestoreIndexedDbDraft("{invalid-json"), true); }
+  finally { console.warn = originalWarn; }
 });
 
 test("only completed outbox records are cleaned and unsynced records remain", () => {

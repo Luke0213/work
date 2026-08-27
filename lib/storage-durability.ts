@@ -66,6 +66,15 @@ export function isIndexedDbMarker(value: unknown): boolean {
   return !!value && typeof value === "object" && (value as Record<string, unknown>)[markerKey] === true;
 }
 
+export function shouldRestoreIndexedDbDraft(localValue: string): boolean {
+  if (!localValue) return true;
+  try { return isIndexedDbMarker(JSON.parse(localValue)); }
+  catch (error) {
+    logStorageException("localStorage", "read", error);
+    return true;
+  }
+}
+
 export function durableStorageState(indexedDb: boolean, local: boolean, errors: StorageErrorDetails[] = []): {
   saved: boolean;
   fallbackOnly: boolean;

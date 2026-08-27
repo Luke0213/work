@@ -7,7 +7,7 @@ import { supabase } from "../lib/supabase";
 import { threeWayMerge } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
-import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, type StorageErrorDetails } from "../lib/storage-durability";
+import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
 import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, saveReceivableWorkbook, saveShipmentWorkbook } from "../lib/acceptance-exports";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
@@ -329,7 +329,7 @@ const canUseSystem = (role: AppRole | null) => !!role,
   };
 const sideViews: [string, string, string][] = [
   ["dashboard", "⌂", "Dashboard"],
-  ["units", "▦", "戶名管理"],
+  ["units", "▦", "戶別管理"],
   ["daily-acceptance", "✓", "今日驗收"],
   ["journal", "▤", "今日日誌"],
   ["billing", "＄", "月結／計價"],
@@ -409,7 +409,7 @@ function useOfflineDraftRestore<T>(draftStorageKey: string, setValue: (value: T)
     void loadOfflineDraft<T>(draftStorageKey).then((draft) => {
       if (!active || !draft) return;
       const local = readLocal(draftStorageKey);
-      if (!local) setValue(draft.payload);
+      if (shouldRestoreIndexedDbDraft(local)) setValue(draft.payload);
     });
     return () => { active = false; };
   }, [draftStorageKey, setValue]);
@@ -897,7 +897,7 @@ function LoginScreen({ initialError = "", onGuest }: { initialError?: string; on
 
 const guestFeatures = [
   ["Dashboard", "查看工程管理首頁與進度摘要的介面"],
-  ["戶名管理", "了解戶別、產品及施工狀態的管理方式"],
+  ["戶別管理", "了解戶別、產品及施工狀態的管理方式"],
   ["場勘與驗收", "查看檢查流程、缺失追蹤及簽名功能說明"],
   ["今日日誌", "了解每日施工紀錄與照片管理功能"],
   ["月結／計價", "查看月結、計價與報表功能說明"],
@@ -1834,7 +1834,7 @@ function ProjectArea({
         set={setView}
         items={[
           ["dashboard", "Dashboard"],
-          ["units", "戶名管理"],
+          ["units", "戶別管理"],
           ["daily-acceptance", "今日驗收"],
           ["journal", "今日日誌"],
           ["billing", "月結／計價"],
@@ -3176,7 +3176,7 @@ function ImportUnits({
       <div className="modal-card import-modal-card">
         <div className="panel-head">
           <div>
-            <p className="eyebrow">戶名管理</p>
+            <p className="eyebrow">戶別管理</p>
             <h2>匯入 Excel</h2>
             <p>先預覽檢查，不會直接寫入既有資料。</p>
           </div>
@@ -3705,7 +3705,7 @@ function UnitDetail({
   return (
     <>
       <button className="back" onClick={back}>
-        ← 返回戶名管理
+        ← 返回戶別管理
       </button>
       <div className="unit-head">
         <div className="unit-head-copy">
@@ -4987,7 +4987,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     <div className="panel-head"><div><h2>驗收日誌</h2><p>流程：新增 → 暫存 → 查看 → 修改 → 完成；照片可產生 Word 報告。</p></div>{editingExisting && <button className="ghost" type="button" onClick={startNew}>新增驗收日誌</button>}</div>
     {editingExisting && <div className="warning">正在修改 {entry.date} 的既有驗收日誌；儲存會更新原紀錄。</div>}
     <div className="grid3"><Field label="日期／完工日期" type="date" value={entry.date} set={(date) => setEntry({ ...entry, date })} /><Field label="工作內容" value={entry.content} set={(content) => setEntry({ ...entry, content })} /><Field label="後續待處理" value={entry.pending} set={(pending) => setEntry({ ...entry, pending })} /><Field label="備註" value={entry.note} set={(note) => setEntry({ ...entry, note })} /></div>
-    <Photos node="戶別工作日誌" label="工作照片" photos={entry.photos} set={(photos) => setEntry({ ...entry, photos })} />
+    <div className="unit-journal-photos"><Photos node="戶別工作日誌" label="工作照片" photos={entry.photos} set={(photos) => setEntry({ ...entry, photos })} /></div>
     <div className="save-success">✓ 輸入內容會先保存在本機；按「暫存」後同步至資料庫</div>
     <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => setPreview(true)}>預覽／產生 Word</button></div>
     {saved && <div className="save-success">{saved}</div>}
