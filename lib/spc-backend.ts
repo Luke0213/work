@@ -1,4 +1,5 @@
 import { supabase } from "./supabase";
+import { readPhotoCleanupQueue, scopedStorageKey, writePhotoCleanupQueue } from "./auth-storage";
 
 export type EntityActivity = {
   entityType: string;
@@ -148,14 +149,18 @@ export function storagePhotoPaths(value: unknown): Set<string> {
   return paths;
 }
 
-export async function cleanupRemovedPhotos(before: unknown, after: unknown): Promise<number> {
+export async function cleanupRemovedPhotos(before: unknown, after: unknown, authenticatedUserId: string): Promise<number> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.user || session.user.id !== authenticatedUserId) throw new Error("SPC_PHOTO_QUEUE_OWNER_MISMATCH");
   const oldPaths = storagePhotoPaths(before), livePaths = storagePhotoPaths(after);
-  const queueKey = "spc-photo-cleanup-queue";
-  let pending: string[] = [];
-  try { pending = JSON.parse(localStorage.getItem(queueKey) || "[]") as string[]; } catch { pending = []; }
+  const queueKey = scopedStorageKey("spc-photo-cleanup-queue", authenticatedUserId);
+  const queue = readPhotoCleanupQueue(localStorage, authenticatedUserId);
+  const pending = queue.paths;
   const removed = [...new Set([...pending, ...[...oldPaths].filter((path) => !livePaths.has(path))])].filter((path) => !livePaths.has(path));
-  localStorage.setItem(queueKey, JSON.stringify(removed));
+  writePhotoCleanupQueue(localStorage, { owner: authenticatedUserId, paths: removed });
   for (let i = 0; i < removed.length; i += 100) {
+    const { data: { session: currentSession } } = await supabase.auth.getSession();
+    if (currentSession?.user.id !== authenticatedUserId) throw new Error("SPC_PHOTO_QUEUE_OWNER_MISMATCH");
     const { error } = await supabase.storage.from("spc-photos").remove(removed.slice(i, i + 100));
     if (error) throw error;
   }

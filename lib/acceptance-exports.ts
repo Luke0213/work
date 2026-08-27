@@ -21,7 +21,7 @@ export type AcceptanceExportRecord = {
   note: string;
 };
 
-type ExportUnit = {
+export type ExportUnit = {
   id: string;
   building?: string;
   floor?: string;
@@ -36,35 +36,45 @@ type ExportUnit = {
   acceptances?: Array<{ id?: string; date?: string; startedAt?: string; area?: number; note?: string; draft?: boolean }>;
 };
 
-type ExportProject = { name?: string; address?: string; contact?: string; units?: ExportUnit[] };
+export type ExportProject = { name?: string; address?: string; contact?: string; units?: ExportUnit[] };
+export type ExportAcceptance = NonNullable<ExportUnit["acceptances"]>[number];
+
+export function buildAcceptanceExportRecord(project: ExportProject, unit: ExportUnit, acceptance?: ExportAcceptance, useAcceptanceDate = false): AcceptanceExportRecord {
+  const workArea = (unit.works || []).reduce((sum, work) => sum + Number(work.area || 0), 0);
+  const areaPing = Number(acceptance?.area || workArea || unit.estimated || 0);
+  const workDate = (unit.works || []).map((work) => work.date || "").filter(Boolean).sort().at(-1) || "";
+  const acceptanceDate = acceptance?.date || "";
+  return {
+    projectName: project.name || "",
+    address: project.address || "",
+    contact: project.contact || "",
+    unitId: unit.id,
+    unitDisplay: [unit.building, unit.floor, unit.number].filter(Boolean).join(" "),
+    model: unit.model || "",
+    colorNo: unit.colorNo || "",
+    vendor: unit.brand || "",
+    workDate,
+    acceptanceDate,
+    exportDate: useAcceptanceDate ? acceptanceDate : workDate || acceptanceDate,
+    areaPing,
+    areaSquareMeters: Number((areaPing * 3.305785).toFixed(2)),
+    unitPrice: Number(unit.rate || 0),
+    amount: Number((areaPing * Number(unit.rate || 0)).toFixed(0)),
+    note: acceptance?.note || unit.note || "",
+  };
+}
 
 export function buildAcceptanceExportRecords(project: ExportProject, currentUnit?: ExportUnit, currentAcceptance?: { id?: string; date?: string; startedAt?: string; area?: number; note?: string; draft?: boolean }): AcceptanceExportRecord[] {
   const units = (project.units || []).map((unit) => unit.id === currentUnit?.id ? { ...unit, acceptances: currentAcceptance ? [currentAcceptance, ...(unit.acceptances || []).filter((item) => item.id !== currentAcceptance.id)] : unit.acceptances } : unit);
   return units.flatMap((unit) => {
     const acceptance = getLatestFinalAcceptance(unit);
     if (!acceptance && !(unit.works || []).length && unit.id !== currentUnit?.id) return [];
-    const workArea = (unit.works || []).reduce((sum, work) => sum + Number(work.area || 0), 0);
-    const areaPing = Number(acceptance?.area || workArea || unit.estimated || 0);
-    const workDate = (unit.works || []).map((work) => work.date || "").filter(Boolean).sort().at(-1) || "";
-    const acceptanceDate = acceptance?.date || currentAcceptance?.date || "";
-    return [{
-      projectName: project.name || "",
-      address: project.address || "",
-      contact: project.contact || "",
-      unitId: unit.id,
-      unitDisplay: [unit.building, unit.floor, unit.number].filter(Boolean).join(" "),
-      model: unit.model || "",
-      colorNo: unit.colorNo || "",
-      vendor: unit.brand || "",
-      workDate,
-      acceptanceDate,
-      exportDate: workDate || acceptanceDate,
-      areaPing,
-      areaSquareMeters: Number((areaPing * 3.305785).toFixed(2)),
-      unitPrice: Number(unit.rate || 0),
-      amount: Number((areaPing * Number(unit.rate || 0)).toFixed(0)),
-      note: acceptance?.note || unit.note || "",
-    }];
+    const record = buildAcceptanceExportRecord(project, unit, acceptance);
+    if (!acceptance && currentAcceptance?.date) {
+      record.acceptanceDate = currentAcceptance.date;
+      record.exportDate = record.workDate || currentAcceptance.date;
+    }
+    return [record];
   }).sort((a, b) => a.exportDate.localeCompare(b.exportDate) || a.unitDisplay.localeCompare(b.unitDisplay));
 }
 

@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { AlignmentType, Document, ImageRun, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
 import { cleanupRemovedPhotos, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
@@ -7,8 +7,14 @@ import { supabase } from "../lib/supabase";
 import { threeWayMerge } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { clearOfflineOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft } from "../lib/offline-drafts";
-import { buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, saveReceivableWorkbook, saveShipmentWorkbook } from "../lib/acceptance-exports";
+import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, saveReceivableWorkbook, saveShipmentWorkbook } from "../lib/acceptance-exports";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
+import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
+import { AuthResolveGuard, resolveAuthIdentity, type AuthIdentity } from "../lib/auth-session";
+import { migrateLegacyStorageValue, scopedDraftKey, scopedStorageKey } from "../lib/auth-storage";
+import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-lifecycle";
+import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
+import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 
 type Status =
   | "待確認"
@@ -38,6 +44,7 @@ type CheckItem = {
   photos?: Photo[];
   value?: string;
   unit?: string;
+  requiresMeasurement?: boolean;
 };
 type Event = {
   id: string;
@@ -274,6 +281,22 @@ const getUnitCurrentStatus = (unit: Pick<Unit, "status">): UnitProgressStatus =>
   }
 };
 type AppRole = "admin" | "shenyin" | "client" | "crew" | "sales";
+type AuthSnapshot = AuthIdentity<AppRole>;
+const AuthOwnerContext = createContext("");
+const useAuthOwner = () => {
+  const owner = useContext(AuthOwnerContext);
+  if (!owner) throw new Error("AUTH_OWNER_REQUIRED");
+  return owner;
+};
+
+function authDebug(detail: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  console.info("[SPC auth]", {
+    timestamp: new Date().toISOString(),
+    visibility: typeof document === "undefined" ? "server" : document.visibilityState,
+    ...detail,
+  });
+}
 const roleLabels: Record<AppRole, string> = {
   admin: "管理員",
   shenyin: "神銀窗口",
@@ -306,6 +329,7 @@ const canUseSystem = (role: AppRole | null) => !!role,
 const sideViews: [string, string, string][] = [
   ["dashboard", "⌂", "Dashboard"],
   ["units", "▦", "戶別主資料"],
+  ["daily-acceptance", "✓", "今日驗收"],
   ["journal", "▤", "工作日誌"],
   ["billing", "＄", "月結／計價"],
   ["project", "⚙", "專案資料"],
@@ -339,11 +363,9 @@ const key = "spc-workflow-v2",
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
   day = () => new Date().toISOString().slice(0, 10),
   stamp = () => new Date().toLocaleString("zh-TW");
-const draftOwner = () =>
-    typeof window === "undefined" ? "anonymous" : localStorage.getItem("spc-current-user-id") || "anonymous",
-  scopedKey = (base: string) => `${base}:${draftOwner()}`;
-const draftKey = (kind: string, unitId: string) =>
-    `spc-draft-${draftOwner()}-${kind}-${unitId}`,
+const scopedKey = (base: string, owner: string) => scopedStorageKey(base, owner);
+const draftKey = (owner: string, kind: string, unitId: string) =>
+    scopedDraftKey(owner, kind, unitId),
   readLocal = (k: string) =>
     typeof window === "undefined" ? "" : localStorage.getItem(k) || "",
   readDraft = <T,>(k: string, fallback: T): T => {
@@ -354,9 +376,8 @@ const draftKey = (kind: string, unitId: string) =>
       return fallback;
     }
   },
-  writeLocalDraft = (k: string, value: unknown) => {
+  writeLocalDraft = (k: string, value: unknown, owner: string) => {
     if (typeof window === "undefined") return true;
-    const owner = draftOwner();
     const suffix = k.replace(`spc-draft-${owner}-`, "");
     const kind = suffix.split("-")[0] || "form";
     const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -380,14 +401,13 @@ function useOfflineDraftRestore<T>(draftStorageKey: string, setValue: (value: T)
     return () => { active = false; };
   }, [draftStorageKey, setValue]);
 }
-function queueRecordChange(kind: string, unitId: string, record: { id: string; [key: string]: unknown }, operation: "upsert" | "complete" = "upsert") {
-  const owner = draftOwner();
+function queueRecordChange(owner: string, kind: string, unitId: string, record: { id: string; [key: string]: unknown }, operation: "upsert" | "complete" = "upsert") {
   void queueOfflineWrite({ owner, kind, recordId: record.id, unitId, operation, baseVersion: Number((record as any).baseVersion || 0), updatedBy: owner, payload: record }).catch(() => undefined);
 }
-const readWorkspaceDraft = (): LocalWorkspaceSnapshot | null => {
+const readWorkspaceDraft = (owner: string): LocalWorkspaceSnapshot | null => {
     if (typeof window === "undefined") return null;
     try {
-      const raw = localStorage.getItem(scopedKey(workspaceDraftKey));
+      const raw = localStorage.getItem(scopedKey(workspaceDraftKey, owner));
       if (!raw) return null;
       const parsed = JSON.parse(raw) as LocalWorkspaceSnapshot;
       return Array.isArray(parsed.projects) && Array.isArray(parsed.catalog)
@@ -398,6 +418,7 @@ const readWorkspaceDraft = (): LocalWorkspaceSnapshot | null => {
     }
   },
   writeWorkspaceDraft = (
+    owner: string,
     projects: Project[],
     catalog: Product[],
     version: number,
@@ -411,11 +432,11 @@ const readWorkspaceDraft = (): LocalWorkspaceSnapshot | null => {
       projects,
       catalog,
     };
-    void saveOfflineDraft({ key: scopedKey(workspaceDraftKey), owner: draftOwner(), kind: "workspace", recordId: "workspace", unitId: "", payload: snapshot, baseVersion: version, updatedBy: draftOwner() }).catch((error) => console.warn("SPC IndexedDB workspace save failed", error));
+    void saveOfflineDraft({ key: scopedKey(workspaceDraftKey, owner), owner, kind: "workspace", recordId: "workspace", unitId: "", payload: snapshot, baseVersion: version, updatedBy: owner }).catch((error) => console.warn("SPC IndexedDB workspace save failed", error));
     try {
-      localStorage.setItem(scopedKey(workspaceDraftKey), JSON.stringify(snapshot));
-      localStorage.setItem(scopedKey(key), JSON.stringify(projects));
-      localStorage.setItem(scopedKey(productKey), JSON.stringify(catalog));
+      localStorage.setItem(scopedKey(workspaceDraftKey, owner), JSON.stringify(snapshot));
+      localStorage.setItem(scopedKey(key, owner), JSON.stringify(projects));
+      localStorage.setItem(scopedKey(productKey, owner), JSON.stringify(catalog));
       return true;
     } catch (error) {
       console.warn("SPC local draft save failed", error);
@@ -593,72 +614,117 @@ function exportFullExcel(projects: Project[], catalog: Product[]) {
 
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
-  const [email, setEmail] = useState("");
-  const [role, setRole] = useState<AppRole | null>(null);
+  const [authSnapshot, setAuthSnapshot] = useState<AuthSnapshot | null>(null);
   const [authError, setAuthError] = useState("");
   const [guestMode, setGuestMode] = useState(false);
   const [recoveryMode, setRecoveryMode] = useState(false);
   const [mustChangePassword, setMustChangePassword] = useState(false);
+  const authGuardRef = useRef(new AuthResolveGuard());
+  const authSnapshotRef = useRef<AuthSnapshot | null>(null);
+
+  useEffect(() => { authSnapshotRef.current = authSnapshot; }, [authSnapshot]);
 
   useEffect(() => {
     let active = true;
-    const resolveAccess = async () => {
-      setAuthReady(false);
-      setAuthError("");
-      const { data: { user }, error: userError } = await supabase.auth.getUser();
-      if (!active) return;
-      if (userError || !user) {
+    let retryTimer: number | undefined;
+    const resolveAccess = async (event: string, session: Awaited<ReturnType<typeof supabase.auth.getSession>>["data"]["session"]) => {
+      const generation = authGuardRef.current.begin();
+      authDebug({ event, generation, sessionUserId: session?.user.id || null, validatedUserId: null, workspaceOwner: authSnapshotRef.current?.userId || null });
+      if (!session) {
+        if (!active || !authGuardRef.current.isCurrent(generation)) return;
         localStorage.removeItem("spc-current-user-id");
-        setEmail("");
-        setRole(null);
+        authSnapshotRef.current = null;
+        setAuthSnapshot(null);
+        setMustChangePassword(false);
+        setAuthError("");
         setAuthReady(true);
         return;
       }
-      localStorage.setItem("spc-current-user-id", user.id);
-      const accountLabel = user.email?.endsWith("@phone.spc.internal")
-        ? String(user.user_metadata?.local_phone || "").replace(/^\+?8869/, "09")
-        : user.email || (user.phone?.replace(/^\+?8869/, "09")) || "";
-      setEmail(accountLabel);
-      setMustChangePassword(Boolean(user.user_metadata?.must_change_password));
-      const { data, error } = await supabase.rpc("spc_current_role");
-      if (!active) return;
-      if (error) {
-        setRole(null);
-        setAuthError("無法確認帳號權限，請聯絡系統管理員。");
-      } else {
-        const resolved = ["admin", "shenyin", "client", "crew", "sales"].includes(String(data))
-          ? (data as AppRole)
-          : "client";
-        setRole(resolved);
+
+      const previousIdentity = authSnapshotRef.current;
+      if (previousIdentity && previousIdentity.userId !== session.user.id) {
+        authSnapshotRef.current = null;
+        setAuthSnapshot(null);
+        setAuthReady(false);
+        authDebug({ event: "AUTH_USER_CHANGE_TEARDOWN", generation, sessionUserId: session.user.id, validatedUserId: null, workspaceOwner: null });
       }
-      setAuthReady(true);
+
+      const result = await resolveAuthIdentity<AppRole>({
+        generation,
+        guard: authGuardRef.current,
+        sessionUser: session.user,
+        previous: previousIdentity?.userId === session.user.id ? previousIdentity : null,
+        validateUser: async () => {
+          const { data, error } = await supabase.auth.getUser();
+          if (error || !data.user) throw error || new Error("AUTH_VALIDATION_EMPTY");
+          return data.user;
+        },
+        loadRole: async () => {
+          const { data, error } = await supabase.rpc("spc_current_role");
+          if (error) throw error;
+          return ["admin", "shenyin", "client", "crew", "sales"].includes(String(data)) ? data as AppRole : "client";
+        },
+        currentSessionUserId: async () => {
+          const { data, error } = await supabase.auth.getSession();
+          if (error) throw error;
+          return data.session?.user.id || null;
+        },
+        accountLabel: (user) => user.email?.endsWith("@phone.spc.internal")
+          ? String(user.user_metadata?.local_phone || "").replace(/^\+?8869/, "09")
+          : user.email || (user.phone?.replace(/^\+?8869/, "09")) || "",
+      });
+      if (!active || result.kind === "stale") return;
+      if (result.kind === "authenticated") {
+        authSnapshotRef.current = result.identity;
+        localStorage.setItem("spc-current-user-id", result.identity.userId);
+        setAuthSnapshot(result.identity);
+        setMustChangePassword(Boolean(session.user.user_metadata?.must_change_password));
+        setAuthError("");
+        setAuthReady(true);
+        authDebug({ event, generation, sessionUserId: session.user.id, validatedUserId: result.identity.userId, email: result.identity.email, role: result.identity.role, workspaceOwner: result.identity.userId });
+        return;
+      }
+      if (result.kind === "temporary-error") {
+        setAuthError("登入驗證暫時無法完成，系統會自動重試；目前不會將您登出。");
+        if (result.identity) setAuthReady(true);
+        authDebug({ event: `${event}:temporary-error`, generation, sessionUserId: session.user.id, validatedUserId: result.identity?.userId || null, email: result.identity?.email || null, role: result.identity?.role || null, workspaceOwner: result.identity?.userId || null });
+        retryTimer = window.setTimeout(() => void supabase.auth.getSession().then(({ data }) => resolveAccess("VALIDATION_RETRY", data.session)), 1500);
+      }
     };
-    const { data: listener } = supabase.auth.onAuthStateChange((event) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === "PASSWORD_RECOVERY") {
         setRecoveryMode(true);
         setAuthReady(true);
         return;
       }
-      window.setTimeout(() => void resolveAccess(), 0);
+      window.setTimeout(() => void resolveAccess(event, session), 0);
     });
-    void resolveAccess();
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) {
+        setAuthError("登入狀態暫時無法讀取，系統會等待瀏覽器恢復。");
+        return;
+      }
+      void resolveAccess("INITIAL_SESSION", data.session);
+    });
     return () => {
       active = false;
+      authGuardRef.current.begin();
+      if (retryTimer) window.clearTimeout(retryTimer);
       listener.subscription.unsubscribe();
     };
   }, []);
 
-  if (!authReady) return <AuthLoading />;
+  if (!authReady) return <AuthLoading message={authError} />;
   if (recoveryMode || mustChangePassword) return <PasswordRecoveryScreen forced={mustChangePassword} onDone={() => { setRecoveryMode(false); setMustChangePassword(false); }} />;
   if (guestMode) return <GuestPreview onExit={() => setGuestMode(false)} />;
-  if (!email) return <LoginScreen initialError={authError} onGuest={() => setGuestMode(true)} />;
-  if (!canUseSystem(role)) return <VisitorScreen email={email} error={authError} />;
-  const activeRole = role as AppRole;
-  return <AdminApp email={email} role={roleLabels[activeRole]} appRole={activeRole} />;
+  if (!authSnapshot) return <LoginScreen initialError={authError} onGuest={() => setGuestMode(true)} />;
+  if (!canUseSystem(authSnapshot.role)) return <VisitorScreen email={authSnapshot.email} error={authError} />;
+  return <AuthOwnerContext.Provider value={authSnapshot.userId}><AdminApp key={authSnapshot.userId} authUserId={authSnapshot.userId} email={authSnapshot.email} role={roleLabels[authSnapshot.role]} appRole={authSnapshot.role} /></AuthOwnerContext.Provider>;
 }
 
-function AuthLoading() {
-  return <main className="login-screen"><section className="login-card"><CompanyLogo className="login-mark" /><h1>正在確認登入狀態…</h1><p>請稍候，系統正在安全地確認您的帳號權限。</p></section></main>;
+function AuthLoading({ message = "" }: { message?: string }) {
+  return <main className="login-screen"><section className="login-card"><CompanyLogo className="login-mark" /><h1>正在確認登入狀態…</h1><p>{message || "請稍候，系統正在安全地確認您的帳號權限。"}</p></section></main>;
 }
 
 function CompanyLogo({ className = "" }: { className?: string }) {
@@ -872,7 +938,8 @@ function SessionChip({ email, role }: { email: string; role: string }) {
   return <div className="session-chip"><span><b>{role}</b><small>{email}</small></span><button onClick={() => void signOut()}>登出</button></div>;
 }
 
-function AdminApp({ email, role, appRole }: { email: string; role: string; appRole: AppRole }) {
+function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; email: string; role: string; appRole: AppRole }) {
+  const mountIdRef = useRef(`${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
   const canManageProjects = canManageProjectData(appRole);
   const canManageAccounts = appRole === "admin";
   const versionRef = useRef(0);
@@ -897,16 +964,24 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
     [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine),
     [showQuickStart, setShowQuickStart] = useState(false),
     [conflictPaths, setConflictPaths] = useState<string[]>([]);
-  useEffect(() => { setShowQuickStart(localStorage.getItem(scopedKey("spc-quick-start-seen")) !== "1"); }, []);
+  useEffect(() => {
+    for (const legacyKey of ["spc-last-survey-person", "spc-last-crew", "spc-last-acceptance-person", "spc-dashboard-unit-filter"]) {
+      const storage = legacyKey === "spc-dashboard-unit-filter" ? sessionStorage : localStorage;
+      migrateLegacyStorageValue(storage, legacyKey, authUserId);
+    }
+    setShowQuickStart(localStorage.getItem(scopedKey("spc-quick-start-seen", authUserId)) !== "1");
+    authDebug({ event: "WORKSPACE_MOUNT", generation: null, sessionUserId: authUserId, validatedUserId: authUserId, email, role: appRole, workspaceOwner: authUserId, mountId: mountIdRef.current });
+    return () => authDebug({ event: "WORKSPACE_UNMOUNT", generation: null, sessionUserId: authUserId, validatedUserId: authUserId, email, role: appRole, workspaceOwner: authUserId, mountId: mountIdRef.current });
+  }, [authUserId, email, appRole]);
   useEffect(() => {
     let active = true;
-    const refresh = () => { setOnline(navigator.onLine); void offlineSummary(draftOwner()).then((summary) => active && setOfflineState(summary)); };
+    const refresh = () => { setOnline(navigator.onLine); void offlineSummary(authUserId).then((summary) => active && setOfflineState(summary)); };
     refresh();
     window.addEventListener("spc-offline-change", refresh);
     window.addEventListener("online", refresh);
     window.addEventListener("offline", refresh);
     return () => { active = false; window.removeEventListener("spc-offline-change", refresh); window.removeEventListener("online", refresh); window.removeEventListener("offline", refresh); };
-  }, []);
+  }, [authUserId]);
   useEffect(() => { latestRef.current = { projects, catalog }; }, [projects, catalog]);
   useEffect(() => {
     if (view === "survey") {
@@ -925,13 +1000,13 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
       setReady(false);
       setStorageWarning("正在從 Supabase 載入…");
       try {
-        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey));
-        const durableDraft = readWorkspaceDraft() || indexedWorkspace?.payload || null;
+        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
+        const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
         const snapshot = await loadWorkspace();
         const legacy = snapshot.projects.length ? null : await loadLegacyWorkspace();
         if (!active) return;
-        const localProjects = normalize(JSON.parse(localStorage.getItem(scopedKey(key)) || "[]"));
-        const localCatalog = JSON.parse(localStorage.getItem(scopedKey(productKey)) || "[]") as Product[];
+        const localProjects = normalize(JSON.parse(localStorage.getItem(scopedKey(key, authUserId)) || "[]"));
+        const localCatalog = JSON.parse(localStorage.getItem(scopedKey(productKey, authUserId)) || "[]") as Product[];
         const useDurableDraft = durableDraft?.pending || (!snapshot.projects.length && durableDraft?.projects.length);
         const loadedProjects = normalize(
           (useDurableDraft
@@ -957,13 +1032,13 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
           ? { projects: [], catalog: [] }
           : { projects: structuredClone(loadedProjects), catalog: structuredClone(loadedCatalog) };
         setReady(true);
-        writeWorkspaceDraft(loadedProjects, loadedCatalog, versionRef.current, !!useDurableDraft);
+        writeWorkspaceDraft(authUserId, loadedProjects, loadedCatalog, versionRef.current, !!useDurableDraft);
         setStorageWarning(useDurableDraft ? "尚未同步：已恢復本機暫存" : "已儲存：已與 Supabase 同步");
       } catch (error) {
-        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey));
-        const durableDraft = readWorkspaceDraft() || indexedWorkspace?.payload || null;
-        const localProjects = normalize(JSON.parse(localStorage.getItem(scopedKey(key)) || "[]"));
-        const localCatalog = JSON.parse(localStorage.getItem(scopedKey(productKey)) || "[]") as Product[];
+        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
+        const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
+        const localProjects = normalize(JSON.parse(localStorage.getItem(scopedKey(key, authUserId)) || "[]"));
+        const localCatalog = JSON.parse(localStorage.getItem(scopedKey(productKey, authUserId)) || "[]") as Product[];
         const recoveredProjects = normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]);
         const recoveredCatalog = (durableDraft?.catalog?.length ? durableDraft.catalog : localCatalog) as Product[];
         if (active && recoveredProjects.length) {
@@ -972,7 +1047,7 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
           setPid(recoveredProjects[0]?.id || "");
           baselineRef.current = { projects: [], catalog: [] };
           setReady(true);
-          writeWorkspaceDraft(recoveredProjects, recoveredCatalog, versionRef.current, true);
+          writeWorkspaceDraft(authUserId, recoveredProjects, recoveredCatalog, versionRef.current, true);
           setStorageWarning("尚未同步：網路或資料庫暫時連不上，已載入本機暫存");
         } else {
           setStorageWarning(`資料初始化失敗：${error instanceof Error ? error.message : "請執行新版 migration"}`);
@@ -981,14 +1056,14 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
     };
     void load();
     return () => { active = false; };
-  }, []);
+  }, [authUserId]);
   useEffect(() => {
     if (!ready) return;
-    const pendingDraft = !!readWorkspaceDraft()?.pending;
+    const pendingDraft = !!readWorkspaceDraft(authUserId)?.pending;
     const current = { projects, catalog },
       baseline = baselineRef.current,
       changed = JSON.stringify(current) !== JSON.stringify(baseline);
-    const localSaved = writeWorkspaceDraft(projects, catalog, versionRef.current, changed || pendingDraft);
+    const localSaved = writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, changed || pendingDraft);
     if (!localSaved) {
       setStorageWarning("本機暫存失敗：瀏覽器空間可能不足，請先下載備份");
       return;
@@ -1033,13 +1108,13 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
         const stillCurrent = JSON.stringify(latestRef.current) === saveInput;
         if (stillCurrent && JSON.stringify(uploaded) !== JSON.stringify(projects)) setProjects(uploaded);
         let removed = 0;
-        try { removed = await cleanupRemovedPhotos(previous.projects, uploaded); } catch { /* data is saved; cleanup can retry next time */ }
+        try { removed = await cleanupRemovedPhotos(previous.projects, uploaded, authUserId); } catch { /* data is saved; cleanup can retry next time */ }
         if (stillCurrent) {
-          writeWorkspaceDraft(uploaded, catalog, nextVersion, false);
-          await clearOfflineOutbox(draftOwner());
+          writeWorkspaceDraft(authUserId, uploaded, catalog, nextVersion, false);
+          await clearOfflineOutbox(authUserId);
           setStorageWarning(`已儲存：已與 Supabase 同步 · 版本 ${nextVersion}${removed ? ` · 清理 ${removed} 張舊照片` : ""}`);
         } else {
-          writeWorkspaceDraft(latestRef.current.projects, latestRef.current.catalog, nextVersion, true);
+          writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, nextVersion, true);
           retrySyncRef.current = true;
           setStorageWarning("儲存中：上一筆已同步，正在接續同步最新修改…");
         }
@@ -1059,7 +1134,7 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
             ? `已合併其他電腦的更新；${merged.conflicts.length} 個同欄位衝突保留這台電腦的內容，正在重新同步…`
             : "已自動合併其他電腦的更新，正在重新同步…");
         } else {
-          writeWorkspaceDraft(projects, catalog, versionRef.current, true);
+          writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, true);
           setStorageWarning(`尚未同步：已暫存，${message}`);
           void reportClientError(message, "supabase-sync", { version: versionRef.current });
         }
@@ -1097,7 +1172,7 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
     const retry = () => setSyncTick((x) => x + 1);
     window.addEventListener("online", retry);
     const timer = window.setInterval(() => {
-      if (navigator.onLine && readWorkspaceDraft()?.pending) retry();
+      if (navigator.onLine && readWorkspaceDraft(authUserId)?.pending) retry();
     }, 15000);
     return () => {
       window.removeEventListener("online", retry);
@@ -1140,7 +1215,7 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
     setProjects((current) => {
       const next = update(current);
       latestRef.current = { projects: next, catalog: latestRef.current.catalog };
-      writeWorkspaceDraft(next, latestRef.current.catalog, versionRef.current, true);
+      writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true);
       return next;
     });
   const updateCatalog = (products: Product[]) => {
@@ -1200,8 +1275,10 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `SPC-backup-${day()}.json`;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    a.remove();
+    revokeObjectUrlLater(a.href);
   };
   const importBackup = async (file: File) => {
     try {
@@ -1277,8 +1354,8 @@ function AdminApp({ email, role, appRole }: { email: string; role: string; appRo
           <SessionChip email={email} role={role} />
         </div>
       </header>
-      {showQuickStart && <div className="quick-start"><div><b>第一次使用，照這 5 步即可</b><span>① 選案場　→　② 選戶別　→　③ 開始檢查　→　④ 📷 拍照　→　⑤ 💾 暫存／✓ 完成</span></div><button onClick={() => { localStorage.setItem(scopedKey("spc-quick-start-seen"), "1"); setShowQuickStart(false); }}>知道了</button></div>}
-      {!!conflictPaths.length && <Modal close={() => undefined} title="偵測到同一筆資料被兩人修改"><div className="form"><div className="warning">系統沒有直接覆蓋資料。共有 {conflictPaths.length} 個相同欄位發生衝突，請選擇要保留哪一版。</div><div className="conflict-list">{conflictPaths.slice(0, 8).map((path) => <code key={path}>{path}</code>)}{conflictPaths.length > 8 && <small>另有 {conflictPaths.length - 8} 個欄位</small>}</div><div className="form-actions"><button className="ghost" onClick={() => { const remote = remoteConflictRef.current; if (remote) { setProjects(remote.projects); setCatalog(remote.catalog); writeWorkspaceDraft(remote.projects, remote.catalog, versionRef.current, false); } setConflictPaths([]); }}>使用 Supabase 最新資料</button><button className="primary" onClick={() => { setConflictPaths([]); setSyncTick((value) => value + 1); }}>保留這台電腦內容並重新同步</button></div></div></Modal>}
+          {showQuickStart && <div className="quick-start"><div><b>第一次使用，照這 5 步即可</b><span>① 選案場　→　② 選戶別　→　③ 開始檢查　→　④ 📷 拍照　→　⑤ 💾 暫存／✓ 完成</span></div><button onClick={() => { localStorage.setItem(scopedKey("spc-quick-start-seen", authUserId), "1"); setShowQuickStart(false); }}>知道了</button></div>}
+      {!!conflictPaths.length && <Modal close={() => undefined} title="偵測到同一筆資料被兩人修改"><div className="form"><div className="warning">系統沒有直接覆蓋資料。共有 {conflictPaths.length} 個相同欄位發生衝突，請選擇要保留哪一版。</div><div className="conflict-list">{conflictPaths.slice(0, 8).map((path) => <code key={path}>{path}</code>)}{conflictPaths.length > 8 && <small>另有 {conflictPaths.length - 8} 個欄位</small>}</div><div className="form-actions"><button className="ghost" onClick={() => { const remote = remoteConflictRef.current; if (remote) { setProjects(remote.projects); setCatalog(remote.catalog); writeWorkspaceDraft(authUserId, remote.projects, remote.catalog, versionRef.current, false); } setConflictPaths([]); }}>使用 Supabase 最新資料</button><button className="primary" onClick={() => { setConflictPaths([]); setSyncTick((value) => value + 1); }}>保留這台電腦內容並重新同步</button></div></div></Modal>}
       <div className="shell">
         <aside
           className={menuOpen ? "mobile-open" : ""}
@@ -1592,8 +1669,9 @@ function ProjectOnboarding({
   cancel: () => void;
   complete: (project: Project, products: Product[]) => void;
 }) {
-  const emptyRow = { building: "", floor: "", number: "", model: "", colorNo: "", estimated: "", note: "" };
-  const onboardingKey = draftKey("project-onboarding", "new");
+  const authUserId = useAuthOwner();
+  const emptyRow = { building: "", floor: "", number: "", model: "", colorNo: "", estimated: "", areaUnit: "坪" as AreaUnit, note: "" };
+  const onboardingKey = draftKey(authUserId, "project-onboarding", "new");
   const recovered = readDraft(onboardingKey, { step: 1, basic: { name: "", address: "", builder: "", contact: "", phone: "", expectedDate: "", note: "" }, products: catalog, product: { id: id(), brand: "", model: "", colorNo: "", spec: "", note: "" } as Product, rows: [{ ...emptyRow }] });
   const [step, setStep] = useState(recovered.step);
   const [basic, setBasic] = useState(recovered.basic);
@@ -1612,7 +1690,7 @@ function ProjectOnboarding({
   }, [onboardingKey]);
   useEffect(() => {
     if (!onboardingDraftReady) return;
-    writeLocalDraft(onboardingKey, { id: "project-onboarding-new", step, basic, products, product, rows });
+    writeLocalDraft(onboardingKey, { id: "project-onboarding-new", step, basic, products, product, rows }, authUserId);
   }, [onboardingKey, onboardingDraftReady, step, basic, products, product, rows]);
   const addProduct = () => {
     if (!product.model.trim() || !product.colorNo.trim()) return setError("請填寫 SPC 編號與色號。");
@@ -1627,7 +1705,7 @@ function ProjectOnboarding({
     if (invalid >= 0) return setError(`第 ${invalid + 1} 戶資料不完整，請確認固定欄位與坪數。`);
     const units = rows.map((r) => {
       const p = products.find((x) => x.model === r.model && x.colorNo === r.colorNo)!;
-      return { ...blankUnit(), building: r.building, floor: r.floor, number: r.number, brand: p.brand, model: p.model, colorNo: p.colorNo, spec: p.spec, estimated: Number(r.estimated), note: r.note };
+      return { ...blankUnit(), building: r.building, floor: r.floor, number: r.number, brand: p.brand, model: p.model, colorNo: p.colorNo, spec: p.spec, estimated: areaInputToPing(r.estimated, r.areaUnit || "坪"), note: r.note };
     });
     complete({
       id: id(), name: basic.name.trim(), address: basic.address.trim(), builder: basic.builder.trim(), contact: basic.contact.trim(), phone: basic.phone.trim(), note: basic.note,
@@ -1646,7 +1724,7 @@ function ProjectOnboarding({
           <Field label="建案名稱（必填）" value={basic.name} set={(name) => setBasic({ ...basic, name })} /><Field label="案場地址（必填）" value={basic.address} set={(address) => setBasic({ ...basic, address })} /><Field label="建設公司" value={basic.builder} set={(builder) => setBasic({ ...basic, builder })} /><Field label="工地窗口" value={basic.contact} set={(contact) => setBasic({ ...basic, contact })} /><Field label="聯絡資訊" value={basic.phone} set={(phone) => setBasic({ ...basic, phone })} /><Field label="預計工程日期" type="date" value={basic.expectedDate} set={(expectedDate) => setBasic({ ...basic, expectedDate })} /><Field label="備註" value={basic.note} set={(note) => setBasic({ ...basic, note })} />
         </div><button className="primary next-step" disabled={!basic.name.trim() || !basic.address.trim()} onClick={() => setStep(2)}>下一步：確認SPC產品 →</button></section>}
         {step === 2 && <section className="panel form"><div><p className="eyebrow">全案場共用產品庫</p><h1>選擇或新增SPC產品</h1><p className="muted">點一下已有色號即可自動帶入下方欄位；沒有的產品只需新增一次。</p></div><div className="onboarding-products">{products.map((p) => <button type="button" className={product.id === p.id ? "selected" : ""} key={p.id} onClick={() => { setProduct({ ...p }); setError(""); }}><b>{p.model}</b><span>{p.colorNo}</span><small>{p.brand || "未填品牌"}</small></button>)}</div><div className="grid3 product-inline"><Field label="品牌／廠商" value={product.brand} set={(brand) => setProduct({ ...product, brand })} /><Field label="SPC編號" value={product.model} set={(model) => setProduct({ ...product, model })} /><Field label="色號" value={product.colorNo} set={(colorNo) => setProduct({ ...product, colorNo })} /><Field label="規格" value={product.spec} set={(spec) => setProduct({ ...product, spec })} /><button className="ghost" onClick={addProduct}>＋ 加入產品庫</button></div><div className="step-actions"><button className="ghost" onClick={() => setStep(1)}>← 上一步</button><button className="primary" disabled={!products.length} onClick={() => setStep(3)}>下一步：建立戶別 →</button></div></section>}
-        {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><Field label="預估坪數" type="number" value={r.estimated} set={(v) => updateRow(i, "estimated", v)} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={() => { setError(""); setStep(4); }}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: Number(row.estimated) || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => Object.values(row).some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
+        {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><AreaDraftInput value={r.estimated} unit={r.areaUnit || "坪"} setValue={(value) => updateRow(i, "estimated", value)} setUnit={(areaUnit) => updateRow(i, "areaUnit", areaUnit)} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={() => { setError(""); setStep(4); }}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: areaInputToPing(row.estimated, row.areaUnit || "坪") || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => [row.building, row.floor, row.number, row.model, row.colorNo, row.estimated, row.note].some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), areaUnit: "坪" as AreaUnit, note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
         {step === 4 && <section className="panel form"><div><p className="eyebrow">最後確認</p><h1>確認並啟用案場</h1></div><div className="activation-summary"><span>建案<b>{basic.name}</b></span><span>案場地址<b>{basic.address}</b></span><span>SPC產品<b>{products.length} 筆</b></span><span>第一批戶別<b>{rows.length} 戶</b></span></div><div className="warning">確認後會正式建立案場，戶別基本資料將直接沿用至場勘、施工、驗收與報告。</div><div className="step-actions"><button className="ghost" onClick={() => setStep(3)}>← 返回修改</button><button className="primary" onClick={finish}>確認並開始使用</button></div></section>}
         {error && <div className="form-error">{error}</div>}
       </section>
@@ -1705,6 +1783,7 @@ function ProjectArea({
         items={[
           ["dashboard", "Dashboard"],
           ["units", "戶別主資料"],
+          ["daily-acceptance", "今日驗收"],
           ["journal", "工作日誌"],
           ["billing", "月結／計價"],
           ["project", "專案資料"],
@@ -1714,11 +1793,71 @@ function ProjectArea({
         <Dashboard p={project} open={open} setView={setView} />
       )}{" "}
       {view === "units" && <Units p={project} patch={patch} open={open} />}{" "}
+      {view === "daily-acceptance" && <DailyAcceptanceView p={project} />}{" "}
       {view === "products" && <Products p={project} patch={patch} />}{" "}
       {view === "journal" && <Journal p={project} patch={patch} />}{" "}
       {view === "billing" && <Billing p={project} patch={patch} />}{" "}
       {view === "project" && <ProjectForm p={project} patch={patch} />}
     </>
+  );
+}
+function DailyAcceptanceView({ p }: { p: Project }) {
+  const entries = useMemo(() => buildDailyAcceptanceEntries<Acceptance, Unit>(p.units), [p.units]);
+  const dates = [...new Set(entries.map((entry) => entry.date))];
+  const [selectedDate, setSelectedDate] = useState(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  });
+  const [selected, setSelected] = useState<(typeof entries)[number] | null>(null);
+  const records = entries.filter((entry) => entry.date === selectedDate);
+  const exportDay = () => {
+    const exportRecords = records.map(({ unit, acceptance }) => buildAcceptanceExportRecord(p, unit, acceptance, true));
+    const workbook = createShipmentWorkbook(p, exportRecords, selectedDate.slice(0, 7));
+    saveShipmentWorkbook(workbook, `${selectedDate}_${p.name}_SPC已出貨明細總表.xlsx`);
+  };
+  return (
+    <div className="form daily-acceptance-view">
+      <section className="panel">
+        <div className="panel-head">
+          <div><p className="eyebrow">案場正式驗收紀錄</p><h2>今日驗收</h2><p>依驗收／複驗紀錄本身的日期顯示，不含草稿。</p></div>
+          <button className="primary" disabled={!records.length} onClick={exportDay}>匯出當日細總表 Excel</button>
+        </div>
+        <div className="daily-acceptance-summary">
+          <label className="field"><span>日期</span><input type="date" value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)} /></label>
+          <article><span>當日正式驗收筆數</span><b>{records.length}</b></article>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>棟／區域</th><th>樓層</th><th>戶別</th><th>型號</th><th>色號</th><th>坪數</th><th>驗收人</th><th>驗收結果</th><th>紀錄類型</th></tr></thead>
+            <tbody>
+              {records.map((entry) => <tr key={`${entry.unit.id}-${entry.acceptance.id}`} className="clickable-row" onClick={() => setSelected(entry)}>
+                <td>{entry.unit.building || "—"}</td><td>{entry.unit.floor || "—"}</td><td>{entry.unit.number || "—"}</td><td>{entry.unit.model || "—"}</td><td>{entry.unit.colorNo || "—"}</td><td>{entry.acceptance.area || entry.unit.estimated || 0} 坪</td><td>{entry.acceptance.person || "—"}</td><td>{entry.acceptance.result}</td><td>{entry.acceptance.recheck ? "複驗" : "驗收"}</td>
+              </tr>)}
+              {!records.length && <tr><td colSpan={9}>此日期沒有正式驗收紀錄。</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section className="panel">
+        <div className="panel-head"><div><h2>歷史驗收紀錄</h2><p>點選日期查看該日所有正式驗收與複驗。</p></div></div>
+        <div className="daily-acceptance-history">
+          {dates.map((date) => <button key={date} className={selectedDate === date ? "primary" : "ghost"} onClick={() => setSelectedDate(date)}><b>{date.replaceAll("-", "/")}</b><span>{entries.filter((entry) => entry.date === date).length} 筆</span></button>)}
+          {!dates.length && <p>尚無正式驗收紀錄。</p>}
+        </div>
+      </section>
+      {selected && <Modal close={() => setSelected(null)} title={`${selected.acceptance.recheck ? "複驗" : "驗收"}詳細內容｜${selected.date}`}>
+        <RecordConfirmation title={`${selected.unit.building} ${selected.unit.floor}-${selected.unit.number}`} rows={[
+          ["型號／色號", `${selected.unit.model || "—"}／${selected.unit.colorNo || "—"}`],
+          ["驗收坪數", `${selected.acceptance.area || selected.unit.estimated || 0} 坪`],
+          ["驗收人", selected.acceptance.person || "—"],
+          ["驗收結果", selected.acceptance.result],
+          ["紀錄類型", selected.acceptance.recheck ? "複驗" : "驗收"],
+          ["備註", selected.acceptance.note || "—"],
+          ["檢查項目", selected.acceptance.items.map((item) => `${item.label}：${item.result || "未填"}`).join("；")],
+        ]} />
+        <PhotoGrid photos={selected.acceptance.photos || []} />
+      </Modal>}
+    </div>
   );
 }
 function Dashboard({
@@ -1730,6 +1869,7 @@ function Dashboard({
   open: (x: string) => void;
   setView: (x: string) => void;
 }) {
+  const authUserId = useAuthOwner();
   const overdueIds = new Set(
       p.units
         .filter((u) =>
@@ -1740,7 +1880,7 @@ function Dashboard({
         .map((u) => u.id),
     );
   const go = (target: string) => {
-    sessionStorage.setItem("spc-dashboard-unit-filter", target);
+    sessionStorage.setItem(scopedKey("spc-dashboard-unit-filter", authUserId), target);
     setView("units");
   };
   const groups = {
@@ -1938,16 +2078,18 @@ function Units({
   patch: (x: Partial<Project>) => void;
   open: (x: string) => void;
 }) {
+  const authUserId = useAuthOwner();
   const empty = {
       building: "",
       floor: "",
       number: "",
       model: "",
       colorNo: "",
-      estimated: "",
+    estimated: "",
+    areaUnit: "坪" as AreaUnit,
       note: "",
     },
-    recoveredCreate = readDraft(draftKey("unit-create", p.id), { draft: empty, rows: [{ ...empty }], batch: false }),
+    recoveredCreate = readDraft(draftKey(authUserId, "unit-create", p.id), { draft: empty, rows: [{ ...empty }], batch: false }),
     [draft, setDraft] = useState(recoveredCreate.draft || empty),
     [q, setQ] = useState(""),
     [b, setB] = useState(""),
@@ -1956,8 +2098,9 @@ function Units({
     [color, setColor] = useState(""),
     [status, setStatus] = useState(() => {
       if (typeof window === "undefined") return "";
-      const v = sessionStorage.getItem("spc-dashboard-unit-filter") || "";
-      sessionStorage.removeItem("spc-dashboard-unit-filter");
+      const filterKey = scopedKey("spc-dashboard-unit-filter", authUserId);
+      const v = sessionStorage.getItem(filterKey) || "";
+      sessionStorage.removeItem(filterKey);
       return v;
     }),
     [batch, setBatch] = useState(!!recoveredCreate.batch),
@@ -1970,15 +2113,15 @@ function Units({
     [filtersOpen, setFiltersOpen] = useState(false),
     [creating, setCreating] = useState(false),
     [batchStatus, setBatchStatus] = useState<Status>("待場勘"),
-    [creationDraftReady, setCreationDraftReady] = useState(() => !!readLocal(draftKey("unit-create", p.id)));
+    [creationDraftReady, setCreationDraftReady] = useState(() => !!readLocal(draftKey(authUserId, "unit-create", p.id)));
   useEffect(() => {
     if (!creationDraftReady) return;
     const hasContent = Object.values(draft).some(Boolean) || rows.some((row) => Object.values(row).some(Boolean));
-    const storageKey = draftKey("unit-create", p.id);
-    if (hasContent) writeLocalDraft(storageKey, { id: `unit-create-${p.id}`, draft, rows, batch });
+    const storageKey = draftKey(authUserId, "unit-create", p.id);
+    if (hasContent) writeLocalDraft(storageKey, { id: `unit-create-${p.id}`, draft, rows, batch }, authUserId);
   }, [draft, rows, batch, p.id, creationDraftReady]);
   useEffect(() => {
-    const storageKey = draftKey("unit-create", p.id);
+    const storageKey = draftKey(authUserId, "unit-create", p.id);
     if (readLocal(storageKey)) { setCreationDraftReady(true); return; }
     void loadOfflineDraft<{ draft: typeof empty; rows: typeof rows; batch: boolean }>(storageKey).then((saved) => {
       if (saved) { setDraft(saved.payload.draft); setRows(saved.payload.rows); setBatch(saved.payload.batch); }
@@ -2105,9 +2248,9 @@ function Units({
       !draft.floor ||
       !draft.number ||
       !product ||
-      !Number(draft.estimated)
+      !areaInputToPing(draft.estimated, draft.areaUnit || "坪")
     ) {
-      setError("請完整填寫棟別、樓層、戶別、有效的 SPC 編號／色號及預估坪數。");
+      setError("請完整填寫棟別、樓層、戶別、有效的 SPC 編號／色號及預估施工坪數。");
       return;
     }
     const u = {
@@ -2119,13 +2262,13 @@ function Units({
       model: product.model,
       colorNo: product.colorNo,
       spec: product.spec,
-      estimated: Number(draft.estimated),
+      estimated: areaInputToPing(draft.estimated, draft.areaUnit || "坪"),
       note: draft.note,
     };
     patch({ units: [...p.units, u] });
     setDraft(empty);
-    localStorage.removeItem(draftKey("unit-create", p.id));
-    void removeOfflineDraft(draftKey("unit-create", p.id));
+    localStorage.removeItem(draftKey(authUserId, "unit-create", p.id));
+    void removeOfflineDraft(draftKey(authUserId, "unit-create", p.id));
     setError("");
     open(u.id);
   };
@@ -2149,7 +2292,7 @@ function Units({
         !r.floor ||
         !r.number ||
         !product ||
-        !Number(r.estimated)
+        !areaInputToPing(r.estimated, r.areaUnit || "坪")
       ) {
         bad.push(
           `第 ${i + 1} 戶：${!product ? `${r.model || "未選編號"}／${r.colorNo || "未選色號"} 不在產品資料中` : "欄位未完整填寫或坪數格式不正確"}`,
@@ -2165,7 +2308,7 @@ function Units({
         model: r.model,
         colorNo: r.colorNo,
         spec: product.spec,
-        estimated: Number(r.estimated),
+        estimated: areaInputToPing(r.estimated, r.areaUnit || "坪"),
         note: r.note,
       });
     });
@@ -2177,8 +2320,8 @@ function Units({
     setRows([{ ...empty }]);
     setBatch(false);
     setCreating(false);
-    localStorage.removeItem(draftKey("unit-create", p.id));
-    void removeOfflineDraft(draftKey("unit-create", p.id));
+    localStorage.removeItem(draftKey(authUserId, "unit-create", p.id));
+    void removeOfflineDraft(draftKey(authUserId, "unit-create", p.id));
     setError("");
   };
   return (
@@ -2267,11 +2410,11 @@ function Units({
                     ))}
                   </select>
                 </label>
-                <Field
-                  label="預估坪數"
-                  type="number"
+                <AreaDraftInput
                   value={draft.estimated}
-                  set={(estimated) => setDraft({ ...draft, estimated })}
+                  unit={draft.areaUnit || "坪"}
+                  setValue={(estimated) => setDraft({ ...draft, estimated })}
+                  setUnit={(areaUnit) => setDraft({ ...draft, areaUnit })}
                 />
                 <Field label="備註／特殊說明" value={draft.note} set={(note) => setDraft({ ...draft, note })} />
               </div>
@@ -2370,11 +2513,11 @@ function Units({
                             ))}
                           </select>
                         </label>
-                        <Field
-                          label="預估坪數"
-                          type="number"
+                        <AreaDraftInput
                           value={r.estimated}
-                          set={(v) => updateRow(i, "estimated", v)}
+                          unit={r.areaUnit || "坪"}
+                          setValue={(v) => updateRow(i, "estimated", v)}
+                          setUnit={(v) => updateRow(i, "areaUnit", v)}
                         />
                         <Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} />
                       </div>
@@ -2875,10 +3018,7 @@ function ImportUnits({
         const number = read(source, ["戶別"]);
         const model = read(source, ["SPC編號", "型號", "SPC型號"]);
         const colorNo = read(source, ["色號", "顏色"]);
-        const areaText = read(source, ["預估坪數", "坪數"])
-          .replace(/,/g, "")
-          .replace(/坪/g, "");
-        const estimated = Number(areaText);
+        const estimated = importedAreaToPing(source);
         const statusText = read(source, ["工程狀態", "狀態"]);
         const status = statuses.includes(statusText as Status)
           ? (statusText as Status)
@@ -2997,7 +3137,7 @@ function ImportUnits({
         <label className="import-drop">
           <b>{fileName || "選擇 Excel 或 CSV 檔案"}</b>
           <span>
-            欄位：棟別、樓層、戶別、SPC 編號、色號、預估坪數、工程狀態、備註
+            欄位：棟別、樓層、戶別、SPC 編號、色號、預估施工坪數／m²、工程狀態、備註
           </span>
           <input
             type="file"
@@ -3052,7 +3192,7 @@ function ImportUnits({
                     <th>列</th>
                     <th>棟／樓／戶</th>
                     <th>SPC 編號／色號</th>
-                    <th>坪數</th>
+                    <th>換算後坪數</th>
                     <th>狀態</th>
                     <th>檢查結果</th>
                   </tr>
@@ -3068,7 +3208,7 @@ function ImportUnits({
                         {row.model || "待確認"}／{row.colorNo}
                       </td>
                       <td>
-                        {Number.isFinite(row.estimated) ? row.estimated : "—"}
+                        {Number.isFinite(row.estimated) ? `${row.estimated.toFixed(2)} 坪` : "—"}
                       </td>
                       <td>{row.status}</td>
                       <td>
@@ -3161,6 +3301,7 @@ function GlobalProducts({
   products: Product[];
   setProducts: (x: Product[]) => void;
 }) {
+  const authUserId = useAuthOwner();
   const blank = (): Product => ({
       id: id(),
       brand: "",
@@ -3169,11 +3310,11 @@ function GlobalProducts({
       spec: "",
       note: "",
     }),
-    formDraftKey = draftKey("global-product", "new"),
+    formDraftKey = draftKey(authUserId, "global-product", "new"),
     [form, setForm] = useState<Product>(() => readDraft(formDraftKey, blank())),
     [q, setQ] = useState("");
   useOfflineDraftRestore(formDraftKey, setForm);
-  useEffect(() => { writeLocalDraft(formDraftKey, form); }, [formDraftKey, form]);
+  useEffect(() => { writeLocalDraft(formDraftKey, form, authUserId); }, [formDraftKey, form, authUserId]);
   const shown = products.filter((x) =>
     [x.brand, x.model, x.colorNo, x.spec, x.note]
       .join(" ")
@@ -3313,7 +3454,8 @@ function Products({
   p: Project;
   patch: (x: Partial<Project>) => void;
 }) {
-  const productDraftKey = draftKey("project-product", p.id);
+  const authUserId = useAuthOwner();
+  const productDraftKey = draftKey(authUserId, "project-product", p.id);
   const [form, setForm] = useState<Product>(() => readDraft(productDraftKey, {
       id: id(),
       brand: "",
@@ -3325,7 +3467,7 @@ function Products({
     [selected, setSelected] = useState(""),
     [unitId, setUnitId] = useState("");
   useOfflineDraftRestore(productDraftKey, setForm);
-  useEffect(() => { writeLocalDraft(productDraftKey, form); }, [productDraftKey, form]);
+  useEffect(() => { writeLocalDraft(productDraftKey, form, authUserId); }, [productDraftKey, form, authUserId]);
   const assign = () => {
     const product = p.products.find((x) => x.id === selected);
     if (!product || !unitId) return;
@@ -3632,6 +3774,7 @@ function Master({
 }) {
   const isCrew = role === "crew";
   const canManage = canManageProjectData(role);
+  const [estimatedUnit, setEstimatedUnit] = useState<AreaUnit>("坪");
   const models = [...new Set(p.products.map((x) => x.model).filter(Boolean))],
     colors = [
       ...new Set(
@@ -3714,13 +3857,23 @@ function Master({
         </label>
         <Field label="品牌／廠商" value={u.brand} disabled />
         <Field label="規格" value={u.spec} disabled />
-        <Field
-          label="預估施工坪數"
-          type="number"
-          value={u.estimated}
-          disabled={isCrew}
-          set={(estimated: string) => patch({ estimated: Number(estimated) })}
-        />
+        <label className="field">
+          <span>預估施工坪數</span>
+          <div className="area-input-row">
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={areaValueFromPing(u.estimated, estimatedUnit)}
+              disabled={isCrew}
+              onChange={(event) => patch({ estimated: areaInputToPing(event.target.value, estimatedUnit) })}
+            />
+            <select disabled={isCrew} value={estimatedUnit} onChange={(event) => setEstimatedUnit(event.target.value as AreaUnit)}>
+              <option value="坪">坪</option>
+              <option value="m²">m²</option>
+            </select>
+          </div>
+        </label>
         <Field
           label="備註"
           value={u.note}
@@ -3839,15 +3992,17 @@ function SurveyTab({
   patch: (x: Partial<Unit>) => void;
   add: any;
 }) {
+  const authUserId = useAuthOwner();
   const fallback: Survey = {
       id: id(),
       date: day(),
-      person: readLocal("spc-last-survey-person"),
+      person: readLocal(scopedKey("spc-last-survey-person", authUserId)),
       items: surveyLabels.map((label) => ({
         label,
         result: "" as Choice,
         note: "",
         photos: [],
+        requiresMeasurement: label === "地坪平整度",
       })),
       photos: [],
       note: "",
@@ -3864,20 +4019,18 @@ function SurveyTab({
       startedAt: stamp(),
     },
     [s, setS] = useState<Survey>(() =>
-      readDraft(draftKey("survey", u.id), fallback),
+      readDraft(draftKey(authUserId, "survey", u.id), fallback),
     ),
     [risk, setRisk] = useState(false),
     [surveySigning, setSurveySigning] = useState(false),
     [surveyDetail, setSurveyDetail] = useState<"door" | "silicone" | "divider" | "parking" | "staging" | "signatures" | null>(null),
     [saved, setSaved] = useState(""),
     [confirming, setConfirming] = useState(false);
-  useOfflineDraftRestore(draftKey("survey", u.id), setS);
+  useOfflineDraftRestore(draftKey(authUserId, "survey", u.id), setS);
   useEffect(() => {
-    writeLocalDraft(draftKey("survey", u.id), s);
-  }, [s, u.id]);
-  const areaStatus = s.areaStatus || "pending",
-    areaUnit = s.areaUnit || "坪",
-    door = s.doorInspection || { thresholdCm: undefined, meetsThreshold: false, hasGap: null, result: "不合格" as const, rationale: "", note: "", photos: [] },
+    writeLocalDraft(draftKey(authUserId, "survey", u.id), s, authUserId);
+  }, [s, u.id, authUserId]);
+  const door = s.doorInspection || { thresholdCm: undefined, meetsThreshold: false, hasGap: null, result: "不合格" as const, rationale: "", note: "", photos: [] },
     silicone = s.siliconeInspection || { matchesFloor: null, otherColor: "", note: "", photos: [] },
     divider = s.dividerInspection || { needed: "待確認" as const, quantity: undefined, location: "", note: "", photos: [] },
     parking = s.parking || { count: "" as const, location: "", note: "", photos: [] },
@@ -3895,7 +4048,6 @@ function SurveyTab({
     updateDoorItem = (label: string, change: Partial<CheckItem>) => setS({ ...s, items: s.items.map((item) => item.label === label ? { ...item, ...change } : item) }),
     doorItemsInvalid = doorItems.length !== doorSurveyLabels.length || doorItems.some((item) => !item.result),
     doorItemsBad = doorItems.some((item) => item.result === "不合格"),
-    pendingSurvey = u.surveys.find((record) => (record.areaStatus || "pending") === "pending"),
     doorBad: CheckItem[] = doorResult === "不合格" ? [{ label: "門檻檢查", result: "不合格", note: [door.rationale, door.note].filter(Boolean).join("；"), photos: door.photos }] : [],
     bad = [...s.items.filter((x) => x.result === "不合格"), ...doorBad],
     incomplete = s.items.some((x) => !x.result),
@@ -3910,17 +4062,14 @@ function SurveyTab({
     saveDraft = () => {
       const draft = { ...s, draft: true };
       patch({ surveys: [draft, ...u.surveys.filter((record) => record.id !== s.id)] });
-      writeLocalDraft(draftKey("survey", u.id), draft);
-      queueRecordChange("survey", u.id, draft);
+      writeLocalDraft(draftKey(authUserId, "survey", u.id), draft, authUserId);
+      queueRecordChange(authUserId, "survey", u.id, draft);
       setSaved("✓ 場勘草稿已暫存；換裝置或重新整理後仍可繼續");
     },
     save = () => {
       const survey: Survey = {
         ...s,
         draft: false,
-        areaStatus,
-        areaUnit,
-        areaValue: areaStatus === "known" ? Number(s.areaValue) : undefined,
         doorInspection: { ...door, meetsThreshold: Number(door.thresholdCm) >= 1.5, result: doorResult },
       };
       const status: Status = s.decision === "可進場" ? "可進場" : "場勘待改善";
@@ -3960,10 +4109,10 @@ function SurveyTab({
             : u.defects,
       });
       add("完成場勘", s.decision, allPhotos);
-      localStorage.setItem("spc-last-survey-person", s.person);
-      localStorage.removeItem(draftKey("survey", u.id));
-      void removeOfflineDraft(draftKey("survey", u.id));
-      queueRecordChange("survey", u.id, survey, "complete");
+      localStorage.setItem(scopedKey("spc-last-survey-person", authUserId), s.person);
+      localStorage.removeItem(draftKey(authUserId, "survey", u.id));
+      void removeOfflineDraft(draftKey(authUserId, "survey", u.id));
+      queueRecordChange(authUserId, "survey", u.id, survey, "complete");
       setSaved("✓ 場勘結果已儲存成功");
       setConfirming(false);
     };
@@ -3977,16 +4126,9 @@ function SurveyTab({
       </div>
       <InspectionGuide />
       <AutoRecord label="場勘開始時間" at={s.startedAt || s.date} />
-      <section className="survey-area-panel">
-        <div className="panel-head"><div><h3>坪數</h3><p>現場尚無法確認時可先選擇「待補」，之後重新開啟場勘補填。</p></div></div>
-        <div className="survey-area-status" role="group" aria-label="坪數狀態">
-          <button type="button" className={areaStatus === "known" ? "primary" : "ghost"} onClick={() => setS({ ...s, areaStatus: "known", areaUnit })}>已知</button>
-          <button type="button" className={areaStatus === "pending" ? "primary" : "ghost"} onClick={() => setS({ ...s, areaStatus: "pending", areaValue: undefined, areaUnit })}>待補</button>
-        </div>
-        {areaStatus === "known" ? <div className="survey-area-fields">
-          <Field label="數值" type="number" value={s.areaValue ?? ""} set={(value: string) => setS({ ...s, areaStatus: "known", areaValue: Number(value), areaUnit })} />
-          <label className="field"><span>單位</span><select value={areaUnit} onChange={(event) => setS({ ...s, areaUnit: event.target.value as Survey["areaUnit"] })}><option>坪</option><option>m</option><option>m²</option></select></label>
-        </div> : <div className="warning">坪數標記為待補，不影響本次場勘儲存。</div>}
+      <section className="survey-area-panel survey-estimated-area">
+        <div><h3>預估施工坪數</h3><p>沿用戶別主資料，此處僅供查看。</p></div>
+        <strong>{u.estimated} 坪</strong>
       </section>
       {surveyDetail === "door" && <Modal close={() => setSurveyDetail(null)} title="門與門檻檢查"><section className="survey-area-panel door-inspection-panel">
         <div className="panel-head"><div><h3>門與門檻檢查</h3><p>門框、門扇、廁所門框與門檻集中在同一頁完成；門檻標準至少 1.5 cm 且不可有空隙。</p></div><span className={doorCombinedResult === "合格" ? "status done" : "status danger"}>{doorCombinedInvalid ? "尚未完成" : doorCombinedResult}</span></div>
@@ -4096,7 +4238,6 @@ function SurveyTab({
       {invalidBad && (
         <div className="form-error">不合格項目必須填寫說明並上傳照片。</div>
       )}
-      {areaStatus === "known" && (!Number.isFinite(Number(s.areaValue)) || Number(s.areaValue) <= 0) && <div className="form-error">坪數選擇「已知」時，請填寫大於 0 的數值。</div>}
       {risk && (
         <RiskModal
           bad={bad}
@@ -4120,7 +4261,6 @@ function SurveyTab({
           dividerInvalid ||
           signaturesInvalid ||
           invalidBad ||
-          (areaStatus === "known" && (!Number.isFinite(Number(s.areaValue)) || Number(s.areaValue) <= 0)) ||
           (bad.length > 0 && s.decision === "可進場" && !s.risk)
         }
         onClick={() => setConfirming(true)}
@@ -4131,7 +4271,7 @@ function SurveyTab({
       {confirming && <Modal close={() => setConfirming(false)} title="最後確認｜場勘">
         <RecordConfirmation title="場勘資料" rows={[
           ["案場／戶別", `${project.name}｜${u.building} ${u.floor}-${u.number}`],
-          ["坪數", areaStatus === "known" ? `${s.areaValue} ${areaUnit}` : "待補"],
+          ["預估施工坪數", `${u.estimated} 坪`],
           ["門檢查", `${door.thresholdCm || "—"} cm｜${doorResult}｜${door.rationale || "—"}`],
           ["停車", parking.count ? `${parking.count === "5台以上" ? parking.count : `${parking.count} 台`}｜${parking.location || "未填位置"}` : "未記錄（選填）"],
           ["放料區", stagingArea.location || "未填位置"],
@@ -4144,19 +4284,19 @@ function SurveyTab({
         <div className="form-actions"><button className="ghost" onClick={() => setConfirming(false)}>返回修改</button><button className="primary" onClick={save}>確認送出</button></div>
       </Modal>}
       {saved && <div className="save-success">{saved}</div>}
-      {pendingSurvey && pendingSurvey.id !== s.id && <div className="pending-area-card"><div><b>有一筆場勘坪數待補</b><small>{pendingSurvey.date} · {pendingSurvey.person || "未填場勘人員"}</small></div><button className="ghost" onClick={() => { setS({ ...pendingSurvey, areaStatus: "pending", areaUnit: pendingSurvey.areaUnit || "坪" }); setSaved("正在補填既有場勘紀錄"); }}>補填坪數</button></div>}
       <History
         title="歷次場勘"
-        rows={u.surveys.map((x) => ({ a: x.date, b: x.person, c: `${x.draft ? "暫存" : "完成"} · ${x.decision} · ${(x.areaStatus || "pending") === "known" ? `${x.areaValue ?? "—"} ${x.areaUnit || "坪"}` : "坪數待補"}`, onOpen: () => { setS(x); setSaved("已開啟既有場勘，可查看或修改後重新儲存"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))}
+        rows={u.surveys.map((x) => ({ a: x.date, b: x.person, c: `${x.draft ? "暫存" : "完成"} · ${x.decision} · 預估 ${u.estimated} 坪`, onOpen: () => { setS(x); setSaved("已開啟既有場勘，可查看或修改後重新儲存"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))}
       />
     </div>
   );
 }
 function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
+  const authUserId = useAuthOwner();
   const fallback: Work = {
       id: id(),
       date: day(),
-      crew: readLocal("spc-last-crew"),
+      crew: readLocal(scopedKey("spc-last-crew", authUserId)),
       people: 1,
       area: u.estimated,
       content: "SPC 地板施工",
@@ -4167,18 +4307,18 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       startedAt: stamp(),
     },
     [w, setW] = useState<Work>(() =>
-      readDraft(draftKey("work", u.id), fallback),
+      readDraft(draftKey(authUserId, "work", u.id), fallback),
     ),
     [saved, setSaved] = useState("");
-  useOfflineDraftRestore(draftKey("work", u.id), setW);
+  useOfflineDraftRestore(draftKey(authUserId, "work", u.id), setW);
   useEffect(() => {
-    writeLocalDraft(draftKey("work", u.id), w);
-  }, [w, u.id]);
+    writeLocalDraft(draftKey(authUserId, "work", u.id), w, authUserId);
+  }, [w, u.id, authUserId]);
   const saveDraft = () => {
     const draft = { ...w, draft: true };
     patch({ works: [draft, ...u.works.filter((record) => record.id !== w.id)] });
-    writeLocalDraft(draftKey("work", u.id), draft);
-    queueRecordChange("work", u.id, draft);
+    writeLocalDraft(draftKey(authUserId, "work", u.id), draft, authUserId);
+    queueRecordChange(authUserId, "work", u.id, draft);
     setSaved("✓ 施工草稿已暫存；上午暫存後，下午可繼續補寫");
   };
   const save = (done: boolean) => {
@@ -4199,10 +4339,10 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       ],
     });
     add(title, w.content, w.photos);
-    localStorage.setItem("spc-last-crew", w.crew);
-    localStorage.removeItem(draftKey("work", u.id));
-    void removeOfflineDraft(draftKey("work", u.id));
-    queueRecordChange("work", u.id, { ...w, draft: false }, done ? "complete" : "upsert");
+    localStorage.setItem(scopedKey("spc-last-crew", authUserId), w.crew);
+    localStorage.removeItem(draftKey(authUserId, "work", u.id));
+    void removeOfflineDraft(draftKey(authUserId, "work", u.id));
+    queueRecordChange(authUserId, "work", u.id, { ...w, draft: false }, done ? "complete" : "upsert");
     setSaved(
       done ? "✓ 施工完成紀錄已儲存，狀態已改為待驗收" : "✓ 施工紀錄已儲存成功",
     );
@@ -4307,11 +4447,12 @@ function CompletionYesNo({ label, value, set }: { label: string; value: boolean 
 }
 
 function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patch: any; add: any }) {
+  const authUserId = useAuthOwner();
   const storedDraft = u.acceptances.find((item) => item.draft);
   const fallback: Acceptance = storedDraft || {
       id: id(),
       date: day(),
-      person: readLocal("spc-last-acceptance-person"),
+      person: readLocal(scopedKey("spc-last-acceptance-person", authUserId)),
       area: u.works.reduce((s, w) => s + w.area, 0) || u.estimated,
       result: "合格",
       items: acceptLabels.map((label) => ({
@@ -4324,7 +4465,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       note: "",
       completion: {
         department: "工程部",
-        officePerson: readLocal("spc-last-acceptance-person"),
+        officePerson: readLocal(scopedKey("spc-last-acceptance-person", authUserId)),
         floorLevel: "",
         abnormalUnit: "",
         damagedMaterialType: "",
@@ -4337,14 +4478,14 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       recheck: u.status === "待複驗",
       startedAt: stamp(),
     };
-  const [a, setA] = useState<Acceptance>(() => readDraft(draftKey("accept", u.id), fallback));
+  const [a, setA] = useState<Acceptance>(() => readDraft(draftKey(authUserId, "accept", u.id), fallback));
   const [signRole, setSignRole] = useState<"installer" | "office" | "siteManager" | "supervisor" | null>(null);
   const [saved, setSaved] = useState("");
   const [confirming, setConfirming] = useState(false);
-  useOfflineDraftRestore(draftKey("accept", u.id), setA);
+  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setA);
   useEffect(() => {
-    writeLocalDraft(draftKey("accept", u.id), a);
-  }, [a, u.id]);
+    writeLocalDraft(draftKey(authUserId, "accept", u.id), a, authUserId);
+  }, [a, u.id, authUserId]);
   const bad = a.items.filter((x) => x.result === "不合格"),
     incomplete = a.items.some((x) => !x.result),
     invalidBad = bad.some((x) => !x.note.trim() || !x.photos?.length),
@@ -4352,8 +4493,8 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
     saveDraft = () => {
       const draft = { ...a, draft: true };
       patch({ acceptances: [draft, ...u.acceptances.filter((item) => item.id !== a.id)] });
-      writeLocalDraft(draftKey("accept", u.id), draft);
-      queueRecordChange("accept", u.id, draft);
+      writeLocalDraft(draftKey(authUserId, "accept", u.id), draft, authUserId);
+      queueRecordChange(authUserId, "accept", u.id, draft);
       setSaved("✓ 驗收草稿已暫存；重新整理或換裝置後可繼續填寫");
     },
     save = () => {
@@ -4390,10 +4531,10 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         ],
       });
       add(a.recheck ? "完成複驗" : "完成驗收", a.result, allPhotos);
-      localStorage.setItem("spc-last-acceptance-person", a.person);
-      localStorage.removeItem(draftKey("accept", u.id));
-      void removeOfflineDraft(draftKey("accept", u.id));
-      queueRecordChange("accept", u.id, { ...a, draft: false }, "complete");
+      localStorage.setItem(scopedKey("spc-last-acceptance-person", authUserId), a.person);
+      localStorage.removeItem(draftKey(authUserId, "accept", u.id));
+      void removeOfflineDraft(draftKey(authUserId, "accept", u.id));
+      queueRecordChange(authUserId, "accept", u.id, { ...a, draft: false }, "complete");
       setSaved(`✓ ${a.recheck ? "複驗" : "驗收"}結果已儲存成功`);
       setConfirming(false);
     };
@@ -4419,6 +4560,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         </span>
       </div>
       <Checklist
+        className="acceptance-checklist"
         node={a.recheck ? "複驗" : "驗收"}
         items={a.items}
         set={(items) => setA({ ...a, items })}
@@ -4453,16 +4595,15 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       />
       <section className="completion-entry">
         <div className="checklist-head"><div><h3>每日完工驗收表資料</h3><small>基本資料、驗收人、施工日期與板材型號會自動套用到三聯 PDF。</small></div></div>
-        <div className="grid3">
-          <Field label="地坪確認（樓層／位置）" value={a.completion?.floorLevel || ""} set={(floorLevel: string) => setA({ ...a, completion: { ...completionDefaults(a, u), floorLevel } })} />
-          <Field label="地坪異常戶別" value={a.completion?.abnormalUnit || ""} set={(abnormalUnit: string) => setA({ ...a, completion: { ...completionDefaults(a, u), abnormalUnit } })} />
-          <Field label="損壞板材種類" value={a.completion?.damagedMaterialType || ""} set={(damagedMaterialType: string) => setA({ ...a, completion: { ...completionDefaults(a, u), damagedMaterialType } })} />
-        </div>
         <div className="completion-checks">
           <CompletionYesNo label="地坪是否異常" value={a.completion?.floorAbnormal ?? null} set={(floorAbnormal) => setA({ ...a, completion: { ...completionDefaults(a, u), floorAbnormal } })} />
           <CompletionYesNo label="現場板材是否損壞" value={a.completion?.boardDamaged ?? null} set={(boardDamaged) => setA({ ...a, completion: { ...completionDefaults(a, u), boardDamaged } })} />
           <CompletionYesNo label="現場垃圾是否清運完畢" value={a.completion?.trashCleared ?? null} set={(trashCleared) => setA({ ...a, completion: { ...completionDefaults(a, u), trashCleared } })} />
         </div>
+        {(a.completion?.floorAbnormal === true || a.completion?.boardDamaged === true) && <div className="completion-supplementary-fields">
+          {a.completion?.floorAbnormal === true && <Field label="地坪異常位置／戶別" value={a.completion.abnormalUnit || ""} set={(abnormalUnit: string) => setA({ ...a, completion: { ...completionDefaults(a, u), abnormalUnit } })} />}
+          {a.completion?.boardDamaged === true && <Field label="損壞板材種類" value={a.completion.damagedMaterialType || ""} set={(damagedMaterialType: string) => setA({ ...a, completion: { ...completionDefaults(a, u), damagedMaterialType } })} />}
+        </div>}
         <div className="completion-signatures">
           {([['installer','施工人員'],['office','工務人員'],['siteManager','工地主任'],['supervisor','神銀主管']] as const).map(([key, label]) => {
             const signed = key === "office" ? a.completion?.signatures?.[key] || a.signature : a.completion?.signatures?.[key];
@@ -4712,27 +4853,30 @@ async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNo
   const link = document.createElement("a");
   link.href = url;
   link.download = `${project.name}_${u.number}_${entry.date}_工作日誌.docx`.replace(/[\\/:*?"<>|]/g, "_");
+  document.body.appendChild(link);
   link.click();
-  URL.revokeObjectURL(url);
+  link.remove();
+  revokeObjectUrlLater(url);
 }
 
 function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>) => void }) {
+  const authUserId = useAuthOwner();
   const blank = (): DailyNote => ({ id: id(), date: day(), content: "", pending: "", note: "", photos: [], createdAt: "", updatedAt: "", createdBy: "", draft: true });
   const storedDraft = u.journals.find((item) => item.draft);
-  const [entry, setEntry] = useState<DailyNote>(() => readDraft(draftKey("unit-journal", u.id), storedDraft || blank()));
+  const [entry, setEntry] = useState<DailyNote>(() => readDraft(draftKey(authUserId, "unit-journal", u.id), storedDraft || blank()));
   const [saved, setSaved] = useState("");
   const [preview, setPreview] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  useOfflineDraftRestore(draftKey("unit-journal", u.id), setEntry);
-  useEffect(() => { writeLocalDraft(draftKey("unit-journal", u.id), entry); }, [entry, u.id]);
+  useOfflineDraftRestore(draftKey(authUserId, "unit-journal", u.id), setEntry);
+  useEffect(() => { writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), entry, authUserId); }, [entry, u.id, authUserId]);
   const persist = async (draft: boolean) => {
     const { data } = await supabase.auth.getUser();
     const now = stamp();
     const record: DailyNote = { ...entry, draft, createdAt: entry.createdAt || now, updatedAt: now, createdBy: entry.createdBy || data.user?.email || "目前登入帳號" };
     patch({ journals: [record, ...u.journals.filter((item) => item.id !== entry.id)] });
     setEntry(record);
-    writeLocalDraft(draftKey("unit-journal", u.id), record);
-    queueRecordChange("unit-journal", u.id, record, draft ? "upsert" : "complete");
+    writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), record, authUserId);
+    queueRecordChange(authUserId, "unit-journal", u.id, record, draft ? "upsert" : "complete");
     setSaved(draft ? "✓ 工作日誌已暫存，可稍後或換裝置繼續" : "✓ 工作日誌已完成並儲存");
   };
   return <div className="panel form">
@@ -4754,6 +4898,7 @@ function Journal({
   p: Project;
   patch: (x: Partial<Project>) => void;
 }) {
+  const authUserId = useAuthOwner();
   const blank = () => ({
       id: id(),
       date: day(),
@@ -4765,21 +4910,21 @@ function Journal({
     }),
     [date, setDate] = useState(day()),
     [entry, setEntry] = useState<DailyNote>(() =>
-      readDraft(draftKey("journal", p.id), blank()),
+      readDraft(draftKey(authUserId, "journal", p.id), blank()),
     ),
     rows = p.units.flatMap((u) =>
       u.works.filter((w) => w.date === date).map((w) => ({ u, w })),
     ),
     notes = p.journals.filter((x) => x.date === date);
-  useOfflineDraftRestore(draftKey("journal", p.id), setEntry);
+  useOfflineDraftRestore(draftKey(authUserId, "journal", p.id), setEntry);
   const hasDraft =
     !!entry.content.trim() ||
     !!entry.pending.trim() ||
     !!entry.note.trim() ||
     entry.photos.length > 0;
   useEffect(() => {
-    const key = draftKey("journal", p.id);
-    if (hasDraft) writeLocalDraft(key, entry);
+    const key = draftKey(authUserId, "journal", p.id);
+    if (hasDraft) writeLocalDraft(key, entry, authUserId);
     else localStorage.removeItem(key);
   }, [entry, hasDraft, p.id]);
   const save = () => {
@@ -4790,12 +4935,12 @@ function Journal({
       createdAt: stamp(),
     };
     patch({ journals: [saved, ...p.journals] });
-    queueRecordChange("journal", p.id, saved, "complete");
+    queueRecordChange(authUserId, "journal", p.id, saved, "complete");
     setDate(entry.date);
     const next = blank();
     setEntry(next);
-    localStorage.removeItem(draftKey("journal", p.id));
-    void removeOfflineDraft(draftKey("journal", p.id));
+    localStorage.removeItem(draftKey(authUserId, "journal", p.id));
+    void removeOfflineDraft(draftKey(authUserId, "journal", p.id));
   };
   return (
     <div className="form">
@@ -4862,7 +5007,7 @@ function Journal({
             <h2>系統自動彙整</h2>
             <p>自動帶入當日施工紀錄。</p>
           </div>
-          <button className="primary" onClick={() => window.print()}>
+          <button className="primary" onClick={() => printWithLifecycleCleanup()}>
             匯出／列印
           </button>
         </div>
@@ -4947,12 +5092,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
     }),
     shipmentRecords = monthlyBillingRecords,
     billSubtotal = billRecords.reduce((sum, record) => sum + record.amount, 0),
-    printBilling = () => {
-      const cleanup = () => document.body.classList.remove("printing-billing");
-      document.body.classList.add("printing-billing");
-      window.addEventListener("afterprint", cleanup, { once: true });
-      window.print();
-    };
+    printBilling = () => printWithLifecycleCleanup("printing-billing");
   return (
     <div className="panel form billing-print-area">
       <div className="panel-head">
@@ -5121,7 +5261,7 @@ function Sheet({ project, u }: { project: Project; u: Unit }) {
           <h2>每日完工驗收表</h2>
           <p className="muted">資料、勾選結果與簽名會自動複製到三聯。</p>
         </div>
-        <button className="primary" onClick={() => window.print()}>匯出／列印 PDF</button>
+        <button className="primary" onClick={() => printWithLifecycleCleanup("printing-completion")}>匯出／列印 PDF</button>
       </div>
       <div className="completion-paper">
         {(["第一聯：客戶存根聯", "第二聯：公司收執聯", "第三聯：廠商收執聯"] as const).map((copy) => (
@@ -5177,12 +5317,14 @@ function Checklist({
   node,
   showCompleteAll = true,
   extraItems,
+  className = "",
 }: {
   items: CheckItem[];
   set: (x: CheckItem[]) => void;
   node: string;
   showCompleteAll?: boolean;
   extraItems?: any;
+  className?: string;
 }) {
   const [active, setActive] = useState<number | null>(null),
     update = (i: number, x: Partial<CheckItem>) =>
@@ -5199,7 +5341,7 @@ function Checklist({
     bad = items.filter((x) => x.result === "不合格"),
     current = active === null ? null : items[active];
   return (
-    <div className="checklist-block">
+    <div className={`checklist-block ${className}`.trim()}>
       <div className="inspection-steps">
         <span className={active === null ? "active" : "done"}>1 項目總覽</span>
         <span className={active !== null ? "active" : ""}>2 逐項檢查</span>
@@ -5327,10 +5469,10 @@ function Checklist({
                 — 不適用
               </button>
             </div>
-            <div className="inspection-measure">
+            {current.requiresMeasurement === true && <div className="inspection-measure">
               <label className="field"><span>數值（需要時填寫）</span><input type="number" value={current.value || ""} onChange={(e) => update(active, { value: e.target.value })} placeholder="例如 1.2" /></label>
               <label className="field"><span>單位</span><select value={current.unit || ""} onChange={(e) => update(active, { unit: e.target.value })}><option value="">不需要</option><option>cm</option><option>mm</option><option>m</option><option>m²</option><option>坪</option><option>個</option></select></label>
-            </div>
+            </div>}
             <label className="field">
               <span>
                 {current.result === "不合格"
@@ -5418,7 +5560,8 @@ function RiskModal({
   close: () => void;
   save: (x: any) => void;
 }) {
-  const riskDraftKey = draftKey("risk", bad.map((x) => x.label).join("-") || "active");
+  const authUserId = useAuthOwner();
+  const riskDraftKey = draftKey(authUserId, "risk", bad.map((x) => x.label).join("-") || "active");
   const [r, setR] = useState(() => readDraft(riskDraftKey, {
       items: bad.map((x) => x.label).join("、"),
       detail: "",
@@ -5430,7 +5573,7 @@ function RiskModal({
     })),
     [sign, setSign] = useState(false);
   useOfflineDraftRestore(riskDraftKey, setR);
-  useEffect(() => { writeLocalDraft(riskDraftKey, { id: `risk-${bad.map((x) => x.label).join("-")}`, ...r }); }, [riskDraftKey, r, bad]);
+  useEffect(() => { writeLocalDraft(riskDraftKey, { id: `risk-${bad.map((x) => x.label).join("-")}`, ...r }, authUserId); }, [riskDraftKey, r, bad, authUserId]);
   return (
     <Modal close={close} title="風險告知／強制進場">
       <div className="form">
@@ -5601,6 +5744,7 @@ function Photos({
   node?: string;
   compact?: boolean;
 }) {
+  const useEnvironmentCapture = shouldUseEnvironmentCapture();
   const [processing, setProcessing] = useState(false),
     [photoError, setPhotoError] = useState(""),
     handleSelectedFiles = async (files: FileList | null) => {
@@ -5656,7 +5800,7 @@ function Photos({
             className="visually-hidden-file"
             type="file"
             accept="image/*"
-            capture="environment"
+            {...(useEnvironmentCapture ? { capture: "environment" as const } : {})}
             disabled={processing}
             onChange={handleInput}
           />
@@ -5767,6 +5911,34 @@ function Field({
     </label>
   );
 }
+function AreaDraftInput({
+  value,
+  unit,
+  setValue,
+  setUnit,
+}: {
+  value: string;
+  unit: AreaUnit;
+  setValue: (value: string) => void;
+  setUnit: (unit: AreaUnit) => void;
+}) {
+  const switchUnit = (nextUnit: AreaUnit) => {
+    setValue(convertAreaInput(value, unit, nextUnit));
+    setUnit(nextUnit);
+  };
+  return (
+    <label className="field">
+      <span>預估施工坪數</span>
+      <div className="area-input-row">
+        <input type="number" min="0" step="0.01" value={value} onChange={(event) => setValue(event.target.value)} />
+        <select value={unit} onChange={(event) => switchUnit(event.target.value as AreaUnit)}>
+          <option value="坪">坪</option>
+          <option value="m²">m²</option>
+        </select>
+      </div>
+    </label>
+  );
+}
 function Tabs({
   value,
   set,
@@ -5860,5 +6032,8 @@ function exportCsv(p: Project, records: ReturnType<typeof buildAcceptanceExportR
     new Blob(["\ufeff" + data], { type: "text/csv" }),
   );
   a.download = `${month}-${p.name}-月結.csv`;
+  document.body.appendChild(a);
   a.click();
+  a.remove();
+  revokeObjectUrlLater(a.href);
 }

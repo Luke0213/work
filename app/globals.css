@@ -999,3 +999,64 @@ img,canvas{max-width:100%}
   body.printing-billing .billing-print-area .table-wrap{overflow:visible}
   body.printing-billing .billing-print-area tbody button.ghost{display:inline-block!important;border:0;padding:0;background:transparent;color:inherit}
 }
+
+/* Acceptance entry and its dedicated A4 three-copy print layout. */
+.acceptance-checklist .inspection-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.acceptance-checklist .inspection-tile{min-width:0}
+.acceptance-checklist .inspection-tile b{max-width:100%;line-height:1.4;text-align:center;overflow-wrap:anywhere}
+.completion-supplementary-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.completion-paper,.completion-copy{box-sizing:border-box}
+
+@media(max-width:700px){
+  .acceptance-checklist .inspection-grid{grid-template-columns:1fr}
+  .acceptance-checklist .inspection-tile{width:100%;min-height:88px;padding:11px}
+  .completion-supplementary-fields{grid-template-columns:1fr}
+}
+
+@media print{
+  body.printing-completion{margin:0;background:#fff}
+  body.printing-completion *{visibility:hidden}
+  body.printing-completion .completion-paper,body.printing-completion .completion-paper *{visibility:visible}
+  body.printing-completion .completion-report-page{position:static;width:auto;margin:0;overflow:visible}
+  body.printing-completion .completion-report-toolbar{display:none!important}
+  body.printing-completion .completion-paper{position:absolute;inset:0;width:210mm;height:297mm;min-height:297mm;margin:0;padding:7mm 9mm;overflow:hidden;box-shadow:none;box-sizing:border-box}
+  body.printing-completion .completion-copy{height:87mm;min-width:0;margin:0 0 1.5mm;padding:0 0 1.5mm;box-sizing:border-box;break-inside:avoid;page-break-inside:avoid;overflow:hidden}
+  body.printing-completion .completion-copy:last-child{margin-bottom:0;padding-bottom:0;border-bottom:0}
+  body.printing-completion .completion-title{height:9mm}
+  body.printing-completion .completion-title h1{font-size:16px}
+  body.printing-completion .completion-copy table{min-width:0;font-size:8px;line-height:1.1}
+  body.printing-completion .completion-copy th,body.printing-completion .completion-copy td{height:5.7mm;padding:1px 3px}
+  body.printing-completion .completion-copy .section-row th{height:4mm;font-size:9px}
+  body.printing-completion .completion-copy .signature-row td{height:11mm}
+  body.printing-completion .completion-copy .signature-row img{height:7.5mm}
+}
+.area-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 82px;
+  gap: 8px;
+}
+
+.area-input-row > * {
+  min-width: 0;
+}
+
+.survey-estimated-area {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.survey-estimated-area strong {
+  white-space: nowrap;
+  font-size: 1.2rem;
+}
+.daily-acceptance-summary{display:flex;align-items:end;gap:16px;margin:16px 0}
+.daily-acceptance-summary .field{min-width:220px}
+.daily-acceptance-summary article{display:grid;gap:4px;padding:12px 18px;border:1px solid var(--line,#ddd);border-radius:12px}
+.daily-acceptance-summary article b{font-size:1.5rem}
+.daily-acceptance-history{display:flex;flex-wrap:wrap;gap:10px}
+.daily-acceptance-history button{display:flex;gap:12px;align-items:center}
+.clickable-row{cursor:pointer}
+
+@media(max-width:700px){.daily-acceptance-summary{align-items:stretch;flex-direction:column}.daily-acceptance-summary .field{min-width:0}}

@@ -78,17 +78,21 @@ test("backups are daily with bounded retention instead of running on every save"
   assert.match(fix, /cron\.unschedule/);
 });
 
-test("survey area supports known or pending values with standardized Excel units", async () => {
+test("unit estimated remains the canonical ping area and survey only displays it", async () => {
   const page = await read("app/page.tsx");
-  for (const value of ["areaStatus", "areaValue", "areaUnit", "待補", "坪數狀態", "坪數單位", "m²"]) assert.match(page, new RegExp(value));
-  assert.match(page, /pendingSurvey/);
+  assert.match(page, /estimated: areaInputToPing/);
+  assert.match(page, /const estimated = importedAreaToPing\(source\)/);
+  assert.match(page, /survey-estimated-area/);
+  assert.match(page, /沿用戶別主資料，此處僅供查看/);
+  assert.doesNotMatch(page, /pendingSurvey/);
+  assert.doesNotMatch(page, /setS\(\{ \.\.\.s, areaStatus: "known"/);
   assert.match(page, /record\.id === survey\.id/);
 });
 
 test("offline drafts are account-scoped and recoverable for every authorized role", async () => {
   const page = await read("app/page.tsx");
   assert.match(page, /spc-current-user-id/);
-  assert.match(page, /scopedKey\(workspaceDraftKey\)/);
+  assert.match(page, /scopedKey\(workspaceDraftKey, authUserId\)/);
   assert.doesNotMatch(page, /const durableDraft = canManageProjects \?/);
   assert.match(page, /setProjectsDurably/);
   assert.match(page, /暫存未完成驗收/);
@@ -204,11 +208,12 @@ test("photo picker keeps separate camera and gallery inputs on one resilient han
   const photos = page.slice(page.indexOf("function Photos"), page.indexOf("function PhotoGrid"));
   const camera = photos.slice(photos.indexOf('photo-source camera'), photos.indexOf('photo-source gallery'));
   const gallery = photos.slice(photos.indexOf('photo-source gallery'));
-  assert.match(camera, /type="file"[\s\S]*accept="image\/\*"[\s\S]*capture="environment"/);
+  assert.match(camera, /type="file"[\s\S]*accept="image\/\*"[\s\S]*useEnvironmentCapture[\s\S]*capture: "environment"/);
   assert.doesNotMatch(camera, /multiple/);
   assert.match(gallery, /type="file"[\s\S]*accept="image\/\*"[\s\S]*multiple/);
   assert.doesNotMatch(gallery, /capture=/);
-  assert.match(photos, /handleSelectedFiles/);
+  assert.equal((photos.match(/handleSelectedFiles\(input\.files\)/g) || []).length, 1);
+  assert.match(page, /shouldUseEnvironmentCapture/);
   assert.match(photos, /for \(const file of selectedFiles\)/);
   assert.match(photos, /照片處理中…/);
   assert.match(css, /\.visually-hidden-file\{position:absolute!important;width:1px!important/);
@@ -257,6 +262,52 @@ test("electronic acceptance excludes drafts and billing labels its CSV accuratel
   assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
 });
 
+test("project daily acceptance view derives final history and reuses shipment workbook", async () => {
+  const page = await read("app/page.tsx");
+  assert.match(page, /\["daily-acceptance", "✓", "今日驗收"\]/);
+  assert.match(page, /buildDailyAcceptanceEntries<Acceptance, Unit>/);
+  assert.match(page, /buildAcceptanceExportRecord\(p, unit, acceptance, true\)/);
+  assert.match(page, /createShipmentWorkbook\(p, exportRecords/);
+  assert.doesNotMatch(page, /function createDaily.*Workbook/i);
+});
+
+test("checklist measurement fields require an explicit item flag", async () => {
+  const page = await read("app/page.tsx");
+  assert.match(page, /requiresMeasurement\?: boolean/);
+  assert.match(page, /requiresMeasurement: label === "地坪平整度"/);
+  assert.match(page, /current\.requiresMeasurement === true && <div className="inspection-measure">/);
+  assert.doesNotMatch(page, /current\.value.*&& <div className="inspection-measure">/);
+  assert.doesNotMatch(page, /current\.result.*&& <div className="inspection-measure">/);
+});
+
+test("acceptance entry and formal sheet keep one completion mapping and three A4 copies", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  for (const value of [
+    "第一聯：客戶存根聯",
+    "第二聯：公司收執聯",
+    "第三聯：廠商收執聯",
+    "completion.floorAbnormal",
+    "completion.boardDamaged",
+    "completion.trashCleared",
+    "completion.abnormalUnit",
+    "completion.damagedMaterialType",
+    'a.completion?.floorAbnormal === true',
+    'a.completion?.boardDamaged === true',
+    'printWithLifecycleCleanup("printing-completion")',
+  ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  for (const value of [
+    "body.printing-completion .completion-paper",
+    "width:210mm",
+    "height:297mm",
+    "height:87mm",
+    "break-inside:avoid",
+    "page-break-inside:avoid",
+    ".acceptance-checklist .inspection-grid{grid-template-columns:repeat(3,minmax(0,1fr))}",
+  ]) assert.match(css, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
+});
+
 test("shipment preview exposes the company summary fields without changing other exporters", async () => {
   const page = await read("app/page.tsx");
   for (const value of ["出貨日期", "客戶名稱", "商品", "片／件 *0.3025", "單價／元", "進價／元", "record.areaSquareMeters", "record.areaPing", "record.unitPrice", "record.amount", "record.vendor"])
@@ -278,6 +329,6 @@ test("tablet and phone layouts use drawers, stacked forms, and safe scrolling", 
 test("every unfinished data-entry flow has durable drafts and notes", async () => {
   const page = await read("app/page.tsx");
   for (const value of ["project-onboarding", "unit-create", "global-product", "project-product", "riskDraftKey", "IndexedDB workspace save failed", "停車備註", "改善備註"]) assert.match(page, new RegExp(value));
-  assert.match(page, /readWorkspaceDraft\(\) \|\| indexedWorkspace\?\.payload/);
-  assert.match(page, /saveOfflineDraft\(\{ key: scopedKey\(workspaceDraftKey\)/);
+  assert.match(page, /readWorkspaceDraft\(authUserId\) \|\| indexedWorkspace\?\.payload/);
+  assert.match(page, /saveOfflineDraft\(\{ key: scopedKey\(workspaceDraftKey, owner\)/);
 });
