@@ -24,11 +24,14 @@ export function readPhotoCleanupQueue(storage: StorageLike, userId: string): Pho
     const parsed = JSON.parse(raw) as Partial<PhotoCleanupQueue>;
     if (parsed.owner !== userId || !Array.isArray(parsed.paths)) return { owner: userId, paths: [] };
     return { owner: userId, paths: parsed.paths.filter((path): path is string => typeof path === "string") };
-  } catch {
+  } catch (error) {
+    logStorageException("localStorage", "read", error);
     return { owner: userId, paths: [] };
   }
 }
 
 export function writePhotoCleanupQueue(storage: StorageLike, queue: PhotoCleanupQueue): void {
-  storage.setItem(scopedStorageKey("spc-photo-cleanup-queue", queue.owner), JSON.stringify(queue));
+  try { storage.setItem(scopedStorageKey("spc-photo-cleanup-queue", queue.owner), JSON.stringify(queue)); }
+  catch (error) { logStorageException("localStorage", "write", error); throw error; }
 }
+import { logStorageException } from "./storage-durability.ts";

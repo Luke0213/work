@@ -6,7 +6,8 @@ import { cleanupRemovedPhotos, loadLegacyWorkspace, loadWorkspace, saveWorkspace
 import { supabase } from "../lib/supabase";
 import { threeWayMerge } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
-import { clearOfflineOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft } from "../lib/offline-drafts";
+import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
+import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, type StorageErrorDetails } from "../lib/storage-durability";
 import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, saveReceivableWorkbook, saveShipmentWorkbook } from "../lib/acceptance-exports";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
@@ -366,13 +367,18 @@ const key = "spc-workflow-v2",
 const scopedKey = (base: string, owner: string) => scopedStorageKey(base, owner);
 const draftKey = (owner: string, kind: string, unitId: string) =>
     scopedDraftKey(owner, kind, unitId),
-  readLocal = (k: string) =>
-    typeof window === "undefined" ? "" : localStorage.getItem(k) || "",
+  readLocal = (k: string) => {
+    if (typeof window === "undefined") return "";
+    try { return localStorage.getItem(k) || ""; }
+    catch (error) { logStorageException("localStorage", "read", error); return ""; }
+  },
   readDraft = <T,>(k: string, fallback: T): T => {
     try {
       const raw = readLocal(k);
-      return raw ? { ...fallback, ...JSON.parse(raw) } : fallback;
-    } catch {
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && !isIndexedDbMarker(parsed) ? { ...fallback, ...parsed } : fallback;
+    } catch (error) {
+      logStorageException("localStorage", "read", error);
       return fallback;
     }
   },
@@ -383,13 +389,20 @@ const draftKey = (owner: string, kind: string, unitId: string) =>
     const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
     void saveOfflineDraft({ key: k, owner, kind, recordId: String(record.id || k), unitId: suffix.slice(kind.length + 1), payload: value, baseVersion: Number(record.baseVersion || 0), updatedBy: owner }).catch((error) => console.warn("SPC IndexedDB draft save failed", error));
     try {
-      localStorage.setItem(k, JSON.stringify(value));
+      localStorage.setItem(k, localDraftValue(value));
       return true;
     } catch (error) {
-      console.warn("SPC form draft save failed", error);
+      logStorageException("localStorage", "write", error);
       return false;
     }
   };
+const removeDurableDraft = (draftStorageKey: string) => {
+  if (typeof localStorage !== "undefined") {
+    try { localStorage.removeItem(draftStorageKey); }
+    catch (error) { logStorageException("localStorage", "delete", error); }
+  }
+  void removeOfflineDraft(draftStorageKey);
+};
 function useOfflineDraftRestore<T>(draftStorageKey: string, setValue: (value: T) => void) {
   useEffect(() => {
     let active = true;
@@ -410,10 +423,11 @@ const readWorkspaceDraft = (owner: string): LocalWorkspaceSnapshot | null => {
       const raw = localStorage.getItem(scopedKey(workspaceDraftKey, owner));
       if (!raw) return null;
       const parsed = JSON.parse(raw) as LocalWorkspaceSnapshot;
-      return Array.isArray(parsed.projects) && Array.isArray(parsed.catalog)
+      return !isIndexedDbMarker(parsed) && Array.isArray(parsed.projects) && Array.isArray(parsed.catalog)
         ? parsed
         : null;
-    } catch {
+    } catch (error) {
+      logStorageException("localStorage", "read", error);
       return null;
     }
   },
@@ -424,7 +438,7 @@ const readWorkspaceDraft = (owner: string): LocalWorkspaceSnapshot | null => {
     version: number,
     pending: boolean,
   ) => {
-    if (typeof window === "undefined") return true;
+    if (typeof window === "undefined") return { local: true, indexedDb: Promise.resolve(true) };
     const snapshot: LocalWorkspaceSnapshot = {
       savedAt: new Date().toISOString(),
       version,
@@ -432,16 +446,25 @@ const readWorkspaceDraft = (owner: string): LocalWorkspaceSnapshot | null => {
       projects,
       catalog,
     };
-    void saveOfflineDraft({ key: scopedKey(workspaceDraftKey, owner), owner, kind: "workspace", recordId: "workspace", unitId: "", payload: snapshot, baseVersion: version, updatedBy: owner }).catch((error) => console.warn("SPC IndexedDB workspace save failed", error));
+    const indexedDb = saveOfflineDraft({ key: scopedKey(workspaceDraftKey, owner), owner, kind: "workspace", recordId: "workspace", unitId: "", payload: snapshot, baseVersion: version, updatedBy: owner })
+      .then(() => {
+        try {
+          if (!local) localStorage.removeItem(scopedKey(workspaceDraftKey, owner));
+          localStorage.removeItem(scopedKey(key, owner));
+          localStorage.removeItem(scopedKey(productKey, owner));
+        } catch (error) { logStorageException("localStorage", "delete", error); }
+        return { ok: true as const, error: null };
+      })
+      .catch((error) => ({ ok: false as const, error: logStorageException("IndexedDB", "write", error) }));
+    let local = false;
+    let localError: StorageErrorDetails | null = null;
     try {
-      localStorage.setItem(scopedKey(workspaceDraftKey, owner), JSON.stringify(snapshot));
-      localStorage.setItem(scopedKey(key, owner), JSON.stringify(projects));
-      localStorage.setItem(scopedKey(productKey, owner), JSON.stringify(catalog));
-      return true;
+      localStorage.setItem(scopedKey(workspaceDraftKey, owner), localDraftValue({ id: "workspace", savedAt: snapshot.savedAt, version, pending }));
+      local = true;
     } catch (error) {
-      console.warn("SPC local draft save failed", error);
-      return false;
+      localError = logStorageException("localStorage", "write", error);
     }
+    return { local, localError, indexedDb };
   };
 const blankUnit = (): Unit => ({
   id: id(),
@@ -967,9 +990,10 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
   useEffect(() => {
     for (const legacyKey of ["spc-last-survey-person", "spc-last-crew", "spc-last-acceptance-person", "spc-dashboard-unit-filter"]) {
       const storage = legacyKey === "spc-dashboard-unit-filter" ? sessionStorage : localStorage;
-      migrateLegacyStorageValue(storage, legacyKey, authUserId);
+      try { migrateLegacyStorageValue(storage, legacyKey, authUserId); }
+      catch (error) { logStorageException("localStorage", "write", error); }
     }
-    setShowQuickStart(localStorage.getItem(scopedKey("spc-quick-start-seen", authUserId)) !== "1");
+    setShowQuickStart(readLocal(scopedKey("spc-quick-start-seen", authUserId)) !== "1");
     authDebug({ event: "WORKSPACE_MOUNT", generation: null, sessionUserId: authUserId, validatedUserId: authUserId, email, role: appRole, workspaceOwner: authUserId, mountId: mountIdRef.current });
     return () => authDebug({ event: "WORKSPACE_UNMOUNT", generation: null, sessionUserId: authUserId, validatedUserId: authUserId, email, role: appRole, workspaceOwner: authUserId, mountId: mountIdRef.current });
   }, [authUserId, email, appRole]);
@@ -1005,8 +1029,8 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
         const snapshot = await loadWorkspace();
         const legacy = snapshot.projects.length ? null : await loadLegacyWorkspace();
         if (!active) return;
-        const localProjects = normalize(JSON.parse(localStorage.getItem(scopedKey(key, authUserId)) || "[]"));
-        const localCatalog = JSON.parse(localStorage.getItem(scopedKey(productKey, authUserId)) || "[]") as Product[];
+        const localProjects = normalize(JSON.parse(readLocal(scopedKey(key, authUserId)) || "[]"));
+        const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
         const useDurableDraft = durableDraft?.pending || (!snapshot.projects.length && durableDraft?.projects.length);
         const loadedProjects = normalize(
           (useDurableDraft
@@ -1037,8 +1061,8 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
       } catch (error) {
         const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
         const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
-        const localProjects = normalize(JSON.parse(localStorage.getItem(scopedKey(key, authUserId)) || "[]"));
-        const localCatalog = JSON.parse(localStorage.getItem(scopedKey(productKey, authUserId)) || "[]") as Product[];
+        const localProjects = normalize(JSON.parse(readLocal(scopedKey(key, authUserId)) || "[]"));
+        const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
         const recoveredProjects = normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]);
         const recoveredCatalog = (durableDraft?.catalog?.length ? durableDraft.catalog : localCatalog) as Product[];
         if (active && recoveredProjects.length) {
@@ -1059,22 +1083,28 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
   }, [authUserId]);
   useEffect(() => {
     if (!ready) return;
+    let active = true;
+    let timer: number | undefined;
     const pendingDraft = !!readWorkspaceDraft(authUserId)?.pending;
     const current = { projects, catalog },
       baseline = baselineRef.current,
       changed = JSON.stringify(current) !== JSON.stringify(baseline);
-    const localSaved = writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, changed || pendingDraft);
-    if (!localSaved) {
-      setStorageWarning("本機暫存失敗：瀏覽器空間可能不足，請先下載備份");
-      return;
-    }
-    if (!changed && !pendingDraft) {
-      setStorageWarning("已儲存");
-      return;
-    }
-    setStorageWarning(navigator.onLine ? "儲存中：已暫存，正在同步…" : "尚未同步：已暫存，網路離線");
-    if (!navigator.onLine) return;
-    const timer = window.setTimeout(async () => {
+    const storage = writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, changed || pendingDraft);
+    void storage.indexedDb.then((indexedDb) => {
+      if (!active) return;
+      const errors = [storage.localError, indexedDb.error].filter((error): error is StorageErrorDetails => !!error);
+      const durable = durableStorageState(indexedDb.ok, storage.local, errors);
+      if (!changed && !pendingDraft) {
+        setStorageWarning(durable.saved ? (durable.fallbackOnly ? durable.message : "已儲存") : durable.message);
+        if (!durable.saved) void storageDiagnostics(authUserId).then((diagnostics) => console.warn("SPC storage diagnostics", diagnostics));
+        return;
+      }
+      setStorageWarning(durable.saved
+        ? (navigator.onLine ? `儲存中：${durable.message}，正在同步…` : `尚未同步：${durable.message}，網路離線`)
+        : (navigator.onLine ? `${durable.message}；正在直接同步雲端…` : `${durable.message}；目前離線，請勿關閉此頁`));
+      if (!durable.saved) void storageDiagnostics(authUserId).then((diagnostics) => console.warn("SPC storage diagnostics", diagnostics));
+      if (!shouldAttemptCloudSave(changed, pendingDraft, navigator.onLine)) return;
+      timer = window.setTimeout(async () => {
       if (savingRef.current) {
         retrySyncRef.current = true;
         return;
@@ -1110,9 +1140,14 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
         let removed = 0;
         try { removed = await cleanupRemovedPhotos(previous.projects, uploaded, authUserId); } catch { /* data is saved; cleanup can retry next time */ }
         if (stillCurrent) {
-          writeWorkspaceDraft(authUserId, uploaded, catalog, nextVersion, false);
-          await clearOfflineOutbox(authUserId);
-          setStorageWarning(`已儲存：已與 Supabase 同步 · 版本 ${nextVersion}${removed ? ` · 清理 ${removed} 張舊照片` : ""}`);
+          const committedCache = writeWorkspaceDraft(authUserId, uploaded, catalog, nextVersion, false);
+          const indexedCache = await committedCache.indexedDb;
+          const cacheErrors = [committedCache.localError, indexedCache.error].filter((error): error is StorageErrorDetails => !!error);
+          const cacheState = durableStorageState(indexedCache.ok, committedCache.local, cacheErrors);
+          try { await completeSyncedOutbox(authUserId); } catch (error) { logStorageException("IndexedDB", "delete", error); }
+          setStorageWarning(cacheState.saved
+            ? `已儲存：已與 Supabase 同步 · 版本 ${nextVersion}${removed ? ` · 清理 ${removed} 張舊照片` : ""}`
+            : "雲端已同步，但本機離線暫存不可用");
         } else {
           writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, nextVersion, true);
           retrySyncRef.current = true;
@@ -1134,8 +1169,12 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             ? `已合併其他電腦的更新；${merged.conflicts.length} 個同欄位衝突保留這台電腦的內容，正在重新同步…`
             : "已自動合併其他電腦的更新，正在重新同步…");
         } else {
-          writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, true);
-          setStorageWarning(`尚未同步：已暫存，${message}`);
+          const fallback = writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, true);
+          const indexedFallback = await fallback.indexedDb;
+          const fallbackErrors = [fallback.localError, indexedFallback.error].filter((storageError): storageError is StorageErrorDetails => !!storageError);
+          const durable = durableStorageState(indexedFallback.ok, fallback.local, fallbackErrors);
+          setStorageWarning(durable.saved ? `尚未同步：${durable.message}，${message}` : durable.message);
+          if (!durable.saved) void storageDiagnostics(authUserId).then((diagnostics) => console.warn("SPC storage diagnostics", diagnostics));
           void reportClientError(message, "supabase-sync", { version: versionRef.current });
         }
       } finally {
@@ -1145,8 +1184,9 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
           window.setTimeout(() => setSyncTick((value) => value + 1), 0);
         }
       }
-    }, 600);
-    return () => window.clearTimeout(timer);
+      }, 600);
+    });
+    return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); };
   }, [projects, catalog, ready, syncTick]);
   useEffect(() => {
     if (!ready) return;
@@ -1172,7 +1212,9 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
     const retry = () => setSyncTick((x) => x + 1);
     window.addEventListener("online", retry);
     const timer = window.setInterval(() => {
-      if (navigator.onLine && readWorkspaceDraft(authUserId)?.pending) retry();
+      if (!navigator.onLine) return;
+      void loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId))
+        .then((draft) => { if (draft?.payload.pending) retry(); });
     }, 15000);
     return () => {
       window.removeEventListener("online", retry);
@@ -1722,7 +1764,7 @@ function ProjectOnboarding({
       expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "",
       units, products, journals: [],
     }, products);
-    localStorage.removeItem(onboardingKey);
+    removeDurableDraft(onboardingKey);
     void removeOfflineDraft(onboardingKey);
   };
   return (
@@ -2277,8 +2319,7 @@ function Units({
     };
     patch({ units: [...p.units, u] });
     setDraft(empty);
-    localStorage.removeItem(draftKey(authUserId, "unit-create", p.id));
-    void removeOfflineDraft(draftKey(authUserId, "unit-create", p.id));
+    removeDurableDraft(draftKey(authUserId, "unit-create", p.id));
     setError("");
     open(u.id);
   };
@@ -2330,8 +2371,7 @@ function Units({
     setRows([{ ...empty }]);
     setBatch(false);
     setCreating(false);
-    localStorage.removeItem(draftKey(authUserId, "unit-create", p.id));
-    void removeOfflineDraft(draftKey(authUserId, "unit-create", p.id));
+    removeDurableDraft(draftKey(authUserId, "unit-create", p.id));
     setError("");
   };
   return (
@@ -3347,7 +3387,7 @@ function GlobalProducts({
       ...products,
     ]);
     setForm(blank());
-    localStorage.removeItem(formDraftKey);
+    removeDurableDraft(formDraftKey);
     void removeOfflineDraft(formDraftKey);
   };
   return (
@@ -3523,7 +3563,7 @@ function Products({
       spec: "",
       note: "",
     });
-    localStorage.removeItem(productDraftKey);
+    removeDurableDraft(productDraftKey);
     void removeOfflineDraft(productDraftKey);
   };
   return (
@@ -4120,8 +4160,7 @@ function SurveyTab({
       });
       add("完成場勘", s.decision, allPhotos);
       localStorage.setItem(scopedKey("spc-last-survey-person", authUserId), s.person);
-      localStorage.removeItem(draftKey(authUserId, "survey", u.id));
-      void removeOfflineDraft(draftKey(authUserId, "survey", u.id));
+      removeDurableDraft(draftKey(authUserId, "survey", u.id));
       queueRecordChange(authUserId, "survey", u.id, survey, "complete");
       setSaved("✓ 場勘結果已儲存成功");
       setConfirming(false);
@@ -4350,8 +4389,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
     });
     add(title, w.content, w.photos);
     localStorage.setItem(scopedKey("spc-last-crew", authUserId), w.crew);
-    localStorage.removeItem(draftKey(authUserId, "work", u.id));
-    void removeOfflineDraft(draftKey(authUserId, "work", u.id));
+    removeDurableDraft(draftKey(authUserId, "work", u.id));
     queueRecordChange(authUserId, "work", u.id, { ...w, draft: false }, done ? "complete" : "upsert");
     setSaved(
       done ? "✓ 施工完成紀錄已儲存，狀態已改為待驗收" : "✓ 施工紀錄已儲存成功",
@@ -4542,8 +4580,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       });
       add(a.recheck ? "完成複驗" : "完成驗收", a.result, allPhotos);
       localStorage.setItem(scopedKey("spc-last-acceptance-person", authUserId), a.person);
-      localStorage.removeItem(draftKey(authUserId, "accept", u.id));
-      void removeOfflineDraft(draftKey(authUserId, "accept", u.id));
+      removeDurableDraft(draftKey(authUserId, "accept", u.id));
       queueRecordChange(authUserId, "accept", u.id, { ...a, draft: false }, "complete");
       setSaved(`✓ ${a.recheck ? "複驗" : "驗收"}結果已儲存成功`);
       setConfirming(false);
@@ -4922,8 +4959,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     setEntry(record);
     if (draft) writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), record, authUserId);
     else {
-      localStorage.removeItem(draftKey(authUserId, "unit-journal", u.id));
-      void removeOfflineDraft(draftKey(authUserId, "unit-journal", u.id));
+      removeDurableDraft(draftKey(authUserId, "unit-journal", u.id));
     }
     queueRecordChange(authUserId, "unit-journal", u.id, record, draft ? "upsert" : "complete");
     setSaved(draft ? "✓ 驗收日誌已暫存，可稍後或換裝置繼續" : editingExisting ? "✓ 既有驗收日誌已更新" : "✓ 驗收日誌已完成並儲存");
@@ -4932,8 +4968,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     const next = blank();
     setEntry(next);
     setSaved("");
-    localStorage.removeItem(draftKey(authUserId, "unit-journal", u.id));
-    void removeOfflineDraft(draftKey(authUserId, "unit-journal", u.id));
+    removeDurableDraft(draftKey(authUserId, "unit-journal", u.id));
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   return <div className="panel form">
@@ -5011,14 +5046,12 @@ function Journal({
     skipNextDraftWrite.current = true;
     setEntry(saved);
     setSavedMessage(existing ? "✓ 既有今日日誌已更新" : "✓ 今日日誌已建立");
-    localStorage.removeItem(draftKey(authUserId, "journal", p.id));
-    void removeOfflineDraft(draftKey(authUserId, "journal", p.id));
+    removeDurableDraft(draftKey(authUserId, "journal", p.id));
   };
   const startNew = () => {
     setEntry(blank(date));
     setSavedMessage("");
-    localStorage.removeItem(draftKey(authUserId, "journal", p.id));
-    void removeOfflineDraft(draftKey(authUserId, "journal", p.id));
+    removeDurableDraft(draftKey(authUserId, "journal", p.id));
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   return (
@@ -5753,7 +5786,7 @@ function RiskModal({
           disabled={!r.detail || !r.reason || !r.person || !r.signature}
           onClick={() => {
             save(r);
-            localStorage.removeItem(riskDraftKey);
+            removeDurableDraft(riskDraftKey);
             void removeOfflineDraft(riskDraftKey);
           }}
         >

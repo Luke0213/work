@@ -277,6 +277,21 @@ test("work journal Word export uses split first page and six fitted photos per p
   assert.doesNotMatch(exporter, /填寫人：|建立：|最後修改：/);
 });
 
+test("storage cache failures are classified and do not block Supabase saving", async () => {
+  const page = await read("app/page.tsx");
+  const durability = await read("lib/storage-durability.ts");
+  const offline = await read("lib/offline-drafts.ts");
+  assert.match(page, /shouldAttemptCloudSave\(changed, pendingDraft, navigator\.onLine\)/);
+  assert.match(page, /雲端已同步，但本機離線暫存不可用/);
+  assert.doesNotMatch(durability, /空間可能不足/);
+  for (const value of ["QuotaExceededError", "SecurityError", "InvalidStateError", "VersionError", "AbortError", "UnknownError", "layer", "operation", "name", "message", "code"])
+    assert.match(durability, new RegExp(value));
+  assert.match(offline, /request\.onupgradeneeded/);
+  assert.match(offline, /createObjectStore\("drafts"/);
+  assert.match(offline, /createObjectStore\("outbox"/);
+  assert.match(offline, /request\.onsuccess/);
+});
+
 test("unit and project journals reopen and update the same record without duplicates", async () => {
   const page = await read("app/page.tsx");
   const unitJournal = page.slice(page.indexOf("function UnitJournalTab"), page.indexOf("function Journal("));
@@ -298,7 +313,7 @@ test("unit and project journals reopen and update the same record without duplic
   assert.match(projectJournal, /查看／修改/);
   assert.match(projectJournal, /新增今日日誌/);
   assert.match(projectJournal, /confirm\("刪除此筆當日日誌？"\)/);
-  assert.match(projectJournal, /removeOfflineDraft\(draftKey\(authUserId, "journal", p\.id\)\)/);
+  assert.match(projectJournal, /removeDurableDraft\(draftKey\(authUserId, "journal", p\.id\)\)/);
 
   assert.match(wordExporter, /columnWidths: \[4400, 4960\]/);
   assert.doesNotMatch(wordExporter, /正在修改|新增今日日誌|新增驗收日誌/);
@@ -410,7 +425,7 @@ test("final mobile unit manager override stays full-width with compact shrinkabl
 
 test("every unfinished data-entry flow has durable drafts and notes", async () => {
   const page = await read("app/page.tsx");
-  for (const value of ["project-onboarding", "unit-create", "global-product", "project-product", "riskDraftKey", "IndexedDB workspace save failed", "停車備註", "改善備註"]) assert.match(page, new RegExp(value));
+  for (const value of ["project-onboarding", "unit-create", "global-product", "project-product", "riskDraftKey", "logStorageException", "停車備註", "改善備註"]) assert.match(page, new RegExp(value));
   assert.match(page, /readWorkspaceDraft\(authUserId\) \|\| indexedWorkspace\?\.payload/);
   assert.match(page, /saveOfflineDraft\(\{ key: scopedKey\(workspaceDraftKey, owner\)/);
 });

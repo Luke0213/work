@@ -1,5 +1,6 @@
 import { supabase } from "./supabase";
 import { readPhotoCleanupQueue, scopedStorageKey, writePhotoCleanupQueue } from "./auth-storage";
+import { logStorageException } from "./storage-durability.ts";
 
 export type EntityActivity = {
   entityType: string;
@@ -164,6 +165,7 @@ export async function cleanupRemovedPhotos(before: unknown, after: unknown, auth
     const { error } = await supabase.storage.from("spc-photos").remove(removed.slice(i, i + 100));
     if (error) throw error;
   }
-  localStorage.removeItem(queueKey);
+  try { localStorage.removeItem(queueKey); }
+  catch (error) { logStorageException("localStorage", "delete", error); }
   return removed.length;
 }
