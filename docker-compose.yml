@@ -1,0 +1,16 @@
+services:
+  spc-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: spc-project-management:latest
+    container_name: spc-project-management
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.docker
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000

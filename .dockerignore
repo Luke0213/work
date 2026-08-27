@@ -1,0 +1,16 @@
+.git
+.sites-runtime
+.wrangler
+.next
+dist
+build
+node_modules
+coverage
+*.log
+*.tmp
+tsconfig.tsbuildinfo
+.env
+.env.*
+!.env.docker.example
+supabase
+public/screenshot.jpeg
