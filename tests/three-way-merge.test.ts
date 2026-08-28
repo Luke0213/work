@@ -117,3 +117,22 @@ test("durable tombstones protect every unit history collection", () => {
     assert.deepEqual((result.value.projects[0].units[0] as any)[collection], [deleted]);
   }
 });
+
+test("stale clients cannot erase project floor acceptances by omission, empty, or null", () => {
+  const floor = { id: "floor-a-14", building: "A棟", floor: "14F", signatures: { office: { valid: true } } };
+  const base = { projects: [{ id: "p1", floorAcceptances: [floor], units: [] }] };
+  const missing = { projects: [{ id: "p1", units: [] }] };
+  const empty = { projects: [{ id: "p1", floorAcceptances: [], units: [] }] };
+  const withNull = { projects: [{ id: "p1", floorAcceptances: null, units: [] }] };
+  assert.deepEqual((threeWayMerge(base, missing, base).value.projects[0] as any).floorAcceptances, [floor]);
+  assert.deepEqual(threeWayMerge(base, empty, base).value.projects[0].floorAcceptances, [floor]);
+  assert.deepEqual((threeWayMerge(base, withNull, base).value.projects[0] as any).floorAcceptances, [floor]);
+});
+
+test("different buildings retain independent same-floor signature records", () => {
+  const a = { id: "a14", building: "A棟", floor: "14F", signatures: { office: { name: "A" } } };
+  const b = { id: "b14", building: "B棟", floor: "14F", signatures: { office: { name: "B" } } };
+  const base = { projects: [{ id: "p1", floorAcceptances: [], units: [] }] };
+  const merged = threeWayMerge(base, { projects: [{ id: "p1", floorAcceptances: [a], units: [] }] }, { projects: [{ id: "p1", floorAcceptances: [b], units: [] }] });
+  assert.deepEqual(merged.value.projects[0].floorAcceptances, [a, b]);
+});

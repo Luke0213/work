@@ -17,6 +17,7 @@ import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-
 import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { importableUnitRows, importProductKey, safeImportedEstimated } from "../lib/unit-import";
+import { canCompleteFloorAcceptance, createFloorReturnContext, floorAcceptanceSummary, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitsFor, resolveFloorSignatures, updateFloorSignature, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole } from "../lib/floor-acceptance";
 
 type Status =
   | "待確認"
@@ -241,6 +242,7 @@ type Project = {
   units: Unit[];
   products: Product[];
   journals: DailyNote[];
+  floorAcceptances?: FloorAcceptanceRecord[];
 };
 type LocalWorkspaceSnapshot = {
   savedAt: string;
@@ -499,6 +501,7 @@ const blankUnit = (): Unit => ({
   defects: [],
   acceptances: [],
   journals: [],
+  floorAcceptances: [],
   events: [
     {
       id: id(),
@@ -563,6 +566,7 @@ function normalize(p: Project[]): Project[] {
     importRule: x.importRule || "",
     products: x.products || [],
     journals: x.journals || [],
+    floorAcceptances: x.floorAcceptances,
     units: (x.units || []).map((u: any) => ({
       ...blankUnit(),
       ...u,
@@ -978,6 +982,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
     [catalog, setCatalog] = useState<Product[]>([]),
     [pid, setPid] = useState(""),
     [uid, setUid] = useState(""),
+    [floorContext, setFloorContext] = useState<FloorReturnContext | null>(null),
     [view, setView] = useState("dashboard"),
     [ready, setReady] = useState(false),
     [menuOpen, setMenuOpen] = useState(false),
@@ -1376,6 +1381,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             className="brand-home-button"
             onClick={() => {
               setUid("");
+              setFloorContext(null);
               setView("dashboard");
             }}
             aria-label="返回主頁"
@@ -1444,7 +1450,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             {canManageAccounts && (
               <button
                 className={view === "accounts" ? "global-products active" : "global-products"}
-                onClick={() => { setUid(""); setView("accounts"); }}
+                onClick={() => { setUid(""); setFloorContext(null); setView("accounts"); }}
               >
                 <span>♙</span>
                 <b>帳號管理</b>
@@ -1470,6 +1476,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
                   onClick={() => {
                     setPid(p.id);
                     setUid("");
+                    setFloorContext(null);
                     setView("dashboard");
                   }}
                 >
@@ -1491,6 +1498,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
                           className={view === key && !uid ? "active" : ""}
                           onClick={() => {
                             setUid("");
+                            setFloorContext(null);
                             setView(key);
                           }}
                         >
@@ -1533,11 +1541,25 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
               patch={patchUnit}
               patchProject={patchProject}
               addEvent={addEvent}
-              back={() => setUid("")}
+              floorContext={floorContext}
+              floorUnits={floorContext ? floorUnitsFor(project.units, floorContext.building, floorContext.floor) : []}
+              openUnit={setUid}
+              back={() => {
+                setUid("");
+                if (floorContext) window.setTimeout(() => window.scrollTo({ top: floorContext.scrollY }), 0);
+              }}
               remove={() => {
                 removeUnit(unit.id);
                 setUid("");
               }}
+            />
+          ) : floorContext ? (
+            <FloorAcceptanceView
+              project={project}
+              context={floorContext}
+              patch={patchProject}
+              openUnit={(unitId, context) => { setFloorContext(context); setUid(unitId); }}
+              back={() => setFloorContext(null)}
             />
           ) : (
             <ProjectArea
@@ -1545,7 +1567,8 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
               view={view}
               setView={setView}
               patch={patchProject}
-              open={setUid}
+              open={(unitId) => { setFloorContext(null); setUid(unitId); }}
+              openFloor={(building, floor) => setFloorContext(createFloorReturnContext(building, floor))}
               remove={removeProject}
             />
           )}
@@ -1796,6 +1819,7 @@ function ProjectArea({
   setView,
   patch,
   open,
+  openFloor,
   remove,
 }: {
   project: Project;
@@ -1803,6 +1827,7 @@ function ProjectArea({
   setView: (x: string) => void;
   patch: (x: Partial<Project>) => void;
   open: (x: string) => void;
+  openFloor: (building: string, floor: string) => void;
   remove: () => void;
 }) {
   return (
@@ -1844,7 +1869,7 @@ function ProjectArea({
       {view === "dashboard" && (
         <Dashboard p={project} open={open} setView={setView} />
       )}{" "}
-      {view === "units" && <Units p={project} patch={patch} open={open} />}{" "}
+      {view === "units" && <Units p={project} patch={patch} open={open} openFloor={openFloor} />}{" "}
       {view === "daily-acceptance" && <DailyAcceptanceView p={project} />}{" "}
       {view === "products" && <Products p={project} patch={patch} />}{" "}
       {view === "journal" && <Journal p={project} patch={patch} />}{" "}
@@ -2125,10 +2150,12 @@ function Units({
   p,
   patch,
   open,
+  openFloor,
 }: {
   p: Project;
   patch: (x: Partial<Project>) => void;
   open: (x: string) => void;
+  openFloor: (building: string, floor: string) => void;
 }) {
   const authUserId = useAuthOwner();
   const empty = {
@@ -2779,7 +2806,8 @@ function Units({
                               floorUnits.filter((u) => getUnitCurrentStatus(u) === s).length,
                             ] as const,
                         )
-                        .filter((x) => x[1] > 0);
+                        .filter((x) => x[1] > 0),
+                      acceptanceSummary = floorAcceptanceSummary(floorUnits);
                     return (
                       <div className="floor-group" key={groupKey}>
                         <div
@@ -2821,6 +2849,13 @@ function Units({
                               {isOpen ? "⌃" : "›"}
                             </span>
                           </button>
+                          {!bulkMode && <button className="floor-acceptance-entry" type="button" onClick={() => openFloor(
+                            floorUnits[0]?.building || (building === "未分類棟" ? "" : building),
+                            floorUnits[0]?.floor || (floor === "未分類樓層" ? "" : floor),
+                          )}>
+                            <b>驗收／簽名</b>
+                            <small>{acceptanceSummary.allQualified ? `✓ ${acceptanceSummary.total} / ${acceptanceSummary.total} 全部合格` : `合格 ${acceptanceSummary.qualified} · 待處理 ${acceptanceSummary.needsAction} · 未驗收 ${acceptanceSummary.uninspected}`}</small>
+                          </button>}
                         </div>
                         {isOpen && (
                           <div className="unit-cards">
@@ -3691,6 +3726,68 @@ function Products({
     </div>
   );
 }
+function FloorAcceptanceView({ project, context, patch, openUnit, back }: {
+  project: Project;
+  context: FloorReturnContext;
+  patch: (value: Partial<Project>) => void;
+  openUnit: (unitId: string, context: FloorReturnContext) => void;
+  back: () => void;
+}) {
+  const authUserId = useAuthOwner();
+  const units = floorUnitsFor(project.units, context.building, context.floor);
+  const record = (project.floorAcceptances || []).find((item) => item.building === context.building && item.floor === context.floor);
+  const summary = floorAcceptanceSummary(units);
+  const resolved = resolveFloorSignatures(record, units);
+  const [filter, setFilter] = useState<"all" | "incomplete">(context.filter);
+  const [expanded, setExpanded] = useState(context.expanded);
+  const [signRole, setSignRole] = useState<FloorSignatureRole | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [editingCompleted, setEditingCompleted] = useState(!record?.completedAt);
+  const visibleUnits = filter === "incomplete" ? units.filter((unit) => floorUnitAcceptanceState(unit) !== "qualified") : units;
+  const saveRecord = (changes: Partial<FloorAcceptanceRecord>) => {
+    const now = stamp();
+    const next: FloorAcceptanceRecord = {
+      id: record?.id || id(), building: context.building, floor: context.floor,
+      signatures: record?.signatures || {}, createdAt: record?.createdAt || now, ...record, ...changes, updatedAt: now,
+    };
+    patch({ floorAcceptances: [...(project.floorAcceptances || []).filter((item) => item.id !== next.id && !(item.building === context.building && item.floor === context.floor)), next] });
+  };
+  const returnContext = (tab: "accept" | "sheet" = "accept") => createFloorReturnContext(context.building, context.floor, filter, expanded, window.scrollY, tab);
+  const signatureLabels: Record<FloorSignatureRole, string> = { installer: "施工人員", office: "工務人員", siteManager: "工地主任", supervisor: "神銀主管" };
+  const signaturesReady = resolved.conflicts.length === 0 && floorSignatureRoles.every((role) => resolved.signatures[role]?.valid === true);
+  return <div className="floor-acceptance-page">
+    <button className="back" onClick={back}>← 返回戶別管理</button>
+    <section className="panel floor-acceptance-hero">
+      <div><p className="eyebrow">{project.name}</p><h1>{context.building} · {context.floor} 樓層驗收</h1><p>{units.length} 戶 · 合格 {summary.qualified} · 待處理 {summary.needsAction} · 未驗收 {summary.uninspected}</p></div>
+      <div className={summary.allQualified ? "floor-ready" : "floor-pending"}>{summary.allQualified ? `✓ ${summary.total} / ${summary.total} 全部合格` : `尚有 ${summary.needsAction + summary.uninspected} 戶未全數合格`}</div>
+    </section>
+    <section className="panel floor-unit-section">
+      <div className="panel-head"><div><h2>戶別驗收進度</h2><p>點擊戶別直接進入原驗收頁。</p></div><button className="ghost" onClick={() => setExpanded((value) => !value)}>{expanded ? "收起" : "展開"}</button></div>
+      <div className="floor-filter"><button className={filter === "all" ? "selected" : ""} onClick={() => setFilter("all")}>全部</button><button className={filter === "incomplete" ? "selected" : ""} onClick={() => setFilter("incomplete")}>只看未合格</button></div>
+      {expanded && <div className="floor-acceptance-grid">{visibleUnits.map((unit) => {
+        const state = floorUnitAcceptanceState(unit);
+        return <button className={`floor-unit-card ${state}`} key={unit.id} onClick={() => openUnit(unit.id, returnContext("accept"))}><b>{unit.number || "未命名"}</b><span>{state === "qualified" ? "✓ 合格" : state === "needsAction" ? "⚠ 待改善" : "○ 未驗收"}</span></button>;
+      })}{!visibleUnits.length && <p className="muted">目前沒有未合格戶別。</p>}</div>}
+    </section>
+    <section className="panel floor-signature-section">
+      <div className="panel-head"><div><h2>樓層四人簽名</h2><p>樓層簽名優先；未建立時，歷史正式驗收簽名只做唯讀 fallback，不會寫回或搬移。</p></div>{record?.completedAt && !editingCompleted && <button className="ghost" onClick={() => { if (confirm("重新編輯簽名會撤回樓層完成狀態，修改後需再次確認完成。是否繼續？")) { saveRecord({ completedAt: undefined, completedBy: undefined }); setEditingCompleted(true); } }}>重新編輯簽名</button>}</div>
+      {!!resolved.conflicts.length && <div className="form-error">同樓層歷史簽名不一致：{resolved.conflicts.map((role) => signatureLabels[role]).join("、")}。系統不會自動選用，請重新確認並簽名。</div>}
+      <div className="floor-signature-grid">{floorSignatureRoles.map((role) => {
+        const own = record?.signatures?.[role];
+        const shown = own?.valid ? own : resolved.signatures[role];
+        const legacy = !own?.valid && !!shown;
+        return <div className="completion-sign-box" key={role}><b>{signatureLabels[role]}</b>{shown?.valid ? <Signed s={shown} /> : <p className="muted">尚未簽名</p>}{legacy && <small className="legacy-signature-badge">歷史簽名（沿用）</small>}{editingCompleted && <div className="actions"><button className="ghost" onClick={() => setSignRole(role)}>{own?.valid ? "重新簽名" : legacy ? "改為樓層簽名" : "觸控簽名"}</button>{own?.valid && <button className="danger" onClick={() => confirm(`只清除${signatureLabels[role]}的樓層簽名？`) && saveRecord({ signatures: updateFloorSignature(record?.signatures, role) })}>清除</button>}</div>}</div>;
+      })}</div>
+    </section>
+    <section className="panel floor-completion-actions">
+      <div>{record?.completedAt ? <><h2>✓ 樓層驗收已完成</h2><p>{record.completedAt}{record.completedBy ? ` · ${record.completedBy}` : ""}</p></> : <><h2>完成樓層驗收</h2><p>{!summary.allQualified ? `尚有 ${summary.needsAction + summary.uninspected} 戶未全數合格` : !signaturesReady ? "四位人員簽名尚未全部完成" : "全部戶別及四位人員簽名均已完成"}</p></>}</div>
+      <div className="actions">{units.some((unit) => getLatestFinalAcceptance(unit)) && <button className="ghost" onClick={() => { const unit = units.find((item) => getLatestFinalAcceptance(item)); if (unit) openUnit(unit.id, returnContext("sheet")); }}>查看三聯驗收單</button>}<button className="primary" disabled={!!record?.completedAt || !canCompleteFloorAcceptance(units, resolved)} onClick={() => setConfirming(true)}>完成樓層驗收</button></div>
+    </section>
+    {signRole && <Sign close={() => setSignRole(null)} save={(signature) => { saveRecord({ signatures: updateFloorSignature(record?.signatures, signRole, signature) }); setSignRole(null); }} />}
+    {confirming && <Modal close={() => setConfirming(false)} title="確認完成樓層驗收"><p>{context.floor} 已全部驗收合格<br />四位人員簽名均已完成</p><p>確認完成 {context.floor} 樓層驗收？</p><div className="form-actions"><button className="ghost" onClick={() => setConfirming(false)}>取消</button><button className="primary" onClick={() => { saveRecord({ completedAt: stamp(), completedBy: authUserId }); setConfirming(false); setEditingCompleted(false); }}>確認完成</button></div></Modal>}
+  </div>;
+}
+
 function UnitDetail({
   project,
   unit,
@@ -3700,6 +3797,9 @@ function UnitDetail({
   patchProject,
   addEvent,
   back,
+  floorContext,
+  floorUnits,
+  openUnit,
   remove,
 }: {
   project: Project;
@@ -3710,17 +3810,32 @@ function UnitDetail({
   patchProject: (x: Partial<Project>) => void;
   addEvent: (a: string, b: string, p?: Photo[]) => void;
   back: () => void;
+  floorContext: FloorReturnContext | null;
+  floorUnits: Unit[];
+  openUnit: (unitId: string) => void;
   remove: () => void;
 }) {
-  const [tab, setTab] = useState("master");
+  const [tab, setTab] = useState(floorContext?.tab || "master");
+  useEffect(() => { if (floorContext?.tab) setTab(floorContext.tab); }, [unit.id, floorContext?.tab]);
   useEffect(() => {
     if (!canUseUnitTab(role, tab)) setTab("master");
   }, [role, tab]);
   return (
     <>
       <button className="back" onClick={back}>
-        ← 返回戶別管理
+        {floorContext ? `← 返回 ${floorContext.floor || "未分類樓層"} 樓層驗收` : "← 返回戶別管理"}
       </button>
+      {floorContext && <div className="floor-unit-navigation">
+        <button className="ghost" disabled={floorUnits.findIndex((item) => item.id === unit.id) <= 0} onClick={() => {
+          const index = floorUnits.findIndex((item) => item.id === unit.id);
+          if (index > 0) openUnit(floorUnits[index - 1].id);
+        }}>← 上一戶</button>
+        <span>{floorContext.building} · {floorContext.floor}</span>
+        <button className="ghost" disabled={floorUnits.findIndex((item) => item.id === unit.id) < 0 || floorUnits.findIndex((item) => item.id === unit.id) >= floorUnits.length - 1} onClick={() => {
+          const index = floorUnits.findIndex((item) => item.id === unit.id);
+          if (index >= 0 && index < floorUnits.length - 1) openUnit(floorUnits[index + 1].id);
+        }}>下一戶 →</button>
+      </div>}
       <div className="unit-head">
         <div className="unit-head-copy">
           <p className="eyebrow">{project.name}</p>
@@ -4628,7 +4743,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       <div className="panel-head">
         <div>
           <h2>{a.recheck ? "複驗" : "完工驗收"}</h2>
-          <p>基本資料與施工紀錄會自動帶入；保留驗收人填寫。</p>
+          <p>基本資料與施工紀錄會自動帶入；戶別完成以逐項驗收結果為準，四人簽名統一於樓層驗收完成。</p>
         </div>
       </div>
       <InspectionGuide />
@@ -4702,7 +4817,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       )}
       <div className="form-actions">
         <button className="ghost" type="button" onClick={saveDraft}>暫存未完成驗收</button>
-        <button className="primary" disabled={!a.person || !(a.completion?.signatures?.office?.valid || a.signature?.valid) || incomplete || invalidBad} onClick={() => setConfirming(true)}>進入最後確認</button>
+        <button className="primary" disabled={!a.person || incomplete || invalidBad} onClick={() => setConfirming(true)}>進入最後確認</button>
       </div>
       {confirming && <Modal close={() => setConfirming(false)} title={`最後確認｜${a.recheck ? "複驗" : "驗收"}`}>
         <RecordConfirmation title="驗收資料" rows={[
@@ -5445,11 +5560,18 @@ function buildCompletionExportDraft(project: Project, unit: Unit, acceptance: Ac
 function Sheet({ project, u }: { project: Project; u: Unit }) {
   const a = getLatestFinalAcceptance(u);
   if (!a) return <div className="panel empty"><h2>尚無正式驗收資料</h2><p>目前尚無正式驗收紀錄，完成驗收後即可產生電子驗收單。</p></div>;
-  return <CompletionReport project={project} unit={u} acceptance={a} completion={completionDefaults(a, u)} />;
+  const floorRecord = (project.floorAcceptances || []).find((record) => record.building === u.building && record.floor === u.floor);
+  const floorUnits = floorUnitsFor(project.units, u.building, u.floor);
+  const resolved = resolveFloorSignatures(floorRecord, floorUnits);
+  return <CompletionReport project={project} unit={u} acceptance={a} completion={completionDefaults(a, u)} signatures={resolved.signatures} signatureConflicts={resolved.conflicts} />;
 }
 
-function CompletionReport({ project, unit, acceptance, completion }: { project: Project; unit: Unit; acceptance: Acceptance; completion: NonNullable<Acceptance["completion"]> }) {
-  const createDraft = () => buildCompletionExportDraft(project, unit, acceptance, completion);
+function CompletionReport({ project, unit, acceptance, completion, signatures, signatureConflicts = [] }: { project: Project; unit: Unit; acceptance: Acceptance; completion: NonNullable<Acceptance["completion"]>; signatures?: NonNullable<Acceptance["completion"]>["signatures"]; signatureConflicts?: FloorSignatureRole[] }) {
+  const reportSignatures = signatures || completion.signatures;
+  const createDraft = () => {
+    const draft = buildCompletionExportDraft(project, unit, acceptance, completion);
+    return { ...draft, signatureNames: { ...draft.signatureNames, ...Object.fromEntries(floorSignatureRoles.map((role) => [role, reportSignatures[role]?.name || draft.signatureNames[role]])) } };
+  };
   const [exportDraft, setExportDraft] = useState<CompletionExportDraft>(createDraft);
   const [stage, setStage] = useState<"preview" | "edit" | "confirm">("preview");
   const setText = (key: keyof CompletionExportDraft, value: string) => setExportDraft((current) => ({ ...current, [key]: value }));
@@ -5472,8 +5594,9 @@ function CompletionReport({ project, unit, acceptance, completion }: { project: 
       <div className="form-actions"><button className="ghost" onClick={() => setStage("preview")}>取消</button><button className="primary" onClick={() => setStage("confirm")}>確認資料</button></div>
     </section>}
     {stage === "confirm" && <div className="panel completion-export-confirm"><div><h2>確認匯出</h2><p>請核對下方三聯內容；確認後才會開啟列印。</p></div><div className="actions"><button className="ghost" onClick={() => setStage("edit")}>返回修改</button><button className="primary" onClick={() => printWithLifecycleCleanup("printing-completion")}>確認匯出</button></div></div>}
+    {!!signatureConflicts.length && <div className="warning">同樓層既有簽名資料不一致：{signatureConflicts.map((role) => signatureLabels[role]).join("、")}。系統未自動選用，請至樓層驗收重新確認。</div>}
     <div className="completion-paper">
-      {(["第一聯：客戶存根聯", "第二聯：公司收執聯", "第三聯：廠商收執聯"] as const).map((copy) => <CompletionCopy key={copy} copy={copy} draft={exportDraft} signatures={completion.signatures} />)}
+      {(["第一聯：客戶存根聯", "第二聯：公司收執聯", "第三聯：廠商收執聯"] as const).map((copy) => <CompletionCopy key={copy} copy={copy} draft={exportDraft} signatures={reportSignatures} />)}
     </div>
   </div>;
 }

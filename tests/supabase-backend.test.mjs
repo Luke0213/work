@@ -186,6 +186,19 @@ test("client and server protect history collections from stale omission deletion
   assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
 });
 
+test("floor acceptances use the same non-destructive protected merge semantics", async () => {
+  const page = await read("app/page.tsx");
+  const client = await read("lib/three-way-merge.ts");
+  const sql = await read("supabase/migrations/202608280002_floor_acceptances_merge.sql");
+  assert.match(page, /floorAcceptances\?: FloorAcceptanceRecord\[\]/);
+  assert.match(client, /"floorAcceptances"/);
+  assert.match(sql, /create or replace function public\.spc_json_merge_three_way_at/i);
+  assert.match(sql, /floorAcceptances/);
+  assert.match(sql, /revoke all on function public\.spc_json_merge_three_way_at[\s\S]*from anon/i);
+  assert.doesNotMatch(sql, /\b(update|delete\s+from|truncate|insert\s+into|drop\s+table|alter\s+table)\b/i);
+  assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
+});
+
 test("Excel unit import accepts partial rows without importing blanks or duplicates", async () => {
   const page = await read("app/page.tsx");
   const importer = page.slice(page.indexOf("type ImportUnitRow"), page.indexOf("function ProjectForm"));
@@ -548,7 +561,9 @@ test("completion export confirmation edits one temporary draft shared by all thr
   for (const value of ["project.name", "project.address", "unit.order", "acceptance.area", "unit.estimated", "completion.floorAbnormal", "completion.boardDamaged", "completion.trashCleared"])
     assert.match(report, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(report, /const \[exportDraft, setExportDraft\]/);
-  assert.match(report, /\.map\(\(copy\) => <CompletionCopy key=\{copy\} copy=\{copy\} draft=\{exportDraft\} signatures=\{completion\.signatures\}/);
+  assert.match(report, /const reportSignatures = signatures \|\| completion\.signatures/);
+  assert.match(report, /\.map\(\(copy\) => <CompletionCopy key=\{copy\} copy=\{copy\} draft=\{exportDraft\} signatures=\{reportSignatures\}/);
+  assert.match(report, /resolveFloorSignatures\(floorRecord, floorUnits\)/);
   assert.match(report, /setText\("projectName"|\['projectName','案場名稱'\]/);
   assert.match(report, /setText\("area"|\['area','坪數確認'\]/);
   assert.match(report, /CompletionDraftBoolean label="地坪是否異常"/);

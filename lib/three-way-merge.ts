@@ -4,7 +4,7 @@ const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const isEntityArray = (v: unknown): v is Array<Record<string, unknown> & { id: string }> =>
   Array.isArray(v) && v.every((x) => isRecord(x) && typeof x.id === "string");
-const protectedCollections = new Set(["surveys", "works", "defects", "acceptances", "journals", "events"]);
+const protectedCollections = new Set(["surveys", "works", "defects", "acceptances", "journals", "events", "floorAcceptances"]);
 const collectionName = (path: string) => path.split(".").at(-1) || "";
 const isDeleted = (value: unknown) => isRecord(value) && value._deleted === true;
 
