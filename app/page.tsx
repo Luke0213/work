@@ -2,9 +2,9 @@
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { AlignmentType, Document, ImageRun, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
-import { cleanupRemovedPhotos, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
+import { loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
-import { threeWayMerge } from "../lib/three-way-merge";
+import { liveEntities, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
 import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
@@ -16,6 +16,7 @@ import { migrateLegacyStorageValue, scopedDraftKey, scopedStorageKey } from "../
 import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-lifecycle";
 import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
+import { importableUnitRows, importProductKey, safeImportedEstimated } from "../lib/unit-import";
 
 type Status =
   | "待確認"
@@ -219,6 +220,9 @@ type DailyNote = {
   updatedAt?: string;
   createdBy?: string;
   draft?: boolean;
+  _deleted?: boolean;
+  deletedAt?: string;
+  deletedBy?: string;
 };
 type Project = {
   id: string;
@@ -383,38 +387,37 @@ const draftKey = (owner: string, kind: string, unitId: string) =>
     }
   },
   writeLocalDraft = (k: string, value: unknown, owner: string) => {
-    if (typeof window === "undefined") return true;
+    if (typeof window === "undefined") return Promise.resolve();
     const suffix = k.replace(`spc-draft-${owner}-`, "");
     const kind = suffix.split("-")[0] || "form";
     const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
-    void saveOfflineDraft({ key: k, owner, kind, recordId: String(record.id || k), unitId: suffix.slice(kind.length + 1), payload: value, baseVersion: Number(record.baseVersion || 0), updatedBy: owner }).catch((error) => console.warn("SPC IndexedDB draft save failed", error));
+    const indexedDbWrite = saveOfflineDraft({ key: k, owner, kind, recordId: String(record.id || k), unitId: suffix.slice(kind.length + 1), payload: value, baseVersion: Number(record.baseVersion || 0), updatedBy: owner }).catch((error) => console.warn("SPC IndexedDB draft save failed", error));
     try {
       localStorage.setItem(k, localDraftValue(value));
-      return true;
     } catch (error) {
       logStorageException("localStorage", "write", error);
-      return false;
     }
+    return indexedDbWrite;
   };
 const removeDurableDraft = (draftStorageKey: string) => {
   if (typeof localStorage !== "undefined") {
     try { localStorage.removeItem(draftStorageKey); }
     catch (error) { logStorageException("localStorage", "delete", error); }
   }
-  void removeOfflineDraft(draftStorageKey);
+  return removeOfflineDraft(draftStorageKey);
 };
-function useOfflineDraftRestore<T>(draftStorageKey: string, setValue: (value: T) => void) {
+function useOfflineDraftRestore<T>(draftStorageKey: string, setValue: (value: T) => void, restoreAllowed?: { current: boolean }) {
   useEffect(() => {
     let active = true;
     void loadOfflineDraft<T>(draftStorageKey).then((draft) => {
-      if (!active || !draft) return;
+      if (!active || !draft || restoreAllowed?.current === false) return;
       const local = readLocal(draftStorageKey);
-      if (shouldRestoreIndexedDbDraft(local)) setValue(draft.payload);
+      if (restoreAllowed?.current !== false && shouldRestoreIndexedDbDraft(local)) setValue(draft.payload);
     });
     return () => { active = false; };
-  }, [draftStorageKey, setValue]);
+  }, [draftStorageKey, setValue, restoreAllowed]);
 }
-function queueRecordChange(owner: string, kind: string, unitId: string, record: { id: string; [key: string]: unknown }, operation: "upsert" | "complete" = "upsert") {
+function queueRecordChange(owner: string, kind: string, unitId: string, record: { id: string; [key: string]: unknown }, operation: "upsert" | "complete" | "delete" = "upsert") {
   void queueOfflineWrite({ owner, kind, recordId: record.id, unitId, operation, baseVersion: Number((record as any).baseVersion || 0), updatedBy: owner, payload: record }).catch(() => undefined);
 }
 const readWorkspaceDraft = (owner: string): LocalWorkspaceSnapshot | null => {
@@ -591,10 +594,10 @@ function exportFullExcel(projects: Project[], catalog: Product[]) {
     sheet["!cols"] = Object.keys(rows[0] || { 說明: "" }).map((key) => ({ wch: Math.min(36, Math.max(12, key.length * 2 + 4)) }));
     XLSX.utils.book_append_sheet(book, sheet, name.slice(0, 31));
   };
-  add("專案", projects.map(({ units, products, journals, ...p }) => ({ ...p, 戶數: units.length, 日誌數: journals.length })));
+  add("專案", projects.map(({ units, products, journals, ...p }) => ({ ...p, 戶數: units.length, 日誌數: liveEntities(journals).length })));
   add("產品", catalog);
   add("戶別", projects.flatMap((p) => p.units.map(({ surveys, works, defects, acceptances, events, ...u }) => ({ 專案ID: p.id, 專案: p.name, ...u }))));
-  add("場勘", projects.flatMap((p) => p.units.flatMap((u) => u.surveys.map(({ items, photos, risk, areaStatus, areaValue, areaUnit, doorInspection, siliconeInspection, dividerInspection, parking, stagingArea, surveySignatures, ...x }) => ({
+  add("場勘", projects.flatMap((p) => p.units.flatMap((u) => liveEntities(u.surveys).map(({ items, photos, risk, areaStatus, areaValue, areaUnit, doorInspection, siliconeInspection, dividerInspection, parking, stagingArea, surveySignatures, ...x }) => ({
     專案: p.name, 戶別: u.number, ...x,
     坪數狀態: areaStatus === "known" ? "已知" : "待補",
     坪數: areaStatus === "known" ? areaValue ?? "" : "",
@@ -627,11 +630,11 @@ function exportFullExcel(projects: Project[], catalog: Product[]) {
     場勘簽名時間: (surveySignatures || []).map((signature) => `${signature.name} ${signature.at}`).join("；"),
     檢查項目: JSON.stringify(items), 風險: JSON.stringify(risk || {}),
   })))));
-  add("施工", projects.flatMap((p) => p.units.flatMap((u) => u.works.map(({ photos, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 照片數: photos.length })))));
-  add("驗收", projects.flatMap((p) => p.units.flatMap((u) => u.acceptances.map(({ items, photos, signature, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 檢查項目: JSON.stringify(items), 簽名人: signature?.name || "" })))));
-  add("缺失", projects.flatMap((p) => p.units.flatMap((u) => u.defects.map(({ before, after, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 改善前照片: before.length, 改善後照片: after.length })) )));
-  add("今日日誌", projects.flatMap((p) => p.journals.map(({ photos, ...x }) => ({ 專案: p.name, ...x, 照片數: photos.length }))));
-  add("事件", projects.flatMap((p) => p.units.flatMap((u) => u.events.map(({ photos, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 照片數: photos.length })) )));
+  add("施工", projects.flatMap((p) => p.units.flatMap((u) => liveEntities(u.works).map(({ photos, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 照片數: photos.length })))));
+  add("驗收", projects.flatMap((p) => p.units.flatMap((u) => liveEntities(u.acceptances).map(({ items, photos, signature, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 檢查項目: JSON.stringify(items), 簽名人: signature?.name || "" })))));
+  add("缺失", projects.flatMap((p) => p.units.flatMap((u) => liveEntities(u.defects).map(({ before, after, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 改善前照片: before.length, 改善後照片: after.length })) )));
+  add("今日日誌", projects.flatMap((p) => liveEntities(p.journals).map(({ photos, ...x }) => ({ 專案: p.name, ...x, 照片數: photos.length }))));
+  add("事件", projects.flatMap((p) => p.units.flatMap((u) => liveEntities(u.events).map(({ photos, ...x }) => ({ 專案: p.name, 戶別: u.number, ...x, 照片數: photos.length })) )));
   XLSX.writeFile(book, `SPC完整資料-${day()}.xlsx`, { compression: true });
 }
 
@@ -1121,7 +1124,6 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
           baselineRef.current.projects,
           baselineRef.current.catalog,
         );
-        const previous = baselineRef.current;
         versionRef.current = nextVersion;
         baselineRef.current = { projects: structuredClone(uploaded), catalog: structuredClone(catalog) };
         try {
@@ -1137,8 +1139,6 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
         } catch { /* the save succeeded */ }
         const stillCurrent = JSON.stringify(latestRef.current) === saveInput;
         if (stillCurrent && JSON.stringify(uploaded) !== JSON.stringify(projects)) setProjects(uploaded);
-        let removed = 0;
-        try { removed = await cleanupRemovedPhotos(previous.projects, uploaded, authUserId); } catch { /* data is saved; cleanup can retry next time */ }
         if (stillCurrent) {
           const committedCache = writeWorkspaceDraft(authUserId, uploaded, catalog, nextVersion, false);
           const indexedCache = await committedCache.indexedDb;
@@ -1146,7 +1146,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
           const cacheState = durableStorageState(indexedCache.ok, committedCache.local, cacheErrors);
           try { await completeSyncedOutbox(authUserId); } catch (error) { logStorageException("IndexedDB", "delete", error); }
           setStorageWarning(cacheState.saved
-            ? `已儲存：已與 Supabase 同步 · 版本 ${nextVersion}${removed ? ` · 清理 ${removed} 張舊照片` : ""}`
+            ? `已儲存：已與 Supabase 同步 · 版本 ${nextVersion}`
             : "雲端已同步，但本機離線暫存不可用");
         } else {
           writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, nextVersion, true);
@@ -2885,7 +2885,8 @@ type ImportUnitRow = {
   product?: Product;
   newProduct: boolean;
   special: boolean;
-  error: string;
+  warning: string;
+  hasData: boolean;
   duplicate: boolean;
 };
 
@@ -3068,30 +3069,35 @@ function ImportUnits({
         const number = read(source, ["戶別"]);
         const model = read(source, ["SPC編號", "型號", "SPC型號"]);
         const colorNo = read(source, ["色號", "顏色"]);
-        const estimated = importedAreaToPing(source);
+        const importedEstimated = importedAreaToPing(source);
+        const estimated = safeImportedEstimated(importedEstimated);
         const statusText = read(source, ["工程狀態", "狀態"]);
         const status = statuses.includes(statusText as Status)
           ? (statusText as Status)
           : "待確認";
         const note = read(source, ["備註"]);
+        const specialText = read(source, ["特殊標記"]);
         const special =
-          read(source, ["特殊標記"]) === "是" ||
+          specialText === "是" ||
           /特殊/.test(colorNo) ||
           note.includes("【特殊案件】");
         const product = p.products.find(
           (item) =>
             item.model.trim() === model && item.colorNo.trim() === colorNo,
         );
+        const areaText = read(source, ["預估坪數", "預估施工坪數", "坪數", "坪", "m²", "m2", "m^2", "㎡", "平方公尺", "平方米"]);
+        const hasData = Boolean(building || floor || number || model || colorNo || areaText || statusText || note || specialText);
         const key = `${building}|${floor}|${number}`;
-        const duplicate = existing.has(key) || inFile.has(key);
-        inFile.add(key);
-        const errors: string[] = [];
-        if (!building || !floor || !number) errors.push("棟別、樓層或戶別空白");
-        if (!colorNo || (!model && !special)) errors.push("SPC 編號或色號空白");
-        if (!Number.isFinite(estimated) || estimated <= 0)
-          errors.push("坪數格式不正確");
+        const hasUnitKey = Boolean(building && floor && number);
+        const duplicate = hasUnitKey && (existing.has(key) || inFile.has(key));
+        if (hasUnitKey) inFile.add(key);
+        const warnings: string[] = [];
+        if (!building || !floor || !number) warnings.push("棟別、樓層或戶別待補");
+        if (!model || !colorNo) warnings.push("SPC 編號或色號待補");
+        if (!Number.isFinite(importedEstimated) || importedEstimated <= 0)
+          warnings.push("坪數待補");
         if (statusText && !statuses.includes(statusText as Status))
-          errors.push(`無法識別狀態「${statusText}」`);
+          warnings.push(`狀態「${statusText}」無法識別，已設為待確認`);
         return {
           row: Number(source["來源列"] || index + 2),
           building,
@@ -3105,7 +3111,8 @@ function ImportUnits({
           product,
           newProduct: Boolean(model && colorNo && !product),
           special,
-          error: errors.join("；"),
+          warning: warnings.join("；"),
+          hasData,
           duplicate,
         };
       });
@@ -3117,26 +3124,28 @@ function ImportUnits({
       setMessage("檔案無法讀取，請確認它是有效的 Excel 或 CSV 檔案。");
     }
   };
-  const valid = rows.filter((row) => !row.error && !row.duplicate);
-  const errors = rows.filter((row) => row.error).length;
+  const importable = importableUnitRows(rows);
+  const pending = importable.filter((row) => row.warning).length;
+  const blanks = rows.filter((row) => !row.hasData).length;
   const duplicates = rows.filter((row) => row.duplicate).length;
-  const specialCount = valid.filter((row) => row.special).length;
+  const specialCount = importable.filter((row) => row.special).length;
   const newProductKeys = [
     ...new Set(
-      valid
-        .filter((row) => row.newProduct)
-        .map((row) => `${row.model}|${row.colorNo}`),
+      importable
+        .filter((row) => row.newProduct && row.model && row.colorNo)
+        .map(importProductKey)
+        .filter((key): key is string => key !== null),
     ),
   ];
   const confirmImport = () => {
-    if (!valid.length) return;
+    if (!importable.length) return;
     if (
       !confirm(
-        `建案名稱：${projectName || "未填寫"}\n即將匯入 ${valid.length} 戶，其中 ${specialCount} 戶標記為特殊案件。\n同時新增 ${newProductKeys.length} 筆 SPC 產品資料到共用產品庫。\n有問題 ${errors} 列、重複 ${duplicates} 列不會匯入。\n\n是否確認？`,
+        `建案名稱：${projectName || "未填寫"}\n即將匯入 ${importable.length} 戶，其中 ${pending} 戶待補資料、${specialCount} 戶標記為特殊案件。\n同時新增 ${newProductKeys.length} 筆 SPC 產品資料到共用產品庫。\n重複 ${duplicates} 列、完全空白 ${blanks} 列不會匯入。\n\n是否確認？`,
       )
     )
       return;
-    const units = valid.map((row) => ({
+    const units = importable.map((row) => ({
       ...blankUnit(),
       building: row.building,
       floor: row.floor,
@@ -3213,11 +3222,11 @@ function ImportUnits({
               </article>
               <article className="import-ok">
                 <span>可匯入</span>
-                <b>{valid.length}</b>
+                <b>{importable.length}</b>
               </article>
               <article className="import-error">
-                <span>需要確認</span>
-                <b>{errors}</b>
+                <span>待補資料</span>
+                <b>{pending}</b>
               </article>
               <article className="import-duplicate">
                 <span>重複跳過</span>
@@ -3264,10 +3273,12 @@ function ImportUnits({
                       <td>
                         <span
                           className={
-                            row.error
-                              ? "import-result error"
-                              : row.duplicate
+                            row.duplicate
                                 ? "import-result duplicate"
+                              : !row.hasData
+                                ? "import-result error"
+                              : row.warning
+                                ? "import-result error"
                                 : row.special
                                   ? "import-result special"
                                   : row.newProduct
@@ -3275,14 +3286,17 @@ function ImportUnits({
                                     : "import-result ok"
                           }
                         >
-                          {row.error ||
-                            (row.duplicate
-                              ? "戶別重複"
+                          {row.duplicate
+                              ? "戶別重複，不匯入"
+                            : !row.hasData
+                              ? "完全空白，不匯入"
+                            : row.warning
+                              ? `待補資料：${row.warning}`
                               : row.special
                                 ? "特殊案件，可匯入"
                                 : row.newProduct
                                   ? "可匯入，將新增產品"
-                                  : "可匯入")}
+                                  : "可匯入"}
                         </span>
                       </td>
                     </tr>
@@ -3298,10 +3312,10 @@ function ImportUnits({
           </button>
           <button
             className="primary"
-            disabled={!valid.length}
+            disabled={!importable.length}
             onClick={confirmImport}
           >
-            匯入可通過的 {valid.length} 戶
+            匯入可匯入的 {importable.length} 戶
           </button>
         </div>
       </div>
@@ -4542,9 +4556,16 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
   const [signRole, setSignRole] = useState<"installer" | "office" | "siteManager" | "supervisor" | null>(null);
   const [saved, setSaved] = useState("");
   const [confirming, setConfirming] = useState(false);
-  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setA);
+  const acceptanceDraftActiveRef = useRef(true);
+  const skipNextDraftWrite = useRef(false);
+  const pendingDraftWriteRef = useRef<Promise<void>>(Promise.resolve());
+  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setA, acceptanceDraftActiveRef);
   useEffect(() => {
-    writeLocalDraft(draftKey(authUserId, "accept", u.id), a, authUserId);
+    if (!acceptanceDraftActiveRef.current) {
+      if (skipNextDraftWrite.current) skipNextDraftWrite.current = false;
+      return;
+    }
+    pendingDraftWriteRef.current = pendingDraftWriteRef.current.then(() => writeLocalDraft(draftKey(authUserId, "accept", u.id), a, authUserId));
   }, [a, u.id, authUserId]);
   const bad = a.items.filter((x) => x.result === "不合格"),
     incomplete = a.items.some((x) => !x.result),
@@ -4553,11 +4574,14 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
     saveDraft = () => {
       const draft = { ...a, draft: true };
       patch({ acceptances: [draft, ...u.acceptances.filter((item) => item.id !== a.id)] });
-      writeLocalDraft(draftKey(authUserId, "accept", u.id), draft, authUserId);
+      pendingDraftWriteRef.current = pendingDraftWriteRef.current.then(() => writeLocalDraft(draftKey(authUserId, "accept", u.id), draft, authUserId));
       queueRecordChange(authUserId, "accept", u.id, draft);
       setSaved("✓ 驗收草稿已暫存；重新整理或換裝置後可繼續填寫");
     },
-    save = () => {
+    save = async () => {
+      const completed: Acceptance = { ...a, draft: false };
+      acceptanceDraftActiveRef.current = false;
+      skipNextDraftWrite.current = true;
       const fail = a.result !== "合格" || bad.length > 0,
         status: Status = fail ? "驗收缺失" : "已驗收",
         newDef = fail
@@ -4576,25 +4600,27 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
             }))
           : [];
       patch({
-        acceptances: [{ ...a, draft: false }, ...u.acceptances.filter((item) => item.id !== a.id)],
+        acceptances: [completed, ...u.acceptances.filter((item) => item.id !== completed.id)],
         status,
         defects: [...newDef, ...u.defects],
         events: [
           {
             id: id(),
             at: stamp(),
-            title: a.recheck ? "完成複驗" : "完成驗收",
-            detail: `結果：${a.result}`,
+            title: completed.recheck ? "完成複驗" : "完成驗收",
+            detail: `結果：${completed.result}`,
             photos: allPhotos,
           },
           ...u.events,
         ],
       });
-      add(a.recheck ? "完成複驗" : "完成驗收", a.result, allPhotos);
-      localStorage.setItem(scopedKey("spc-last-acceptance-person", authUserId), a.person);
-      removeDurableDraft(draftKey(authUserId, "accept", u.id));
-      queueRecordChange(authUserId, "accept", u.id, { ...a, draft: false }, "complete");
-      setSaved(`✓ ${a.recheck ? "複驗" : "驗收"}結果已儲存成功`);
+      add(completed.recheck ? "完成複驗" : "完成驗收", completed.result, allPhotos);
+      localStorage.setItem(scopedKey("spc-last-acceptance-person", authUserId), completed.person);
+      setA(completed);
+      queueRecordChange(authUserId, "accept", u.id, completed, "complete");
+      await pendingDraftWriteRef.current;
+      await removeDurableDraft(draftKey(authUserId, "accept", u.id));
+      setSaved(`✓ ${completed.recheck ? "複驗" : "驗收"}結果已儲存成功`);
       setConfirming(false);
     };
   return (
@@ -4950,13 +4976,13 @@ async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNo
 function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>) => void }) {
   const authUserId = useAuthOwner();
   const blank = (): DailyNote => ({ id: id(), date: day(), content: "", pending: "", note: "", photos: [], createdAt: "", updatedAt: "", createdBy: "", draft: true });
-  const storedDraft = u.journals.find((item) => item.draft);
+  const storedDraft = liveEntities(u.journals).find((item) => item.draft);
   const [entry, setEntry] = useState<DailyNote>(() => readDraft(draftKey(authUserId, "unit-journal", u.id), storedDraft || blank()));
   const [saved, setSaved] = useState("");
   const [preview, setPreview] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const skipNextDraftWrite = useRef(false);
-  const editingExisting = u.journals.some((item) => item.id === entry.id);
+  const editingExisting = liveEntities(u.journals).some((item) => item.id === entry.id);
   useOfflineDraftRestore(draftKey(authUserId, "unit-journal", u.id), setEntry);
   useEffect(() => {
     if (skipNextDraftWrite.current) { skipNextDraftWrite.current = false; return; }
@@ -4992,7 +5018,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => setPreview(true)}>預覽／產生 Word</button></div>
     {saved && <div className="save-success">{saved}</div>}
     {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span></div><div className="word-preview-photos">{entry.photos.slice(0, 6).map((photo) => <ZoomablePhoto key={photo.id} photo={photo} alt={photo.caption || "工作照片"} />)}</div><p><b>工作內容：</b>{entry.content}</p><p><b>備註：</b>{entry.note || "無"}</p></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); await downloadWorkJournalDocx(project, u, entry); setDownloading(false); }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
-    <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={u.journals.map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
+    <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={liveEntities(u.journals).map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
   </div>;
 }
 
@@ -5024,7 +5050,7 @@ function Journal({
     rows = p.units.flatMap((u) =>
       u.works.filter((w) => w.date === date).map((w) => ({ u, w })),
     ),
-    notes = [...p.journals].sort((a, b) => b.date.localeCompare(a.date));
+    notes = liveEntities(p.journals).sort((a, b) => b.date.localeCompare(a.date));
   const skipNextDraftWrite = useRef(false);
   useOfflineDraftRestore(draftKey(authUserId, "journal", p.id), setEntry);
   const editingExisting = p.journals.some((item) => item.id === entry.id),
@@ -5151,10 +5177,12 @@ function Journal({
                 <button className="ghost" type="button" onClick={() => { setEntry(x); setDate(x.date); setSavedMessage(`正在修改 ${x.date} 的既有紀錄`); window.scrollTo({ top: 0, behavior: "smooth" }); }}>查看／修改</button>
                 <button
                   className="danger"
-                  onClick={() =>
-                    confirm("刪除此筆當日日誌？") &&
-                    patch({ journals: p.journals.filter((n) => n.id !== x.id) })
-                  }
+                  onClick={() => {
+                    if (!confirm("刪除此筆當日日誌？")) return;
+                    const deleted = tombstoneEntity(x, authUserId, stamp());
+                    patch({ journals: p.journals.map((note) => note.id === x.id ? deleted : note) });
+                    queueRecordChange(authUserId, "journal", p.id, deleted, "delete");
+                  }}
                 >
                   刪除
                 </button>

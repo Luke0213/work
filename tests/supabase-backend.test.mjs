@@ -25,6 +25,29 @@ test("frontend uses v2 RPC and Storage instead of writing legacy app state", asy
   assert.match(backend, /spc-photo-cleanup-queue/);
 });
 
+test("normal workspace sync never invokes physical photo cleanup", async () => {
+  const page = await read("app/page.tsx");
+  const backend = await read("lib/spc-backend.ts");
+  assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
+  assert.match(backend, /export async function cleanupRemovedPhotos/);
+  assert.match(backend, /storage\.from\("spc-photos"\)\.remove/);
+});
+
+test("completed acceptance cannot restore or rewrite a stale durable draft", async () => {
+  const page = await read("app/page.tsx");
+  const acceptance = page.slice(page.indexOf("function AcceptTab"), page.indexOf("function CompletionCopy"));
+  assert.match(acceptance, /const draft = \{ \.\.\.a, draft: true \}/);
+  assert.match(acceptance, /writeLocalDraft\(draftKey\(authUserId, "accept", u\.id\), draft, authUserId\)/);
+  assert.match(acceptance, /const completed: Acceptance = \{ \.\.\.a, draft: false \}/);
+  assert.match(acceptance, /acceptances: \[completed,[\s\S]*setA\(completed\)[\s\S]*queueRecordChange\(authUserId, "accept", u\.id, completed, "complete"\)/);
+  assert.match(acceptance, /acceptanceDraftActiveRef\.current = false[\s\S]*skipNextDraftWrite\.current = true/);
+  assert.match(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setA, acceptanceDraftActiveRef\)/);
+  assert.match(acceptance, /await pendingDraftWriteRef\.current;[\s\S]*await removeDurableDraft/);
+  assert.match(acceptance, /add\(completed\.recheck[\s\S]*completed\.result/);
+  assert.match(page, /signatures: a\.completion\?\.signatures \|\| \(a\.signature \? \{ office: a\.signature \} : \{\}\)/);
+  assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
+});
+
 test("monitoring, scheduled backups, and full Excel export are wired", async () => {
   const page = await read("app/page.tsx");
   const monitoring = await read("lib/monitoring.ts");
@@ -81,7 +104,8 @@ test("backups are daily with bounded retention instead of running on every save"
 test("unit estimated remains the canonical ping area and survey only displays it", async () => {
   const page = await read("app/page.tsx");
   assert.match(page, /estimated: areaInputToPing/);
-  assert.match(page, /const estimated = importedAreaToPing\(source\)/);
+  assert.match(page, /const importedEstimated = importedAreaToPing\(source\)/);
+  assert.match(page, /const estimated = safeImportedEstimated\(importedEstimated\)/);
   assert.match(page, /survey-estimated-area/);
   assert.match(page, /沿用戶別主資料，此處僅供查看/);
   assert.doesNotMatch(page, /pendingSurvey/);
@@ -139,6 +163,41 @@ test("new-project onboarding supports product shortcuts and Excel import", async
   assert.doesNotMatch(unitManager, /<ImportUnits/);
   assert.match(css, /\.onboarding-products\{display:grid;grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
   assert.match(css, /\.onboarding-products button\{[^}]*min-height:78px/);
+});
+
+test("client and server protect history collections from stale omission deletion", async () => {
+  const merge = await read("lib/three-way-merge.ts");
+  const page = await read("app/page.tsx");
+  const sql = await read("supabase/migrations/202608280001_protected_history_merge.sql");
+  for (const collection of ["surveys", "works", "defects", "acceptances", "journals", "events"]) {
+    assert.match(merge, new RegExp(`\\"${collection}\\"`));
+    assert.match(sql, new RegExp(collection));
+  }
+  assert.match(merge, /const tombstone = \[bv, lv, rv\]/);
+  assert.match(merge, /if \(tombstone\) \{ result\.push\(tombstone\); continue; \}/);
+  assert.match(merge, /export const liveEntities/);
+  assert.match(sql, /spc_json_merge_three_way_at/);
+  assert.match(sql, /result := result \|\| jsonb_build_array\(deleted_marker\)/);
+  assert.match(sql, /revoke all on function public\.spc_json_merge_three_way_at\(jsonb, jsonb, jsonb, text\) from public/);
+  assert.match(sql, /revoke all on function public\.spc_json_merge_three_way_at\(jsonb, jsonb, jsonb, text\) from anon/);
+  assert.match(page, /tombstoneEntity\(x, authUserId, stamp\(\)\)/);
+  assert.match(page, /queueRecordChange\(authUserId, "journal", p\.id, deleted, "delete"\)/);
+  assert.doesNotMatch(page, /patch\(\{ journals: p\.journals\.filter\(\(n\) => n\.id !== x\.id\) \}\)/);
+  assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
+});
+
+test("Excel unit import accepts partial rows without importing blanks or duplicates", async () => {
+  const page = await read("app/page.tsx");
+  const importer = page.slice(page.indexOf("type ImportUnitRow"), page.indexOf("function ProjectForm"));
+  assert.match(importer, /const hasData = Boolean\(building \|\| floor \|\| number \|\| model \|\| colorNo \|\| areaText \|\| statusText \|\| note \|\| specialText\)/);
+  assert.match(importer, /const hasUnitKey = Boolean\(building && floor && number\)/);
+  assert.match(importer, /const duplicate = hasUnitKey && \(existing\.has\(key\) \|\| inFile\.has\(key\)\)/);
+  assert.match(importer, /const estimated = safeImportedEstimated\(importedEstimated\)/);
+  assert.match(importer, /const importable = importableUnitRows\(rows\)/);
+  assert.match(importer, /const units = importable\.map/);
+  assert.match(importer, /row\.newProduct && row\.model && row\.colorNo/);
+  for (const result of ["待補資料：", "戶別重複，不匯入", "完全空白，不匯入", "可匯入"]) assert.match(importer, new RegExp(result));
+  assert.doesNotMatch(importer, /const valid = rows\.filter/);
 });
 
 test("survey door inspection records measurements, gap, evidence, photos, and Excel fields", async () => {
@@ -305,7 +364,7 @@ test("IndexedDB photo drafts restore through markers without overriding full loc
   const durability = await read("lib/storage-durability.ts");
 
   assert.match(restore, /loadOfflineDraft<T>\(draftStorageKey\)/);
-  assert.match(restore, /if \(!active \|\| !draft\) return/);
+  assert.match(restore, /if \(!active \|\| !draft \|\| restoreAllowed\?\.current === false\) return/);
   assert.match(restore, /shouldRestoreIndexedDbDraft\(local\)\) setValue\(draft\.payload\)/);
   assert.match(durability, /if \(!localValue\) return true/);
   assert.match(durability, /return isIndexedDbMarker\(JSON\.parse\(localValue\)\)/);
@@ -409,7 +468,7 @@ test("unit and project journals reopen and update the same record without duplic
 
   assert.match(projectJournal, /const existing = p\.journals\.find\(\(item\) => item\.id === entry\.id\)/);
   assert.match(projectJournal, /journals: \[saved, \.\.\.p\.journals\.filter\(\(item\) => item\.id !== saved\.id\)\]/);
-  assert.match(projectJournal, /notes = \[\.\.\.p\.journals\]\.sort\(\(a, b\) => b\.date\.localeCompare\(a\.date\)\)/);
+  assert.match(projectJournal, /notes = liveEntities\(p\.journals\)\.sort\(\(a, b\) => b\.date\.localeCompare\(a\.date\)\)/);
   assert.doesNotMatch(projectJournal, /notes = p\.journals\.filter\(\(x\) => x\.date === date\)/);
   assert.match(projectJournal, /施工紀錄日期/);
   assert.match(projectJournal, /所有案場日誌/);

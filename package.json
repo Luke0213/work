@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "bash scripts/build-verified.sh",
     "start": "vinext start",
-    "test": "node --test tests/supabase-backend.test.mjs && node --experimental-strip-types --test tests/three-way-merge.test.ts tests/acceptance-exports.test.ts tests/area.test.ts tests/auth-session.test.ts tests/auth-storage.test.ts tests/browser-lifecycle.test.ts tests/photo-capture.test.ts tests/daily-acceptances.test.ts tests/storage-durability.test.ts",
+    "test": "node --test tests/supabase-backend.test.mjs && node --experimental-strip-types --test tests/three-way-merge.test.ts tests/acceptance-exports.test.ts tests/area.test.ts tests/auth-session.test.ts tests/auth-storage.test.ts tests/browser-lifecycle.test.ts tests/photo-capture.test.ts tests/daily-acceptances.test.ts tests/storage-durability.test.ts tests/unit-import.test.ts",
     "test:render": "pnpm run build && node --test tests/rendered-html.test.mjs",
     "validate:artifact": "bash scripts/validate-artifact.sh",
     "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next"

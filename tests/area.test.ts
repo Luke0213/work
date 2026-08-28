@@ -23,7 +23,10 @@ test("坪切換 m² 再切回坪不會重複換算", () => {
 });
 
 test("Excel 坪欄位不換算，明確 m² 欄位才換算", () => {
-  assert.equal(importedAreaToPing({ 坪數: "20.21" }), 20.21);
-  assert.equal(importedAreaToPing({ "m²": "66.80" }), 20.21);
-  assert.equal(importedAreaToPing({ 預估施工坪數: "20.21 坪" }), 20.21);
+  assert.equal(importedAreaToPing({ 坪數: "30" }), 30);
+  assert.equal(importedAreaToPing({ 預估施工坪數: "20.5 坪" }), 20.5);
+  assert.equal(importedAreaToPing({ "m²": "100" }), 30.25);
+  assert.equal(importedAreaToPing({ 平方公尺: "50" }), 15.13);
+  const canonicalPing = importedAreaToPing({ "m²": "100" });
+  assert.equal(areaInputToPing(canonicalPing, "坪"), 30.25);
 });
