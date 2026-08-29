@@ -1,7 +1,7 @@
 "use client";
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
-import { AlignmentType, Document, ImageRun, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
+import { AlignmentType, BorderStyle, Document, ImageRun, Packer, PageOrientation, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
 import { loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
 import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
@@ -18,6 +18,7 @@ import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPin
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { importableUnitRows, importProductKey, safeImportedEstimated } from "../lib/unit-import";
 import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, resolveUnitSignatures, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
+import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 
 type Status =
   | "待確認"
@@ -5155,17 +5156,21 @@ function DefectsTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
     </div>
   );
 }
-async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number) {
+function loadJournalPhotoDimensions(photo: Photo) {
+  return new Promise<{ width: number; height: number }>((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth || 4, height: image.naturalHeight || 3 });
+    image.onerror = () => resolve({ width: 4, height: 3 });
+    image.src = photo.data;
+  });
+}
+
+async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number, dimensions?: { width: number; height: number }) {
   try {
-    const dimensions = await new Promise<{ width: number; height: number }>((resolve) => {
-      const image = new Image();
-      image.onload = () => resolve({ width: image.naturalWidth || 4, height: image.naturalHeight || 3 });
-      image.onerror = () => resolve({ width: 4, height: 3 });
-      image.src = photo.data;
-    });
-    const scale = Math.min(maxWidth / dimensions.width, maxHeight / dimensions.height);
-    const width = Math.max(1, Math.round(dimensions.width * scale));
-    const height = Math.max(1, Math.round(dimensions.height * scale));
+    const intrinsic = dimensions || await loadJournalPhotoDimensions(photo);
+    const scale = Math.min(maxWidth / intrinsic.width, maxHeight / intrinsic.height);
+    const width = Math.max(1, Math.round(intrinsic.width * scale));
+    const height = Math.max(1, Math.round(intrinsic.height * scale));
     const response = await fetch(photo.data);
     const data = await response.arrayBuffer();
     const mime = response.headers.get("content-type") || (photo.data.startsWith("data:image/png") ? "image/png" : "image/jpeg");
@@ -5176,45 +5181,84 @@ async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: n
   }
 }
 
+const JOURNAL_PAGE_WIDTH = 9360;
+const JOURNAL_NO_BORDERS = {
+  top: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
+  bottom: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
+  left: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
+  right: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
+  insideHorizontal: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
+  insideVertical: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
+};
+type MeasuredJournalPhoto = JournalPhotoLayoutItem<Photo>;
+
+async function buildJournalLogoRun() {
+  try {
+    const response = await fetch("/shen-yin-logo.png");
+    return new ImageRun({ data: await response.arrayBuffer(), type: "png", transformation: { width: 120, height: 44 }, altText: { title: "神銀建材 Logo", description: "神銀建材 Logo", name: "神銀建材 Logo" } });
+  } catch {
+    return null;
+  }
+}
+
 async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNote) {
   const PHOTO_PER_PAGE = 6;
-  const photoRuns = await Promise.all((entry.photos || []).map((photo, index) => buildJournalPhotoRun(photo, index < 2 ? 300 : 285, index < 2 ? 170 : 190)));
-  const photos = photoRuns.filter(Boolean) as ImageRun[];
-  const photoCell = (photo: ImageRun, width = 4560) => new TableCell({ width: { size: width, type: WidthType.DXA }, margins: { top: 70, bottom: 70, left: 70, right: 70 }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [photo] })] });
-  const photoTable = (pagePhotos: ImageRun[], width = 9120) => new Table({
-    width: { size: width, type: WidthType.DXA },
-    columnWidths: [Math.floor(width / 2), Math.ceil(width / 2)],
-    rows: Array.from({ length: Math.ceil(pagePhotos.length / 2) }, (_, rowIndex) => new TableRow({
-      cantSplit: true,
-      children: pagePhotos.slice(rowIndex * 2, rowIndex * 2 + 2).map((photo) => photoCell(photo, Math.floor(width / 2))),
-    })),
+  const sourcePhotos = (entry.photos || []).slice();
+  const measuredPhotos: MeasuredJournalPhoto[] = await Promise.all(sourcePhotos.map(async (photo) => ({ value: photo, ...await loadJournalPhotoDimensions(photo) })));
+  const photoPages = Array.from({ length: Math.ceil(measuredPhotos.length / PHOTO_PER_PAGE) }, (_, index) => measuredPhotos.slice(index * PHOTO_PER_PAGE, (index + 1) * PHOTO_PER_PAGE));
+  const logo = await buildJournalLogoRun();
+  const photoCell = (photo: ImageRun | null, width: number) => new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: width, type: WidthType.DXA }, margins: { top: 30, bottom: 30, left: 30, right: 30 }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: photo ? [photo] : [new TextRun({ text: "圖片無法載入", color: "777777", size: 16, font: "Microsoft JhengHei" })] })] });
+  const photoTable = async (rowPhotos: MeasuredJournalPhoto[], maxHeight: number, width = JOURNAL_PAGE_WIDTH) => {
+    const columnWidth = Math.floor(width / rowPhotos.length);
+    const availableWidth = Math.max(1, Math.floor(columnWidth / 15) - 4);
+    const maxPhotoWidth = rowPhotos.length === 1 ? Math.min(440, availableWidth) : availableWidth;
+    const runs = await Promise.all(rowPhotos.map((photo) => buildJournalPhotoRun(photo.value, maxPhotoWidth, maxHeight, photo)));
+    return new Table({ alignment: AlignmentType.CENTER, borders: JOURNAL_NO_BORDERS, width: { size: width, type: WidthType.DXA }, columnWidths: rowPhotos.map(() => columnWidth), rows: [new TableRow({ cantSplit: true, children: runs.map((run) => photoCell(run, columnWidth)) })] });
+  };
+  const journalHeader = (pageBreakBefore = false) => new Table({
+    alignment: AlignmentType.CENTER,
+    borders: JOURNAL_NO_BORDERS,
+    width: { size: JOURNAL_PAGE_WIDTH, type: WidthType.DXA },
+    columnWidths: [3120, 3120, 3120],
+    rows: [new TableRow({ cantSplit: true, children: [
+      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 3120, type: WidthType.DXA }, children: [new Paragraph({ pageBreakBefore, alignment: AlignmentType.LEFT, children: logo ? [logo] : [] })] }),
+      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 3120, type: WidthType.DXA }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "SPC 工程工作日誌", bold: true, size: 34, font: "Microsoft JhengHei" })] })] }),
+      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 3120, type: WidthType.DXA }, children: [new Paragraph({})] }),
+    ] })],
   });
-  const topPhotos = photos.slice(0, 2);
-  const firstPageLowerPhotos = photos.slice(2, PHOTO_PER_PAGE);
   const meta = [
     ["案場名稱", project.name], ["完工日期", entry.date], ["戶別", `${u.building} ${u.floor}-${u.number}`],
     ["SPC 型號／色號", `${u.model}${u.colorNo ? `／${u.colorNo}` : ""}`], ["坪數", `${u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪`],
     ["工作內容", entry.content || "—"], ["備註", entry.note || "無"],
   ];
-  const infoRows = meta.map(([label, value]) => new TableRow({ cantSplit: true, children: [
-    new TableCell({ width: { size: 1300, type: WidthType.DXA }, margins: { top: 75, bottom: 75, left: 90, right: 90 }, children: [new Paragraph({ children: [new TextRun({ text: label, bold: true, size: 19, font: "Microsoft JhengHei" })] })] }),
-    new TableCell({ width: { size: 3100, type: WidthType.DXA }, margins: { top: 75, bottom: 75, left: 90, right: 90 }, children: [new Paragraph({ children: [new TextRun({ text: value || "—", size: 19, font: "Microsoft JhengHei" })] })] }),
-  ] }));
-  const rightTopChildren = topPhotos.length
-    ? [photoTable(topPhotos, 4960)]
+  const infoChildren = meta.map(([label, value]) => new Paragraph({ spacing: { after: 105 }, children: [new TextRun({ text: `${label}：`, bold: true, size: 24, font: "Microsoft JhengHei" }), new TextRun({ text: value || "—", size: 24, font: "Microsoft JhengHei" })] }));
+  const firstPagePhotos = photoPages[0] || [];
+  const firstPhotoRun = firstPagePhotos[0] ? await buildJournalPhotoRun(firstPagePhotos[0].value, 320, 300, firstPagePhotos[0]) : null;
+  const rightTopChildren = firstPhotoRun
+    ? [new Paragraph({ alignment: AlignmentType.CENTER, children: [firstPhotoRun] })]
     : [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "無工作照片", color: "777777", font: "Microsoft JhengHei" })] })];
   const children: Array<Paragraph | Table> = [
-    new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 180 }, children: [new TextRun({ text: "SPC 工程工作日誌", bold: true, size: 36, font: "Microsoft JhengHei" })] }),
-    new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [4400, 4960], rows: [new TableRow({ cantSplit: true, children: [
-      new TableCell({ width: { size: 4400, type: WidthType.DXA }, margins: { top: 60, bottom: 60, left: 60, right: 80 }, children: [new Table({ width: { size: 4400, type: WidthType.DXA }, columnWidths: [1300, 3100], rows: infoRows })] }),
-      new TableCell({ width: { size: 4960, type: WidthType.DXA }, margins: { top: 40, bottom: 40, left: 80, right: 40 }, children: rightTopChildren }),
+    journalHeader(),
+    new Paragraph({ spacing: { after: 40 } }),
+    new Table({ alignment: AlignmentType.CENTER, borders: JOURNAL_NO_BORDERS, width: { size: JOURNAL_PAGE_WIDTH, type: WidthType.DXA }, columnWidths: [4540, 4820], rows: [new TableRow({ cantSplit: true, children: [
+      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 4540, type: WidthType.DXA }, margins: { top: 40, bottom: 40, left: 30, right: 90 }, children: infoChildren }),
+      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 4820, type: WidthType.DXA }, margins: { top: 40, bottom: 40, left: 90, right: 30 }, children: rightTopChildren }),
     ] })] }),
   ];
-  if (firstPageLowerPhotos.length) children.push(new Paragraph({ spacing: { before: 100, after: 50 }, children: [new TextRun({ text: "工作照片", bold: true, size: 22, font: "Microsoft JhengHei" })] }), photoTable(firstPageLowerPhotos));
-  for (let index = PHOTO_PER_PAGE; index < photos.length; index += PHOTO_PER_PAGE) {
-    children.push(new Paragraph({ pageBreakBefore: true, spacing: { after: 80 }, children: [new TextRun({ text: "SPC 工程工作日誌｜工作照片", bold: true, size: 26, font: "Microsoft JhengHei" })] }), photoTable(photos.slice(index, index + PHOTO_PER_PAGE)));
+  const firstPageRows = planJournalPhotoRows(firstPagePhotos.slice(1));
+  const firstPageRowHeight = Math.min(360, Math.floor(570 / Math.max(1, firstPageRows.length)));
+  for (const rowPhotos of firstPageRows) {
+    children.push(await photoTable(rowPhotos, firstPageRowHeight));
   }
-  const doc = new Document({ sections: [{ properties: { page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } } }, children }] });
+  for (const pagePhotos of photoPages.slice(1)) {
+    children.push(journalHeader(true), new Paragraph({ spacing: { after: 100 } }));
+    const followingRows = planJournalPhotoRows(pagePhotos);
+    const followingRowHeight = Math.min(520, Math.floor(900 / Math.max(1, followingRows.length)));
+    for (const rowPhotos of followingRows) {
+      children.push(await photoTable(rowPhotos, followingRowHeight));
+    }
+  }
+  const doc = new Document({ sections: [{ properties: { page: { size: { width: 11906, height: 16838, orientation: PageOrientation.PORTRAIT }, margin: { top: 720, right: 720, bottom: 720, left: 720 } } }, children }] });
   const blob = await Packer.toBlob(doc);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -5224,6 +5268,19 @@ async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNo
   link.click();
   link.remove();
   revokeObjectUrlLater(url);
+}
+
+function JournalWordPreviewPhotoRows({ photos }: { photos: Photo[] }) {
+  const previewPhotos = photos.slice(1, 6);
+  const [measured, setMeasured] = useState<MeasuredJournalPhoto[]>(() => previewPhotos.map((photo) => ({ value: photo, width: 1, height: 1 })));
+  useEffect(() => {
+    let active = true;
+    void Promise.all(previewPhotos.map(async (photo) => ({ value: photo, ...await loadJournalPhotoDimensions(photo) }))).then((next) => {
+      if (active) setMeasured(next);
+    });
+    return () => { active = false; };
+  }, [photos]);
+  return <div className="word-preview-photo-layout">{planJournalPhotoRows(measured).map((row, rowIndex) => <div className="word-preview-photo-row" style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }} key={rowIndex}>{row.map(({ value: photo }) => <ZoomablePhoto key={photo.id} photo={photo} alt={photo.caption || "工作照片"} />)}</div>)}</div>;
 }
 
 function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>) => void }) {
@@ -5270,7 +5327,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     <div className="save-success">✓ 輸入內容會先保存在本機；按「暫存」後同步至資料庫</div>
     <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => setPreview(true)}>預覽／產生 Word</button></div>
     {saved && <div className="save-success">{saved}</div>}
-    {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span></div><div className="word-preview-photos">{entry.photos.slice(0, 6).map((photo) => <ZoomablePhoto key={photo.id} photo={photo} alt={photo.caption || "工作照片"} />)}</div><p><b>工作內容：</b>{entry.content}</p><p><b>備註：</b>{entry.note || "無"}</p></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); await downloadWorkJournalDocx(project, u, entry); setDownloading(false); }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
+    {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span aria-hidden="true" /></div><div className="word-preview-first-row"><div className="word-preview-meta"><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span><span><b>工作內容：</b>{entry.content}</span><span><b>備註：</b>{entry.note || "無"}</span></div>{entry.photos[0] ? <ZoomablePhoto photo={entry.photos[0]} alt={entry.photos[0].caption || "工作照片"} /> : <span className="word-preview-empty">無工作照片</span>}</div><JournalWordPreviewPhotoRows photos={entry.photos} /></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); await downloadWorkJournalDocx(project, u, entry); setDownloading(false); }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
     <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={liveEntities(u.journals).map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
   </div>;
 }

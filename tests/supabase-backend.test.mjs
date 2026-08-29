@@ -404,19 +404,40 @@ test("electronic acceptance excludes drafts and billing labels its CSV accuratel
   assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
 });
 
-test("work journal Word export uses split first page and six fitted photos per page", async () => {
+test("work journal Word export uses adaptive borderless six-photo pages", async () => {
   const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
   const exporter = page.slice(page.indexOf("async function buildJournalPhotoRun"), page.indexOf("function UnitJournalTab"));
-  assert.match(exporter, /columnWidths: \[4400, 4960\]/);
   assert.match(exporter, /const PHOTO_PER_PAGE = 6/);
-  assert.match(exporter, /photos\.slice\(0, 2\)/);
-  assert.match(exporter, /photos\.slice\(2, PHOTO_PER_PAGE\)/);
-  assert.match(exporter, /index \+= PHOTO_PER_PAGE/);
-  assert.match(exporter, /photos\.slice\(index, index \+ PHOTO_PER_PAGE\)/);
-  assert.match(exporter, /Math\.min\(maxWidth \/ dimensions\.width, maxHeight \/ dimensions\.height\)/);
+  assert.match(exporter, /planJournalPhotoRows\(firstPagePhotos\.slice\(1\)\)/);
+  assert.match(exporter, /planJournalPhotoRows\(pagePhotos\)/);
+  assert.match(exporter, /measuredPhotos\.slice\(index \* PHOTO_PER_PAGE, \(index \+ 1\) \* PHOTO_PER_PAGE\)/);
+  assert.match(exporter, /photoPages\.slice\(1\)/);
+  assert.match(exporter, /Math\.min\(maxWidth \/ intrinsic\.width, maxHeight \/ intrinsic\.height\)/);
+  assert.match(exporter, /Math\.floor\(columnWidth \/ 15\) - 4/);
+  assert.match(exporter, /buildJournalPhotoRun\(firstPagePhotos\[0\]\.value, 320, 300, firstPagePhotos\[0\]\)/);
+  assert.match(exporter, /Math\.floor\(570 \/ Math\.max\(1, firstPageRows\.length\)\)/);
+  assert.match(exporter, /Math\.floor\(900 \/ Math\.max\(1, followingRows\.length\)\)/);
+  assert.match(exporter, /Math\.min\(440, availableWidth\)/);
+  assert.match(exporter, /margins: \{ top: 30, bottom: 30, left: 30, right: 30 \}/);
+  assert.match(exporter, /spacing: \{ after: 105 \}[\s\S]*bold: true, size: 24[\s\S]*text: value \|\| "—", size: 24/);
   assert.match(exporter, /cantSplit: true/);
+  assert.match(exporter, /JOURNAL_NO_BORDERS[\s\S]*BorderStyle\.NIL/);
+  assert.match(exporter, /borders: JOURNAL_NO_BORDERS/);
+  assert.match(exporter, /fetch\("\/shen-yin-logo\.png"\)/);
+  assert.doesNotMatch(exporter, /dist\/client\/shen-yin-logo/);
+  assert.match(exporter, /columnWidths: \[3120, 3120, 3120\]/);
+  assert.match(exporter, /journalHeader[\s\S]*alignment: AlignmentType\.CENTER/);
+  assert.match(exporter, /photoTable[\s\S]*alignment: AlignmentType\.CENTER/);
+  assert.match(exporter, /columnWidths: \[4540, 4820\][\s\S]*alignment: AlignmentType\.CENTER|alignment: AlignmentType\.CENTER[\s\S]*columnWidths: \[4540, 4820\]/);
+  assert.match(exporter, /size: \{ width: 11906, height: 16838, orientation: PageOrientation\.PORTRAIT \}/);
+  assert.match(exporter, /margin: \{ top: 720, right: 720, bottom: 720, left: 720 \}/);
+  assert.match(exporter, /text: "SPC 工程工作日誌"/);
   assert.match(exporter, /"無工作照片"/);
-  assert.doesNotMatch(exporter, /填寫人：|建立：|最後修改：/);
+  assert.doesNotMatch(exporter, /工作照片", bold|圖一|圖二|cleanupRemovedPhotos|uploadEmbeddedPhotos|entry\.photos\s*=/);
+  assert.match(page, /word-preview-first-row[\s\S]*entry\.photos\[0\][\s\S]*JournalWordPreviewPhotoRows photos=\{entry\.photos\}/);
+  assert.match(page, /function JournalWordPreviewPhotoRows[\s\S]*planJournalPhotoRows\(measured\)/);
+  assert.match(css, /\.word-preview-first-row\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1\.08fr\)/);
 });
 
 test("IndexedDB photo drafts restore through markers without overriding full local drafts", async () => {
@@ -477,7 +498,7 @@ test("PhotoGrid thumbnails share one non-mutating lightbox while editing control
   assert.match(grid, /includeReport: e\.target\.checked/);
   assert.match(grid, /set\(photos\.filter\(\(p\) => p\.id !== x\.id\)\)/);
   assert.doesNotMatch(grid, /localStorage|indexedDB|fetch\(|compress\(/);
-  assert.match(page, /word-preview-photos[\s\S]*ZoomablePhoto key=\{photo\.id\} photo=\{photo\}/);
+  assert.match(page, /word-preview-photo-row[\s\S]*ZoomablePhoto key=\{photo\.id\} photo=\{photo\}/);
   assert.match(css, /\.photo-lightbox \.photo-lightbox-image\{[^}]*max-width:[^;]+!important;[^}]*max-height:[^;]+!important;[^}]*object-fit:contain!important/);
   assert.match(css, /\.photo-zoom-trigger\{cursor:zoom-in\}/);
 });
@@ -485,7 +506,7 @@ test("PhotoGrid thumbnails share one non-mutating lightbox while editing control
 test("unit acceptance journal alone uses larger frameless responsive photos", async () => {
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
-  const unitJournal = page.slice(page.indexOf("function UnitJournalTab"), page.indexOf("function Journal"));
+  const unitJournal = page.slice(page.indexOf("function UnitJournalTab"), page.indexOf("function Journal({"));
   const scopedStyles = css.slice(css.indexOf("Unit acceptance journal photos only"));
 
   assert.match(unitJournal, /<div className="unit-journal-photos"><Photos node="戶別工作日誌"/);
@@ -496,7 +517,7 @@ test("unit acceptance journal alone uses larger frameless responsive photos", as
   assert.match(css, /\.photo-record\{display:grid/);
   assert.match(page, /function PhotoGrid[\s\S]*<ZoomablePhoto photo=\{x\}/);
   assert.match(page, /function ZoomablePhoto[\s\S]*photo-lightbox/);
-  assert.match(unitJournal, /word-preview-photos/);
+  assert.match(unitJournal, /word-preview-first-row/);
   assert.match(page, /async function downloadWorkJournalDocx/);
 });
 
@@ -542,7 +563,7 @@ test("unit and project journals reopen and update the same record without duplic
   assert.match(projectJournal, /confirm\("刪除此筆當日日誌？"\)/);
   assert.match(projectJournal, /removeDurableDraft\(draftKey\(authUserId, "journal", p\.id\)\)/);
 
-  assert.match(wordExporter, /columnWidths: \[4400, 4960\]/);
+  assert.match(wordExporter, /columnWidths: \[4540, 4820\]/);
   assert.doesNotMatch(wordExporter, /正在修改|新增今日日誌|新增驗收日誌/);
 });
 
