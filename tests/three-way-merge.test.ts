@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { liveEntities, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge.ts";
+import { liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge.ts";
 
 test("merges changes made to different records", () => {
   const base = { units: [{ id: "a", owner: "王", status: "待場勘" }, { id: "b", owner: "李", status: "待場勘" }] };
@@ -21,13 +21,65 @@ test("keeps local value and reports a same-field conflict", () => {
   assert.deepEqual(result.conflicts, ["units[a].status"]);
 });
 
-test("preserves a remotely edited record when it was locally deleted", () => {
+test("array omission is not a formal unit deletion and preserves the remote live unit", () => {
   const base = { units: [{ id: "a", status: "待場勘" }] };
   const local = { units: [] as Array<{ id: string; status: string }> };
   const remote = { units: [{ id: "a", status: "可進場" }] };
   const result = threeWayMerge(base, local, remote);
   assert.equal(result.value.units[0].status, "可進場");
-  assert.deepEqual(result.conflicts, ["units[a]"]);
+  assert.deepEqual(result.conflicts, []);
+});
+
+test("explicit unit tombstone survives unchanged and stale remotely edited units", () => {
+  const original = { id: "u1", status: "待場勘", photos: [{ id: "photo", data: "storage-url" }] };
+  const deleted = tombstoneEntity(original, "user-delete", "2026-08-29T01:00:00.000Z");
+  const base = { units: [original] };
+  assert.deepEqual(threeWayMerge(base, { units: [deleted] }, base).value.units, [deleted]);
+  assert.deepEqual(threeWayMerge(base, { units: [deleted] }, { units: [{ ...original, status: "施工中" }] }).value.units, [deleted]);
+  assert.deepEqual(deleted.photos, original.photos);
+});
+
+test("persisted unit tombstone survives repeated stale-device merges and live view hides it", () => {
+  const original = { id: "u1", status: "待場勘" };
+  const other = { id: "u2", status: "施工中" };
+  const deleted = tombstoneEntity(original, "user-delete", "2026-08-29T01:00:00.000Z");
+  const base = { units: [original, other] };
+  const first = threeWayMerge(base, { units: [deleted, other] }, base).value;
+  const second = threeWayMerge(base, base, first).value;
+  const third = threeWayMerge(base, base, second).value;
+  assert.deepEqual(first.units, [deleted, other]);
+  assert.deepEqual(second.units, [deleted, other]);
+  assert.deepEqual(third.units, [deleted, other]);
+  assert.deepEqual(liveEntities(third.units), [other]);
+});
+
+test("project tombstone survives stale remote project while other live projects remain visible", () => {
+  const project = { id: "p1", name: "deleted project", units: [{ id: "u1" }] };
+  const other = { id: "p2", name: "live project", units: [] };
+  const deleted = tombstoneEntity(project, "user-delete", "2026-08-29T01:00:00.000Z");
+  const base = { projects: [project, other] };
+  const result = threeWayMerge(base, { projects: [deleted, other] }, { projects: [{ ...project, name: "stale edit" }, other] });
+  assert.deepEqual(result.value.projects, [deleted, other]);
+  assert.deepEqual(liveEntities(result.value.projects), [other]);
+  assert.deepEqual(deleted.units, project.units);
+});
+
+test("newest explicit tombstone wins and normal live records are unaffected", () => {
+  const original = { id: "u1", status: "待場勘" };
+  const older = tombstoneEntity(original, "old-user", "2026-08-29T01:00:00.000Z");
+  const newer = tombstoneEntity(original, "new-user", "2026-08-29T02:00:00.000Z");
+  const live = { id: "u2", status: "施工中" };
+  const result = threeWayMerge({ units: [original, live] }, { units: [older, live] }, { units: [newer, live] });
+  assert.deepEqual(result.value.units, [newer, live]);
+});
+
+test("live unit updates retain persisted tombstones without exposing them", () => {
+  const deleted = tombstoneEntity({ id: "u1", status: "待場勘" }, "user-delete", "2026-08-29T01:00:00.000Z");
+  const live = { id: "u2", status: "施工中" };
+  assert.deepEqual(retainEntityTombstones([deleted, live], [{ ...live, status: "已驗收" }]), [
+    { ...live, status: "已驗收" },
+    deleted,
+  ]);
 });
 
 const projectWith = (journals: unknown, unitCollections: Record<string, unknown> = {}) => ({

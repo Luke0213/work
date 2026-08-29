@@ -4,7 +4,7 @@ const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const isEntityArray = (v: unknown): v is Array<Record<string, unknown> & { id: string }> =>
   Array.isArray(v) && v.every((x) => isRecord(x) && typeof x.id === "string");
-const protectedCollections = new Set(["surveys", "works", "defects", "acceptances", "journals", "events", "floorAcceptances"]);
+const protectedCollections = new Set(["projects", "units", "surveys", "works", "defects", "acceptances", "journals", "events", "floorAcceptances"]);
 const collectionName = (path: string) => path.split(".").at(-1) || "";
 const isDeleted = (value: unknown) => isRecord(value) && value._deleted === true;
 
@@ -16,6 +16,10 @@ export function tombstoneEntity<T extends { id: string }>(entity: T, deletedBy: 
 
 export const isDeletedEntity = (entity: unknown): boolean => isDeleted(entity);
 export const liveEntities = <T>(entities: T[]): T[] => entities.filter((entity) => !isDeleted(entity));
+export function retainEntityTombstones<T extends { id: string }>(persisted: T[], live: T[]): T[] {
+  const incomingIds = new Set(live.map((entity) => entity.id));
+  return [...live, ...persisted.filter((entity) => isDeleted(entity) && !incomingIds.has(entity.id))];
+}
 
 function protectedEntityArray(value: unknown): Array<Record<string, unknown> & { id: string }> {
   return isEntityArray(value) ? value : [];

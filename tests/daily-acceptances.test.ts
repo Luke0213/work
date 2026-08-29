@@ -24,6 +24,11 @@ test("daily acceptance keeps every final history record by its own date", () => 
   assert.equal(entries.filter((entry) => entry.acceptance.id === "today-a").length, 1);
 });
 
+test("deleted units never contribute daily acceptance history", () => {
+  const units = [{ id: "deleted", _deleted: true, acceptances: [{ id: "a1", date: "2026-08-28" }] }];
+  assert.deepEqual(buildDailyAcceptanceEntries(units), []);
+});
+
 test("single-day shipment export contains only that day and restarts serial at one", () => {
   const project = { name: "測試案場", units: [unit] };
   const entries = buildDailyAcceptanceEntries([unit]).filter((entry) => entry.date === yesterday);

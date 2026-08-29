@@ -23,6 +23,7 @@ export type AcceptanceExportRecord = {
 
 export type ExportUnit = {
   id: string;
+  _deleted?: boolean;
   building?: string;
   floor?: string;
   number?: string;
@@ -65,7 +66,7 @@ export function buildAcceptanceExportRecord(project: ExportProject, unit: Export
 }
 
 export function buildAcceptanceExportRecords(project: ExportProject, currentUnit?: ExportUnit, currentAcceptance?: { id?: string; date?: string; startedAt?: string; area?: number; note?: string; draft?: boolean }): AcceptanceExportRecord[] {
-  const units = (project.units || []).map((unit) => unit.id === currentUnit?.id ? { ...unit, acceptances: currentAcceptance ? [currentAcceptance, ...(unit.acceptances || []).filter((item) => item.id !== currentAcceptance.id)] : unit.acceptances } : unit);
+  const units = (project.units || []).filter((unit) => unit._deleted !== true).map((unit) => unit.id === currentUnit?.id ? { ...unit, acceptances: currentAcceptance ? [currentAcceptance, ...(unit.acceptances || []).filter((item) => item.id !== currentAcceptance.id)] : unit.acceptances } : unit);
   return units.flatMap((unit) => {
     const acceptance = getLatestFinalAcceptance(unit);
     if (!acceptance && !(unit.works || []).length && unit.id !== currentUnit?.id) return [];

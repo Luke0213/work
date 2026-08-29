@@ -199,6 +199,55 @@ test("floor acceptances use the same non-destructive protected merge semantics",
   assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
 });
 
+test("project and unit deletion uses durable tombstones in client views and the additive server merge", async () => {
+  const merge = await read("lib/three-way-merge.ts");
+  const page = await read("app/page.tsx");
+  const migration = await read("supabase/migrations/202608290001_project_unit_tombstone_merge.sql");
+  const deletion = page.slice(page.indexOf("const removeUnit ="), page.indexOf("const addEvent ="));
+  for (const collection of ["projects", "units"]) {
+    assert.match(merge, new RegExp(`\\"${collection}\\"`));
+    assert.match(migration, new RegExp(collection));
+  }
+  assert.match(deletion, /const unit = p\.units\.find\([\s\S]*!isDeletedEntity\(candidate\)/);
+  assert.match(deletion, /tombstoneEntity\(unit, authUserId, stamp\(\)\)/);
+  assert.match(deletion, /tombstoneEntity\(p, authUserId, stamp\(\)\)/);
+  assert.doesNotMatch(deletion, /units\.filter|ps\.filter|projects\.filter/);
+  assert.match(page, /const liveProjectViews = \(projects: Project\[\]\): Project\[\] => liveEntities\(projects\)\.map/);
+  assert.match(page, /units: liveEntities\(project\.units\)/);
+  assert.match(page, /const liveProjects = liveProjectViews\(projects\)/);
+  assert.match(page, /retainEntityTombstones\(p\.units, x\.units\)/);
+  assert.match(migration, /create or replace function public\.spc_json_merge_three_way_at/i);
+  assert.match(migration, /\(projects\|units\|surveys\|works\|defects\|acceptances\|journals\|events\|floorAcceptances\)/);
+  assert.match(migration, /order by coalesce\(marker->>'deletedAt', ''\) desc/);
+  assert.match(migration, /revoke all on function public\.spc_json_merge_three_way_at[\s\S]*from public/i);
+  assert.match(migration, /revoke all on function public\.spc_json_merge_three_way_at[\s\S]*from anon/i);
+  assert.doesNotMatch(migration, /\b(delete\s+from|truncate|drop\s+table|alter\s+table|update\s+public\.|insert\s+into)\b/i);
+  assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
+  assert.doesNotMatch(deletion, /storage|spc-photos|\.remove\(/);
+});
+
+test("floor continuous acceptance workbench updates only the explicit unit acceptance signature", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const appState = page.slice(page.indexOf("const patchUnit ="), page.indexOf("const removeUnit ="));
+  const floorView = page.slice(page.indexOf("function FloorAcceptanceView"), page.indexOf("function UnitDetail"));
+
+  assert.match(appState, /const patchUnitById = \(unitId: string, updater: \(current: Unit\) => Unit\)/);
+  assert.match(appState, /setProjectsDurably\(\(ps\) =>[\s\S]*p\.id !== pid \|\| isDeletedEntity\(p\)[\s\S]*current\.id === unitId && !isDeletedEntity\(current\) \? updater\(current\) : current/);
+  assert.match(page, /patchUnitById=\{patchUnitById\}/);
+  for (const value of ["樓層連續驗收工作台", "開始／繼續作業", "下一待處理", "上一戶", "下一戶", "簽名／補簽", "查看完整驗收資料", "四簽完成"])
+    assert.match(floorView, new RegExp(value));
+  assert.match(floorView, /patchUnitById\(targetUnitId, \(latestUnit\) => updateLatestFormalAcceptanceSignature\(latestUnit, targetRole, signature\)\)/);
+  assert.match(floorView, /尚未完成驗收[\s\S]*不會建立假 Acceptance/);
+  assert.match(floorView, /areaValueFromPing\(currentUnit\.estimated, "坪"\)/);
+  assert.doesNotMatch(floorView, /acceptance\?\.area \|\| currentUnit\.estimated/);
+  assert.doesNotMatch(floorView, /floorAcceptances\s*:|updateFloorSignature|saveRecord/);
+  assert.match(css, /#24A floor continuous acceptance workbench/);
+  assert.match(css, /\.floor-acceptance-page \.floor-workbench\{display:grid;grid-template-columns:270px minmax\(0,1fr\)/);
+  assert.match(css, /@media\(max-width:1000px\) and \(min-width:701px\)[\s\S]*overflow-x:auto/);
+  assert.match(css, /@media\(max-width:700px\)[\s\S]*\.floor-acceptance-page \.floor-workbench-selector\{display:none\}[\s\S]*position:fixed/);
+});
+
 test("Excel unit import accepts partial rows without importing blanks or duplicates", async () => {
   const page = await read("app/page.tsx");
   const importer = page.slice(page.indexOf("type ImportUnitRow"), page.indexOf("function ProjectForm"));
@@ -534,7 +583,9 @@ test("acceptance entry and formal sheet keep one completion mapping and three A4
     'a.completion?.boardDamaged === true',
     'printWithLifecycleCleanup("printing-completion")',
   ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  const completionPrint = css.slice(css.lastIndexOf("@media print{"), css.indexOf(".area-input-row"));
+  const completionPrintStart = css.lastIndexOf("@media print{", css.indexOf("body.printing-completion{"));
+  const completionPrintEnd = css.indexOf("@media print{", completionPrintStart + 1);
+  const completionPrint = css.slice(completionPrintStart, completionPrintEnd > completionPrintStart ? completionPrintEnd : css.indexOf(".area-input-row"));
   for (const value of [
     "body.printing-completion .completion-paper",
     "width:210mm",
@@ -553,6 +604,37 @@ test("acceptance entry and formal sheet keep one completion mapping and three A4
   assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
 });
 
+test("floor batch acceptance export keeps unit-scoped drafts, signatures, and one A4 three-copy group per unit", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const helper = await read("lib/floor-acceptance.ts");
+  const batch = page.slice(page.indexOf("function FloorBatchExport"), page.indexOf("function UnitDetail"));
+  assert.match(page, />匯出驗收單<\/button>/);
+  assert.match(batch, /floorBatchSelectableIds\(units\)/);
+  assert.match(helper, /return !!getLatestFinalAcceptance\(unit\)/);
+  assert.match(batch, /disabled=\{disabled\}/);
+  assert.match(batch, /全選可匯出/);
+  assert.match(batch, /buildUnitScopedRecord\(targets, createUnitExport\)/);
+  assert.match(batch, /updateUnitScopedRecord\(record, currentUnit\.id, update\)/);
+  assert.match(batch, /buildCompletionExportDraft\(project, unit, acceptance, completion\)/);
+  assert.match(batch, /resolveUnitSignatures\(unit, floorRecord, units\)/);
+  assert.match(batch, /還原此戶自動資料/);
+  assert.match(batch, /className="floor-batch-export-editor-grid"/);
+  assert.doesNotMatch(batch, /className="grid3"/);
+  assert.match(batch, /printWithLifecycleCleanup\("printing-completion-batch"\)/);
+  assert.match(batch, /completionCopyLabels\.map\(\(copy\) => <CompletionCopy/);
+  assert.match(page, /printWithLifecycleCleanup\("printing-completion"\)/);
+  assert.match(css, /\.floor-batch-print\{display:none\}/);
+  assert.match(css, /\.modal-card:has\(> \.floor-batch-export\)\{[^}]*width:min\(900px,calc\(100vw - 40px\)\)[^}]*overflow-x:hidden;overflow-y:auto/);
+  assert.match(css, /\.floor-batch-unit-grid\{[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\)[^}]*max-width:100%/);
+  assert.match(css, /\.floor-batch-export-editor-grid\{[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\)[^}]*max-width:100%/);
+  assert.match(css, /\.floor-batch-unit-selector\{[^}]*overflow-x:auto;overflow-y:hidden/);
+  assert.match(css, /@media\(max-width:700px\)\{[\s\S]*\.floor-batch-unit-grid,\.floor-batch-export-editor-grid,\.floor-batch-review,\.floor-batch-summary\{grid-template-columns:1fr\}/);
+  assert.match(css, /body\.printing-completion-batch \.floor-batch-paper\{[\s\S]*max-height:285mm[\s\S]*break-after:page;page-break-after:always/);
+  assert.match(css, /\.floor-batch-paper:last-child\{break-after:auto;page-break-after:auto\}/);
+  assert.match(css, /body\.printing-completion-batch \.completion-copy\{[\s\S]*height:87mm/);
+});
+
 test("completion export confirmation edits one temporary draft shared by all three copies", async () => {
   const page = await read("app/page.tsx");
   const report = page.slice(page.indexOf("type CompletionExportDraft"), page.indexOf("function Timeline"));
@@ -563,7 +645,7 @@ test("completion export confirmation edits one temporary draft shared by all thr
   assert.match(report, /const \[exportDraft, setExportDraft\]/);
   assert.match(report, /const reportSignatures = signatures \|\| completion\.signatures/);
   assert.match(report, /\.map\(\(copy\) => <CompletionCopy key=\{copy\} copy=\{copy\} draft=\{exportDraft\} signatures=\{reportSignatures\}/);
-  assert.match(report, /resolveFloorSignatures\(floorRecord, floorUnits\)/);
+  assert.match(report, /resolveUnitSignatures\(u, floorRecord, floorUnits\)/);
   assert.match(report, /setText\("projectName"|\['projectName','案場名稱'\]/);
   assert.match(report, /setText\("area"|\['area','坪數確認'\]/);
   assert.match(report, /CompletionDraftBoolean label="地坪是否異常"/);

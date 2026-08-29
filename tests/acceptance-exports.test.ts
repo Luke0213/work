@@ -33,6 +33,12 @@ test("normalizes acceptance records with ping and square meter values", () => {
   assert.match(records[0].unitDisplay, /A15-5/);
 });
 
+test("deleted units are excluded from acceptance export rows", () => {
+  const deletedUnit = { ...project.units[0], id: "deleted", _deleted: true };
+  const records = buildAcceptanceExportRecords({ ...project, units: [project.units[0], deletedUnit] });
+  assert.deepEqual(records.map((record) => record.unitId), ["u1"]);
+});
+
 test("shipment workbook contains stable formulas without reference errors", () => {
   const records = buildAcceptanceExportRecords(project);
   const workbook = createShipmentWorkbook(project, records, "2026-04") as {

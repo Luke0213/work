@@ -2,12 +2,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   canCompleteFloorAcceptance,
+  batchCompletionCopyDescriptors,
+  buildUnitScopedRecord,
   createFloorReturnContext,
   floorAcceptanceSummary,
+  floorBatchExportable,
+  floorBatchSelectableIds,
   floorIdentity,
+  floorUnitNeedsAction,
+  floorUnitSignatureCount,
   floorUnitAcceptanceState,
   floorUnitsFor,
+  floorWorkbenchSummary,
+  nextPendingFloorUnitId,
   resolveFloorSignatures,
+  resolveUnitSignatures,
+  updateLatestFormalAcceptanceSignature,
+  updateUnitScopedRecord,
   updateFloorSignature,
   type FloorAcceptanceUnit,
   type FloorSignature,
@@ -22,6 +33,7 @@ test("floor identity and grouping include building and support arbitrary unit co
   const units = Array.from({ length: 11 }, (_, index) => unit(`u${index}`, index === 10 ? "B棟" : "A棟"));
   assert.equal(floorUnitsFor(units, "A棟", "14F").length, 10);
   assert.equal(floorUnitsFor(units, "B棟", "14F").length, 1);
+  assert.deepEqual(floorUnitsFor([...units, { ...unit("deleted"), _deleted: true }], "A棟", "14F").map((item) => item.id), units.filter((item) => item.building === "A棟").map((item) => item.id));
 });
 
 test("one, eight, and arbitrary-size floors use the same all-qualified rule", () => {
@@ -37,6 +49,108 @@ test("missing and draft acceptances are uninspected; latest formal all-pass acce
   assert.equal(floorUnitAcceptanceState(unit("ok", "A棟", "14F", [acceptance("old", ["不合格"], { startedAt: "2026-08-27T00:00:00Z" }), acceptance("new", ["合格"], { startedAt: "2026-08-28T00:00:00Z" })])), "qualified");
   assert.equal(floorUnitAcceptanceState(unit("bad", "A棟", "14F", [acceptance("bad", ["合格", "不合格"])])), "needsAction");
   assert.equal(floorUnitAcceptanceState(unit("empty", "A棟", "14F", [acceptance("empty", [])])), "needsAction");
+});
+
+test("floor batch export selects only formal acceptances and keeps incomplete signatures selectable", () => {
+  const formal = unit("formal", "A棟", "14F", [acceptance("a1", ["合格"], { completion: { signatures: { office: signature("office") } } })]);
+  const conflicted = unit("conflicted", "A棟", "14F", [acceptance("a2", ["合格"], { completion: { signatures: { office: signature("other") } } })]);
+  const draftOnly = unit("draft", "A棟", "14F", [acceptance("draft-a", ["合格"], { draft: true })]);
+  const otherFloor = unit("other-floor", "A棟", "15F", [acceptance("a3", ["合格"])]);
+  const scoped = floorUnitsFor([formal, conflicted, draftOnly, otherFloor], "A棟", "14F");
+  assert.equal(floorBatchExportable(formal), true);
+  assert.equal(floorBatchExportable(draftOnly), false);
+  assert.deepEqual(floorBatchSelectableIds(scoped), ["formal", "conflicted"]);
+});
+
+test("floor batch drafts update independently without mutating source values", () => {
+  const units = [{ id: "u1", name: "one" }, { id: "u2", name: "two" }];
+  const source = structuredClone(units);
+  const drafts = buildUnitScopedRecord(units, (item) => ({ projectName: item.name, floorAbnormal: false }));
+  const next = updateUnitScopedRecord(drafts, "u2", (draft) => ({ ...draft, projectName: "edited", floorAbnormal: true }));
+  assert.deepEqual(drafts.u1, { projectName: "one", floorAbnormal: false });
+  assert.deepEqual(next.u1, drafts.u1);
+  assert.deepEqual(next.u2, { projectName: "edited", floorAbnormal: true });
+  assert.deepEqual(units, source);
+});
+
+test("two selected units produce exactly six three-copy descriptors", () => {
+  const copies = batchCompletionCopyDescriptors(["u1", "u2"], ["客戶", "公司", "廠商"]);
+  assert.equal(copies.length, 6);
+  assert.deepEqual(copies.map((item) => item.unitId), ["u1", "u1", "u1", "u2", "u2", "u2"]);
+});
+
+test("floor workbench pending covers formal result, items, and four independent signatures", () => {
+  const four = { installer: signature("i"), office: signature("o"), siteManager: signature("m"), supervisor: signature("s") };
+  assert.equal(floorUnitNeedsAction(unit("none")), true);
+  assert.equal(floorUnitNeedsAction(unit("draft", "A棟", "14F", [acceptance("draft", ["合格"], { draft: true, completion: { signatures: four } })])), true);
+  assert.equal(floorUnitNeedsAction(unit("result", "A棟", "14F", [acceptance("result", ["合格"], { result: "部分合格", completion: { signatures: four } })])), true);
+  assert.equal(floorUnitNeedsAction(unit("empty", "A棟", "14F", [acceptance("empty", [], { result: "合格", completion: { signatures: four } })])), true);
+  assert.equal(floorUnitNeedsAction(unit("item", "A棟", "14F", [acceptance("item", ["合格", "不合格"], { result: "合格", completion: { signatures: four } })])), true);
+  const three = { installer: four.installer, office: four.office, siteManager: four.siteManager };
+  assert.equal(floorUnitSignatureCount(unit("three", "A棟", "14F", [acceptance("three", ["合格"], { completion: { signatures: three } })])), 3);
+  assert.equal(floorUnitNeedsAction(unit("three", "A棟", "14F", [acceptance("three", ["合格"], { completion: { signatures: three } })])), true);
+  assert.equal(floorUnitNeedsAction(unit("complete", "A棟", "14F", [acceptance("complete", ["合格"], { completion: { signatures: four } })])), false);
+});
+
+test("next pending skips complete units, stays in the supplied floor list, and wraps", () => {
+  const four = { installer: signature("i"), office: signature("o"), siteManager: signature("m"), supervisor: signature("s") };
+  const complete = (id: string, building = "A棟") => unit(id, building, "14F", [acceptance(`a-${id}`, ["合格"], { completion: { signatures: four } })]);
+  const floor = [complete("u1"), complete("u2"), unit("u3"), complete("u4")];
+  assert.equal(nextPendingFloorUnitId(floor, "u1"), "u3");
+  assert.equal(nextPendingFloorUnitId(floor, "u3"), null);
+  assert.equal(nextPendingFloorUnitId([complete("u1"), complete("u2")], "u1"), null);
+  assert.equal(nextPendingFloorUnitId(floorUnitsFor([...floor, unit("other", "B棟")], "A棟", "14F"), "u4"), "u3");
+});
+
+test("targeted acceptance signature update preserves unit, role siblings, acceptance content, and history", () => {
+  const original = { installer: signature("i"), office: signature("o"), siteManager: signature("m") };
+  const old = acceptance("old", ["不合格"], { startedAt: "2026-08-27", draft: false, note: "old" });
+  const draft = acceptance("draft", ["合格"], { startedAt: "2026-08-29", draft: true, note: "draft" });
+  const latest = acceptance("latest", ["合格"], { startedAt: "2026-08-28", note: "keep", photos: [{ id: "p" }], completion: { signatures: original, extra: "keep" } });
+  const source: any = { ...unit("u1", "A棟", "14F", [old, latest, draft]), model: "M1", colorNo: "C1", estimated: 20 };
+  const next = updateLatestFormalAcceptanceSignature(source, "supervisor", signature("s"));
+  assert.notEqual(next, source);
+  assert.equal(next.model, "M1");
+  assert.equal(next.acceptances[0], old);
+  assert.equal(next.acceptances[2], draft);
+  assert.deepEqual(next.acceptances[1].items, latest.items);
+  assert.deepEqual(next.acceptances[1].photos, latest.photos);
+  assert.equal(next.acceptances[1].note, "keep");
+  assert.equal(next.acceptances[1].completion.extra, "keep");
+  assert.equal(next.acceptances[1].completion.signatures.installer, original.installer);
+  assert.equal(next.acceptances[1].completion.signatures.office, original.office);
+  assert.equal(next.acceptances[1].completion.signatures.siteManager, original.siteManager);
+  assert.equal(next.acceptances[1].completion.signatures.supervisor?.name, "s");
+  const withoutFormal = unit("none", "A棟", "14F", [draft]);
+  assert.equal(updateLatestFormalAcceptanceSignature(withoutFormal, "office", signature("new")), withoutFormal);
+});
+
+test("explicit unit-id update changes only the selected unit and leaves floor records untouched", () => {
+  const units: any[] = [
+    unit("u1", "A棟", "14F", [acceptance("a1", ["合格"], { completion: { signatures: {} } })]),
+    unit("u2", "A棟", "14F", [acceptance("a2", ["合格"], { completion: { signatures: {} } })]),
+    unit("u3", "A棟", "14F", [acceptance("a3", ["合格"], { completion: { signatures: {} } })]),
+  ];
+  const floorAcceptances = [{ id: "floor-legacy", building: "A棟", floor: "14F", signatures: { office: signature("legacy") } }];
+  const beforeFloor = structuredClone(floorAcceptances);
+  const next = units.map((current) => current.id === "u2" ? updateLatestFormalAcceptanceSignature(current, "office", signature("target")) : current);
+  assert.equal(next[0], units[0]);
+  assert.notEqual(next[1], units[1]);
+  assert.equal(next[2], units[2]);
+  assert.equal(next[1].acceptances[0].completion.signatures.office.name, "target");
+  assert.equal(next[0].acceptances[0].completion.signatures.office, undefined);
+  assert.deepEqual(floorAcceptances, beforeFloor);
+});
+
+test("workbench summary reads each unit independently", () => {
+  const four = { installer: signature("i"), office: signature("o"), siteManager: signature("m"), supervisor: signature("s") };
+  const units = [
+    { ...unit("u1", "A棟", "14F", [acceptance("a1", ["合格"], { completion: { signatures: four } })]), model: "SPC-A" },
+    { ...unit("u2", "A棟", "14F", [acceptance("a2", ["合格"], { completion: { signatures: { installer: signature("i2") } } })]), model: "SPC-B" },
+  ];
+  assert.deepEqual(floorWorkbenchSummary(units), { total: 2, acceptanceComplete: 2, signaturesComplete: 1, pending: 1 });
+  assert.equal((units[0] as any).model, "SPC-A");
+  assert.equal((units[1] as any).model, "SPC-B");
 });
 
 test("floor completion requires every unit and all four valid signatures", () => {
@@ -106,6 +220,28 @@ test("conflicting legacy signatures are reported instead of selected or written"
   const resolved = resolveFloorSignatures(undefined, units);
   assert.equal(resolved.signatures.office, undefined);
   assert.deepEqual(resolved.conflicts, ["office"]);
+});
+
+test("sheet signatures prefer the unit and use floor legacy fallback only for missing roles", () => {
+  const ownOffice = signature("unit-office"), ownInstaller = signature("unit-installer"), floorOffice = signature("floor-office"), floorSupervisor = signature("floor-supervisor");
+  const target = unit("u1", "A棟", "14F", [acceptance("a1", ["合格"], { completion: { signatures: { office: ownOffice, installer: ownInstaller } } })]);
+  const sibling = unit("u2", "A棟", "14F", [acceptance("a2", ["合格"], { completion: { signatures: { siteManager: signature("legacy-manager") } } })]);
+  const record = { id: "f", building: "A棟", floor: "14F", signatures: { office: floorOffice, supervisor: floorSupervisor } };
+  const resolved = resolveUnitSignatures(target, record, [target, sibling]);
+  assert.equal(resolved.signatures.office, ownOffice);
+  assert.equal(resolved.signatures.installer, ownInstaller);
+  assert.equal(resolved.signatures.supervisor, floorSupervisor);
+  assert.deepEqual(record.signatures, { office: floorOffice, supervisor: floorSupervisor });
+});
+
+test("unit signature removes only its own role from legacy conflicts", () => {
+  const target = unit("u1", "A棟", "14F", [acceptance("a1", ["合格"], { completion: { signatures: { office: signature("own") } } })]);
+  const sibling = unit("u2", "A棟", "14F", [acceptance("a2", ["合格"], { completion: { signatures: { installer: signature("i2"), office: signature("other") } } })]);
+  const other = unit("u3", "A棟", "14F", [acceptance("a3", ["合格"], { completion: { signatures: { installer: signature("i3") } } })]);
+  const resolved = resolveUnitSignatures(target, undefined, [target, sibling, other]);
+  assert.equal(resolved.signatures.office?.name, "own");
+  assert.doesNotMatch(resolved.conflicts.join(","), /office/);
+  assert.match(resolved.conflicts.join(","), /installer/);
 });
 
 test("floor return context preserves group, filter, expansion, scroll, and target tab", () => {

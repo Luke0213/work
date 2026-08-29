@@ -4,7 +4,7 @@ import * as XLSX from "xlsx";
 import { AlignmentType, Document, ImageRun, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
 import { loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
-import { liveEntities, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
+import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
 import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
@@ -17,7 +17,7 @@ import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-
 import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { importableUnitRows, importProductKey, safeImportedEstimated } from "../lib/unit-import";
-import { canCompleteFloorAcceptance, createFloorReturnContext, floorAcceptanceSummary, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitsFor, resolveFloorSignatures, updateFloorSignature, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole } from "../lib/floor-acceptance";
+import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, resolveUnitSignatures, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 
 type Status =
   | "待確認"
@@ -201,6 +201,9 @@ type Unit = {
   events: Event[];
   rate: number;
   pricedAt: string;
+  _deleted?: boolean;
+  deletedAt?: string;
+  deletedBy?: string;
 };
 type Product = {
   id: string;
@@ -243,6 +246,9 @@ type Project = {
   products: Product[];
   journals: DailyNote[];
   floorAcceptances?: FloorAcceptanceRecord[];
+  _deleted?: boolean;
+  deletedAt?: string;
+  deletedBy?: string;
 };
 type LocalWorkspaceSnapshot = {
   savedAt: string;
@@ -590,6 +596,11 @@ function normalize(p: Project[]): Project[] {
     })),
   }));
 }
+
+const liveProjectViews = (projects: Project[]): Project[] => liveEntities(projects).map((project) => ({
+  ...project,
+  units: liveEntities(project.units),
+}));
 
 function exportFullExcel(projects: Project[], catalog: Product[]) {
   const book = XLSX.utils.book_new();
@@ -1056,7 +1067,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
         setActivity(snapshot.activity || []);
         setProjects(loadedProjects);
         setCatalog(loadedCatalog);
-        setPid(loadedProjects[0]?.id || "");
+        setPid(liveProjectViews(loadedProjects)[0]?.id || "");
         if (!snapshot.projects.length && loadedProjects.length && !durableDraft?.pending) {
           versionRef.current = await saveWorkspace(snapshot.version, loadedProjects, loadedCatalog, snapshot.projects, snapshot.catalog);
         }
@@ -1076,7 +1087,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
         if (active && recoveredProjects.length) {
           setProjects(recoveredProjects);
           setCatalog(recoveredCatalog);
-          setPid(recoveredProjects[0]?.id || "");
+          setPid(liveProjectViews(recoveredProjects)[0]?.id || "");
           baselineRef.current = { projects: [], catalog: [] };
           setReady(true);
           writeWorkspaceDraft(authUserId, recoveredProjects, recoveredCatalog, versionRef.current, true);
@@ -1248,16 +1259,24 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
   useEffect(() => {
     if (
       ready &&
-      projects.some(
+      liveEntities(projects).some(
         (p) =>
           p.products.length !== catalog.length ||
           p.products.some((x, i) => x.id !== catalog[i]?.id),
       )
     )
-      setProjects((ps) => ps.map((p) => ({ ...p, products: catalog })));
+      setProjects((ps) => ps.map((p) => isDeletedEntity(p) ? p : { ...p, products: catalog }));
   }, [projects.length, catalog, ready]);
-  const project = projects.find((p) => p.id === pid),
+  const liveProjects = liveProjectViews(projects),
+    project = liveProjects.find((p) => p.id === pid),
     unit = project?.units.find((u) => u.id === uid);
+  useEffect(() => {
+    if (!pid || liveProjects.some((candidate) => candidate.id === pid)) return;
+    setPid(liveProjects[0]?.id || "");
+    setUid("");
+    setFloorContext(null);
+    setView("dashboard");
+  }, [pid, projects]);
   const setProjectsDurably = (update: (current: Project[]) => Project[]) =>
     setProjects((current) => {
       const next = update(current);
@@ -1268,7 +1287,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
   const updateCatalog = (products: Product[]) => {
     setCatalog(products);
     latestRef.current.catalog = products;
-    setProjectsDurably((ps) => ps.map((p) => ({ ...p, products })));
+    setProjectsDurably((ps) => ps.map((p) => isDeletedEntity(p) ? p : { ...p, products }));
   };
   const patchProject = (x: Partial<Project>) => {
     if (x.products) {
@@ -1277,34 +1296,47 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
       latestRef.current.catalog = products;
       setProjectsDurably((ps) =>
         ps.map((p) =>
-          p.id === pid ? { ...p, ...x, products } : { ...p, products },
+          isDeletedEntity(p) ? p : p.id === pid ? { ...p, ...x, products } : { ...p, products },
         ),
       );
       return;
     }
-    setProjectsDurably((ps) => ps.map((p) => (p.id === pid ? { ...p, ...x } : p)));
+    setProjectsDurably((ps) => ps.map((p) => {
+      if (p.id !== pid || isDeletedEntity(p)) return p;
+      return { ...p, ...x, ...(x.units ? { units: retainEntityTombstones(p.units, x.units) } : {}) };
+    }));
   };
   const patchUnit = (x: Partial<Unit>) =>
     setProjectsDurably((ps) =>
       ps.map((p) =>
-        p.id !== pid
+        p.id !== pid || isDeletedEntity(p)
           ? p
           : {
               ...p,
-              units: p.units.map((u) => (u.id !== uid ? u : { ...u, ...x })),
+              units: p.units.map((u) => (u.id !== uid || isDeletedEntity(u) ? u : { ...u, ...x })),
             },
       ),
     );
-  const removeUnit = (target: string) =>
+  const patchUnitById = (unitId: string, updater: (current: Unit) => Unit) =>
     setProjectsDurably((ps) =>
-      ps.map((p) =>
-        p.id !== pid
-          ? p
-          : { ...p, units: p.units.filter((u) => u.id !== target) },
-      ),
+      ps.map((p) => p.id !== pid || isDeletedEntity(p) ? p : {
+        ...p,
+        units: p.units.map((current) => current.id === unitId && !isDeletedEntity(current) ? updater(current) : current),
+      }),
     );
+  const removeUnit = (target: string) =>
+    setProjectsDurably((ps) => ps.map((p) => {
+      if (p.id !== pid || isDeletedEntity(p)) return p;
+      const unit = p.units.find((candidate) => candidate.id === target && !isDeletedEntity(candidate));
+      if (!unit) return p;
+      const deleted = tombstoneEntity(unit, authUserId, stamp());
+      return { ...p, units: p.units.map((candidate) => candidate.id === target ? deleted : candidate) };
+    }));
   const removeProject = () => {
-    setProjectsDurably((ps) => ps.filter((p) => p.id !== pid));
+    setProjectsDurably((ps) => ps.map((p) => {
+      if (p.id !== pid || isDeletedEntity(p)) return p;
+      return tombstoneEntity(p, authUserId, stamp());
+    }));
     setPid("");
     setUid("");
     setView("dashboard");
@@ -1334,7 +1366,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
       if (!confirm(`即將以備份中的 ${backup.projects.length} 個專案取代目前資料，是否繼續？`)) return;
       setProjects(normalize(backup.projects));
       setCatalog(backup.catalog);
-      setPid(backup.projects[0]?.id || "");
+      setPid(liveProjectViews(normalize(backup.projects))[0]?.id || "");
       setStorageWarning("備份已載入，正在同步…");
     } catch (error) { alert(error instanceof Error ? error.message : "無法讀取備份"); }
   };
@@ -1343,7 +1375,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
   if (mode === "entry")
     return (
       <SystemEntry
-        count={projects.length}
+        count={liveProjects.length}
         warning={storageWarning}
         create={() => setMode("new")}
         enter={() => setMode("app")}
@@ -1398,7 +1430,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             {online ? "●" : "○"} {storageWarning || "已與 Supabase 同步"}{offlineState.pending ? ` · ${offlineState.pending} 筆待同步` : ""}{offlineState.photos ? ` · ${offlineState.photos} 張照片` : ""}
           </button>
           {canManageProjects && <><button className="ghost" onClick={exportBackup}>下載備份</button>
-          <button className="ghost" onClick={() => exportFullExcel(projects, catalog)}>完整 Excel</button>
+          <button className="ghost" onClick={() => exportFullExcel(liveProjects, catalog)}>完整 Excel</button>
           <button className="ghost" onClick={() => systemHealth && alert([
             `專案：${systemHealth.projects}｜戶別：${systemHealth.units}`,
             `照片：${systemHealth.storageFiles} 張｜${(systemHealth.storageBytes / 1024 / 1024).toFixed(1)} MB`,
@@ -1469,7 +1501,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             ＋ 新增專案
           </button>
           <div className="project-list">
-            {projects.map((p) => (
+            {liveProjects.map((p) => (
               <div className="project-group" key={p.id}>
                 <button
                   className={p.id === pid ? "project active" : "project"}
@@ -1557,7 +1589,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             <FloorAcceptanceView
               project={project}
               context={floorContext}
-              patch={patchProject}
+              patchUnitById={patchUnitById}
               openUnit={(unitId, context) => { setFloorContext(context); setUid(unitId); }}
               back={() => setFloorContext(null)}
             />
@@ -3726,66 +3758,172 @@ function Products({
     </div>
   );
 }
-function FloorAcceptanceView({ project, context, patch, openUnit, back }: {
+function FloorAcceptanceView({ project, context, patchUnitById, openUnit, back }: {
   project: Project;
   context: FloorReturnContext;
-  patch: (value: Partial<Project>) => void;
+  patchUnitById: (unitId: string, updater: (current: Unit) => Unit) => void;
   openUnit: (unitId: string, context: FloorReturnContext) => void;
   back: () => void;
 }) {
-  const authUserId = useAuthOwner();
   const units = floorUnitsFor(project.units, context.building, context.floor);
-  const record = (project.floorAcceptances || []).find((item) => item.building === context.building && item.floor === context.floor);
-  const summary = floorAcceptanceSummary(units);
-  const resolved = resolveFloorSignatures(record, units);
+  const summary = floorWorkbenchSummary(units);
   const [filter, setFilter] = useState<"all" | "incomplete">(context.filter);
   const [expanded, setExpanded] = useState(context.expanded);
+  const initialUnitId = units.some((unit) => unit.id === context.currentUnitId)
+    ? context.currentUnitId!
+    : units.find(floorUnitNeedsAction)?.id || units[0]?.id || "";
+  const [currentUnitId, setCurrentUnitId] = useState(initialUnitId);
+  const [workMode, setWorkMode] = useState(context.workMode === true);
+  const [signaturePanel, setSignaturePanel] = useState(false);
   const [signRole, setSignRole] = useState<FloorSignatureRole | null>(null);
-  const [confirming, setConfirming] = useState(false);
-  const [editingCompleted, setEditingCompleted] = useState(!record?.completedAt);
-  const visibleUnits = filter === "incomplete" ? units.filter((unit) => floorUnitAcceptanceState(unit) !== "qualified") : units;
-  const saveRecord = (changes: Partial<FloorAcceptanceRecord>) => {
-    const now = stamp();
-    const next: FloorAcceptanceRecord = {
-      id: record?.id || id(), building: context.building, floor: context.floor,
-      signatures: record?.signatures || {}, createdAt: record?.createdAt || now, ...record, ...changes, updatedAt: now,
-    };
-    patch({ floorAcceptances: [...(project.floorAcceptances || []).filter((item) => item.id !== next.id && !(item.building === context.building && item.floor === context.floor)), next] });
-  };
-  const returnContext = (tab: "accept" | "sheet" = "accept") => createFloorReturnContext(context.building, context.floor, filter, expanded, window.scrollY, tab);
+  const [notice, setNotice] = useState("");
+  const [batchExportOpen, setBatchExportOpen] = useState(false);
+  useEffect(() => {
+    if (units.some((unit) => unit.id === currentUnitId)) return;
+    setCurrentUnitId(units.find(floorUnitNeedsAction)?.id || units[0]?.id || "");
+  }, [units, currentUnitId]);
+  const currentUnit = units.find((unit) => unit.id === currentUnitId) || units[0];
+  const currentIndex = currentUnit ? units.findIndex((unit) => unit.id === currentUnit.id) : -1;
+  const visibleUnits = filter === "incomplete" ? units.filter(floorUnitNeedsAction) : units;
+  const returnContext = (tab: "accept" | "sheet" = "accept") => createFloorReturnContext(context.building, context.floor, filter, expanded, window.scrollY, tab, currentUnit?.id, workMode);
   const signatureLabels: Record<FloorSignatureRole, string> = { installer: "施工人員", office: "工務人員", siteManager: "工地主任", supervisor: "神銀主管" };
-  const signaturesReady = resolved.conflicts.length === 0 && floorSignatureRoles.every((role) => resolved.signatures[role]?.valid === true);
+  const acceptance = currentUnit ? getLatestFinalAcceptance(currentUnit) : undefined;
+  const acceptanceState = currentUnit ? floorUnitAcceptanceState(currentUnit) : "uninspected";
+  const signatures = currentUnit ? floorUnitSignatures(currentUnit) : {};
+  const signatureCount = currentUnit ? floorUnitSignatureCount(currentUnit) : 0;
+  const moveTo = (index: number) => {
+    const target = units[index];
+    if (!target) return;
+    setCurrentUnitId(target.id);
+    setNotice("");
+  };
+  const moveToNextPending = () => {
+    if (!currentUnit) return;
+    const targetId = nextPendingFloorUnitId(units, currentUnit.id);
+    if (!targetId) { setNotice("本樓層目前沒有下一個待處理戶"); return; }
+    setCurrentUnitId(targetId);
+    setNotice("");
+  };
+  const startWork = () => {
+    const target = units.find(floorUnitNeedsAction) || currentUnit || units[0];
+    if (target) setCurrentUnitId(target.id);
+    setWorkMode(true);
+    setNotice("");
+  };
   return <div className="floor-acceptance-page">
     <button className="back" onClick={back}>← 返回戶別管理</button>
     <section className="panel floor-acceptance-hero">
-      <div><p className="eyebrow">{project.name}</p><h1>{context.building} · {context.floor} 樓層驗收</h1><p>{units.length} 戶 · 合格 {summary.qualified} · 待處理 {summary.needsAction} · 未驗收 {summary.uninspected}</p></div>
-      <div className={summary.allQualified ? "floor-ready" : "floor-pending"}>{summary.allQualified ? `✓ ${summary.total} / ${summary.total} 全部合格` : `尚有 ${summary.needsAction + summary.uninspected} 戶未全數合格`}</div>
+      <div><p className="eyebrow">{project.name}</p><h1>{context.building} · {context.floor}</h1><p>{summary.total} 戶</p></div>
+      <div className="floor-workbench-counts"><span>驗收完成 <b>{summary.acceptanceComplete} / {summary.total}</b></span><span>四簽完成 <b>{summary.signaturesComplete} / {summary.total}</b></span></div>
     </section>
     <section className="panel floor-unit-section">
-      <div className="panel-head"><div><h2>戶別驗收進度</h2><p>點擊戶別直接進入原驗收頁。</p></div><button className="ghost" onClick={() => setExpanded((value) => !value)}>{expanded ? "收起" : "展開"}</button></div>
-      <div className="floor-filter"><button className={filter === "all" ? "selected" : ""} onClick={() => setFilter("all")}>全部</button><button className={filter === "incomplete" ? "selected" : ""} onClick={() => setFilter("incomplete")}>只看未合格</button></div>
+      <div className="panel-head"><div><h2>樓層連續驗收工作台</h2><p>逐戶確認驗收與四人簽名，不會共用或複製戶別資料。</p></div><div className="actions"><button className="ghost" onClick={() => setExpanded((value) => !value)}>{expanded ? "收起戶別" : "展開戶別"}</button><button className="ghost" onClick={() => setBatchExportOpen(true)}>匯出驗收單</button><button className="primary" onClick={startWork}>{workMode ? "繼續作業" : "開始／繼續作業"}</button></div></div>
+      <div className="floor-filter"><button className={filter === "all" ? "selected" : ""} onClick={() => setFilter("all")}>全部</button><button className={filter === "incomplete" ? "selected" : ""} onClick={() => setFilter("incomplete")}>待處理</button></div>
       {expanded && <div className="floor-acceptance-grid">{visibleUnits.map((unit) => {
         const state = floorUnitAcceptanceState(unit);
-        return <button className={`floor-unit-card ${state}`} key={unit.id} onClick={() => openUnit(unit.id, returnContext("accept"))}><b>{unit.number || "未命名"}</b><span>{state === "qualified" ? "✓ 合格" : state === "needsAction" ? "⚠ 待改善" : "○ 未驗收"}</span></button>;
-      })}{!visibleUnits.length && <p className="muted">目前沒有未合格戶別。</p>}</div>}
+        const count = floorUnitSignatureCount(unit);
+        const pending = floorUnitNeedsAction(unit);
+        return <button className={`floor-unit-card ${state} ${pending ? "pending" : "complete"} ${currentUnit?.id === unit.id ? "current" : ""}`} key={unit.id} onClick={() => { setCurrentUnitId(unit.id); setWorkMode(true); setNotice(""); }}><b>{unit.number || "未命名"}</b><span>{state === "qualified" ? "✓ 驗收合格" : state === "needsAction" ? "⚠ 待改善" : "○ 未驗收"}</span><small>{count === 4 ? "✓" : "⚠"} 四簽 {count}/4</small></button>;
+      })}{!visibleUnits.length && <p className="muted">本樓層目前沒有待處理戶。</p>}</div>}
     </section>
-    <section className="panel floor-signature-section">
-      <div className="panel-head"><div><h2>樓層四人簽名</h2><p>樓層簽名優先；未建立時，歷史正式驗收簽名只做唯讀 fallback，不會寫回或搬移。</p></div>{record?.completedAt && !editingCompleted && <button className="ghost" onClick={() => { if (confirm("重新編輯簽名會撤回樓層完成狀態，修改後需再次確認完成。是否繼續？")) { saveRecord({ completedAt: undefined, completedBy: undefined }); setEditingCompleted(true); } }}>重新編輯簽名</button>}</div>
-      {!!resolved.conflicts.length && <div className="form-error">同樓層歷史簽名不一致：{resolved.conflicts.map((role) => signatureLabels[role]).join("、")}。系統不會自動選用，請重新確認並簽名。</div>}
-      <div className="floor-signature-grid">{floorSignatureRoles.map((role) => {
-        const own = record?.signatures?.[role];
-        const shown = own?.valid ? own : resolved.signatures[role];
-        const legacy = !own?.valid && !!shown;
-        return <div className="completion-sign-box" key={role}><b>{signatureLabels[role]}</b>{shown?.valid ? <Signed s={shown} /> : <p className="muted">尚未簽名</p>}{legacy && <small className="legacy-signature-badge">歷史簽名（沿用）</small>}{editingCompleted && <div className="actions"><button className="ghost" onClick={() => setSignRole(role)}>{own?.valid ? "重新簽名" : legacy ? "改為樓層簽名" : "觸控簽名"}</button>{own?.valid && <button className="danger" onClick={() => confirm(`只清除${signatureLabels[role]}的樓層簽名？`) && saveRecord({ signatures: updateFloorSignature(record?.signatures, role) })}>清除</button>}</div>}</div>;
-      })}</div>
-    </section>
-    <section className="panel floor-completion-actions">
-      <div>{record?.completedAt ? <><h2>✓ 樓層驗收已完成</h2><p>{record.completedAt}{record.completedBy ? ` · ${record.completedBy}` : ""}</p></> : <><h2>完成樓層驗收</h2><p>{!summary.allQualified ? `尚有 ${summary.needsAction + summary.uninspected} 戶未全數合格` : !signaturesReady ? "四位人員簽名尚未全部完成" : "全部戶別及四位人員簽名均已完成"}</p></>}</div>
-      <div className="actions">{units.some((unit) => getLatestFinalAcceptance(unit)) && <button className="ghost" onClick={() => { const unit = units.find((item) => getLatestFinalAcceptance(item)); if (unit) openUnit(unit.id, returnContext("sheet")); }}>查看三聯驗收單</button>}<button className="primary" disabled={!!record?.completedAt || !canCompleteFloorAcceptance(units, resolved)} onClick={() => setConfirming(true)}>完成樓層驗收</button></div>
-    </section>
-    {signRole && <Sign close={() => setSignRole(null)} save={(signature) => { saveRecord({ signatures: updateFloorSignature(record?.signatures, signRole, signature) }); setSignRole(null); }} />}
-    {confirming && <Modal close={() => setConfirming(false)} title="確認完成樓層驗收"><p>{context.floor} 已全部驗收合格<br />四位人員簽名均已完成</p><p>確認完成 {context.floor} 樓層驗收？</p><div className="form-actions"><button className="ghost" onClick={() => setConfirming(false)}>取消</button><button className="primary" onClick={() => { saveRecord({ completedAt: stamp(), completedBy: authUserId }); setConfirming(false); setEditingCompleted(false); }}>確認完成</button></div></Modal>}
+    {workMode && currentUnit && <section className="floor-workbench">
+      <aside className="panel floor-workbench-selector" aria-label="本樓層戶別選擇">{units.map((unit) => <button key={unit.id} className={`${unit.id === currentUnit.id ? "current" : ""} ${floorUnitNeedsAction(unit) ? "pending" : "complete"}`} onClick={() => { setCurrentUnitId(unit.id); setNotice(""); }}><b>{unit.number || "未命名"}</b><span>{floorUnitAcceptanceState(unit) === "qualified" ? "✓" : "⚠"} · {floorUnitSignatureCount(unit)}/4</span></button>)}</aside>
+      <section className="panel floor-workbench-current">
+        <div className="floor-workbench-heading"><div><p className="eyebrow">{context.building} · {context.floor}　{currentIndex + 1}/{units.length}</p><h2>{currentUnit.number || "未命名戶別"}</h2></div><div className={floorUnitNeedsAction(currentUnit) ? "floor-pending" : "floor-ready"}>{floorUnitNeedsAction(currentUnit) ? "待處理" : "✓ 此戶完成"}</div></div>
+        <div className="floor-current-status"><span>{acceptanceState === "qualified" ? "✓ 驗收合格" : acceptanceState === "needsAction" ? "⚠ 驗收待改善" : "○ 尚未完成驗收"}</span><span>{signatureCount === 4 ? "✓" : "⚠"} 簽名 {signatureCount}/4</span></div>
+        <div className="floor-unit-facts"><div><small>SPC 型號／色號</small><b>{[currentUnit.model, currentUnit.colorNo].filter(Boolean).join("／") || "—"}</b></div>{currentUnit.spec && <div><small>產品規格</small><b>{currentUnit.spec}</b></div>}<div><small>坪數／面積</small><b>{Number.isFinite(currentUnit.estimated) && currentUnit.estimated > 0 ? `${areaValueFromPing(currentUnit.estimated, "坪")} 坪` : "—"}</b></div></div>
+        <div className="floor-unit-signatures">{floorSignatureRoles.map((role) => <div key={role} className={signatures[role]?.valid ? "signed" : "unsigned"}><b>{signatureLabels[role]}</b><span>{signatures[role]?.valid ? "✓ 已簽" : "○ 待簽"}</span></div>)}</div>
+        {!acceptance && <div className="warning">尚未完成驗收，請先進入完整驗收頁完成正式驗收；系統不會建立假 Acceptance。</div>}
+        {signatureCount === 4 && <div className="save-success">✓ 此戶四人簽名完成</div>}
+        {notice && <div className="warning">{notice}</div>}
+        <div className="floor-workbench-actions"><button className="primary" disabled={!acceptance} onClick={() => setSignaturePanel(true)}>簽名／補簽</button><button className="ghost" onClick={() => openUnit(currentUnit.id, returnContext("accept"))}>查看完整驗收資料</button>{signatureCount === 4 && <button className="ghost" onClick={moveToNextPending}>下一個待處理 →</button>}</div>
+      </section>
+      <nav className="floor-workbench-nav" aria-label="樓層戶別導覽"><button className="ghost" disabled={currentIndex <= 0} onClick={() => moveTo(currentIndex - 1)}>← <span>上一戶</span></button><button className="primary" onClick={moveToNextPending}>下一待處理</button><button className="ghost" disabled={currentIndex < 0 || currentIndex >= units.length - 1} onClick={() => moveTo(currentIndex + 1)}><span>下一戶</span> →</button></nav>
+    </section>}
+    {signaturePanel && currentUnit && !signRole && <Modal close={() => setSignaturePanel(false)} title={`${currentUnit.number || "戶別"}｜簽名／補簽`}><div className="floor-quick-sign-list">{floorSignatureRoles.map((role) => <button className={signatures[role]?.valid ? "signed" : "unsigned"} key={role} onClick={() => setSignRole(role)}><b>{signatureLabels[role]}</b><span>{signatures[role]?.valid ? "✓ 已簽 · 重新簽名" : "○ 待簽 · 開始簽名"}</span></button>)}</div><p className="muted">簽名只會儲存到目前戶別的最新正式驗收。</p></Modal>}
+    {signRole && currentUnit && <Sign close={() => setSignRole(null)} save={(signature) => { const targetUnitId = currentUnit.id; const targetRole = signRole; patchUnitById(targetUnitId, (latestUnit) => updateLatestFormalAcceptanceSignature(latestUnit, targetRole, signature)); setSignRole(null); setSignaturePanel(false); }} />}
+    {batchExportOpen && <FloorBatchExport project={project} units={units} context={context} close={() => setBatchExportOpen(false)} />}
   </div>;
+}
+
+const completionCopyLabels = ["第一聯：客戶存根聯", "第二聯：公司收執聯", "第三聯：廠商收執聯"] as const;
+
+function FloorBatchExport({ project, units, context, close }: { project: Project; units: Unit[]; context: FloorReturnContext; close: () => void }) {
+  const [stage, setStage] = useState<"select" | "edit" | "confirm">("select");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, CompletionExportDraft>>({});
+  const [resolvedByUnit, setResolvedByUnit] = useState<Record<string, ResolvedFloorSignatures>>({});
+  const [currentUnitId, setCurrentUnitId] = useState("");
+  const floorRecord = (project.floorAcceptances || []).find((record) => record.building === context.building && record.floor === context.floor);
+  const exportableIds = floorBatchSelectableIds(units);
+  const selectedUnits = units.filter((unit) => selectedIds.includes(unit.id));
+  const currentUnit = selectedUnits.find((unit) => unit.id === currentUnitId) || selectedUnits[0];
+  const currentIndex = currentUnit ? selectedUnits.findIndex((unit) => unit.id === currentUnit.id) : -1;
+  const signatureLabels: Record<FloorSignatureRole, string> = { installer: "施工人員", office: "工務人員", siteManager: "工地主任", supervisor: "神銀主管" };
+  const createUnitExport = (unit: Unit) => {
+    const acceptance = getLatestFinalAcceptance(unit)!;
+    const completion = completionDefaults(acceptance, unit);
+    const resolved = resolveUnitSignatures(unit, floorRecord, units);
+    const draft = buildCompletionExportDraft(project, unit, acceptance, completion);
+    return {
+      resolved,
+      draft: { ...draft, signatureNames: { ...draft.signatureNames, ...Object.fromEntries(floorSignatureRoles.map((role) => [role, resolved.signatures[role]?.name || draft.signatureNames[role]])) } } as CompletionExportDraft,
+    };
+  };
+  const beginEdit = () => {
+    const targets = units.filter((unit) => selectedIds.includes(unit.id) && getLatestFinalAcceptance(unit));
+    const initialized = buildUnitScopedRecord(targets, createUnitExport);
+    setDrafts(buildUnitScopedRecord(targets, (unit) => initialized[unit.id].draft));
+    setResolvedByUnit(buildUnitScopedRecord(targets, (unit) => initialized[unit.id].resolved));
+    setCurrentUnitId(targets[0]?.id || "");
+    setStage("edit");
+  };
+  const setCurrentDraft = (update: (draft: CompletionExportDraft) => CompletionExportDraft) => {
+    if (!currentUnit) return;
+    setDrafts((record) => updateUnitScopedRecord(record, currentUnit.id, update));
+  };
+  const currentDraft = currentUnit ? drafts[currentUnit.id] : undefined;
+  const conflictUnits = selectedUnits.filter((unit) => (resolvedByUnit[unit.id]?.conflicts.length || 0) > 0);
+  const incompleteSignatureUnits = selectedUnits.filter((unit) => floorSignatureRoles.filter((role) => resolvedByUnit[unit.id]?.signatures[role]?.valid).length < 4);
+  return <>
+    <Modal close={close} title={`${context.building} · ${context.floor}｜樓層驗收單批次匯出`}>
+      <div className="floor-batch-export">
+        <div className="floor-batch-steps"><span className={stage === "select" ? "current" : ""}>1 選擇戶別</span><span className={stage === "edit" ? "current" : ""}>2 編輯確認</span><span className={stage === "confirm" ? "current" : ""}>3 匯出確認</span></div>
+        {stage === "select" && <section className="floor-batch-select">
+          <div className="panel-head"><div><h3>選擇本樓層要匯出的戶別</h3><p>只有正式驗收可匯出；簽名未滿或舊資料衝突仍可選取並會顯示提醒。</p></div><button className="ghost" onClick={() => setSelectedIds(exportableIds)}>全選可匯出</button></div>
+          <div className="floor-batch-unit-grid">{units.map((unit) => {
+            const acceptance = getLatestFinalAcceptance(unit);
+            const resolved = acceptance ? resolveUnitSignatures(unit, floorRecord, units) : undefined;
+            const signatureCount = resolved ? floorSignatureRoles.filter((role) => resolved.signatures[role]?.valid).length : 0;
+            const disabled = !acceptance;
+            return <label className={`floor-batch-unit ${disabled ? "disabled" : ""}`} key={unit.id}><input type="checkbox" disabled={disabled} checked={selectedIds.includes(unit.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, unit.id] : ids.filter((id) => id !== unit.id))} /><span><b>{unit.number || "未命名戶別"}</b><small>{disabled ? "尚未完成正式驗收" : `${floorUnitAcceptanceState(unit) === "qualified" ? "驗收合格" : "驗收待改善"} · ${signatureCount === 4 ? "✓ 四簽 4/4" : `⚠ 四簽 ${signatureCount}/4`}`}</small>{!!resolved?.conflicts.length && <em>⚠ 舊簽名資料不一致</em>}</span></label>;
+          })}</div>
+          <div className="floor-batch-footer"><b>已選 {selectedIds.length} 戶</b><div className="actions"><button className="ghost" onClick={close}>取消</button><button className="primary" disabled={!selectedIds.length} onClick={beginEdit}>下一步：編輯資料</button></div></div>
+        </section>}
+        {stage === "edit" && currentUnit && currentDraft && <section className="floor-batch-edit">
+          <div className="floor-batch-unit-selector" aria-label="批次匯出戶別切換">{selectedUnits.map((unit, index) => <button className={unit.id === currentUnit.id ? "current" : ""} key={unit.id} onClick={() => setCurrentUnitId(unit.id)}>{unit.number || "未命名"}<small>{index + 1}/{selectedUnits.length}</small></button>)}</div>
+          <div className="panel-head"><div><p className="eyebrow">準備匯出 {selectedUnits.length} 戶</p><h3>{currentUnit.number || "未命名戶別"}｜文件資料</h3><p>第 {currentIndex + 1} 戶，共 {selectedUnits.length} 戶；修改只影響本次匯出。</p></div><button className="ghost" onClick={() => { const initialized = createUnitExport(currentUnit); setDrafts((record) => ({ ...record, [currentUnit.id]: initialized.draft })); }}>還原此戶自動資料</button></div>
+          {!!resolvedByUnit[currentUnit.id]?.conflicts.length && <div className="warning">此戶舊簽名資料不一致：{resolvedByUnit[currentUnit.id].conflicts.map((role) => signatureLabels[role]).join("、")}。</div>}
+          <div className="floor-batch-export-editor-grid">
+            {([['department','部門別'],['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={currentDraft[key]} set={(value) => setCurrentDraft((draft) => ({ ...draft, [key]: value }))} />)}
+            <CompletionDraftBoolean label="地坪是否異常" value={currentDraft.floorAbnormal} set={(value) => setCurrentDraft((draft) => ({ ...draft, floorAbnormal: value }))} />
+            <CompletionDraftBoolean label="現場板材是否損壞" value={currentDraft.boardDamaged} set={(value) => setCurrentDraft((draft) => ({ ...draft, boardDamaged: value }))} />
+            <CompletionDraftBoolean label="現場垃圾是否清運完畢" value={currentDraft.trashCleared} set={(value) => setCurrentDraft((draft) => ({ ...draft, trashCleared: value }))} />
+            {floorSignatureRoles.map((role) => <Field key={role} label={`${signatureLabels[role]}簽名人姓名`} value={currentDraft.signatureNames[role]} set={(value) => setCurrentDraft((draft) => ({ ...draft, signatureNames: { ...draft.signatureNames, [role]: value } }))} />)}
+          </div>
+          <div className="floor-batch-footer"><button className="ghost" onClick={() => setStage("select")}>返回選擇</button><div className="actions"><button className="ghost" disabled={currentIndex <= 0} onClick={() => setCurrentUnitId(selectedUnits[currentIndex - 1].id)}>← 上一戶</button>{currentIndex < selectedUnits.length - 1 ? <button className="primary" onClick={() => setCurrentUnitId(selectedUnits[currentIndex + 1].id)}>儲存本次修改並下一戶 →</button> : <button className="primary" onClick={() => setStage("confirm")}>下一步：總確認</button>}</div></div>
+        </section>}
+        {stage === "confirm" && <section className="floor-batch-confirm">
+          <div><p className="eyebrow">{context.building} · {context.floor}</p><h3>準備匯出 {selectedUnits.length} 戶</h3></div><div className="floor-batch-summary"><span>戶別<b>{selectedUnits.length}</b></span><span>三聯驗收單組數<b>{selectedUnits.length}</b></span><span>驗收單聯數<b>{selectedUnits.length * 3}</b></span></div>
+          {!!incompleteSignatureUnits.length && <div className="warning">{incompleteSignatureUnits.length} 戶簽名未滿 4/4，空缺簽名將保持空白。</div>}
+          {!!conflictUnits.length && <div className="warning">{conflictUnits.length} 戶有舊簽名資料衝突，系統不會自行選用衝突簽名。</div>}
+          <div className="floor-batch-review">{selectedUnits.map((unit) => { const count = floorSignatureRoles.filter((role) => resolvedByUnit[unit.id]?.signatures[role]?.valid).length; return <div key={unit.id}><b>{unit.number || "未命名戶別"}</b><span>{[unit.model, unit.colorNo].filter(Boolean).join("／") || "—"} · {drafts[unit.id]?.area ? `${drafts[unit.id].area} 坪` : "坪數 —"}</span><small>{floorUnitAcceptanceState(unit) === "qualified" ? "驗收合格" : "驗收待改善"} · {count === 4 ? "四簽 4/4" : `四簽 ${count}/4 ⚠`}</small>{!!resolvedByUnit[unit.id]?.conflicts.length && <em>⚠ legacy 簽名資料衝突</em>}</div>; })}</div>
+          <div className="floor-batch-footer"><button className="ghost" onClick={() => setStage("edit")}>返回修改</button><button className="primary" onClick={() => printWithLifecycleCleanup("printing-completion-batch")}>確認並匯出</button></div>
+        </section>}
+      </div>
+    </Modal>
+    <div className="floor-batch-print" aria-hidden="true">{selectedUnits.map((unit) => drafts[unit.id] && resolvedByUnit[unit.id] ? <div className="completion-paper floor-batch-paper" key={unit.id}>{completionCopyLabels.map((copy) => <CompletionCopy key={copy} copy={copy} draft={drafts[unit.id]} signatures={resolvedByUnit[unit.id].signatures} />)}</div> : null)}</div>
+  </>;
 }
 
 function UnitDetail({
@@ -5562,7 +5700,7 @@ function Sheet({ project, u }: { project: Project; u: Unit }) {
   if (!a) return <div className="panel empty"><h2>尚無正式驗收資料</h2><p>目前尚無正式驗收紀錄，完成驗收後即可產生電子驗收單。</p></div>;
   const floorRecord = (project.floorAcceptances || []).find((record) => record.building === u.building && record.floor === u.floor);
   const floorUnits = floorUnitsFor(project.units, u.building, u.floor);
-  const resolved = resolveFloorSignatures(floorRecord, floorUnits);
+  const resolved = resolveUnitSignatures(u, floorRecord, floorUnits);
   return <CompletionReport project={project} unit={u} acceptance={a} completion={completionDefaults(a, u)} signatures={resolved.signatures} signatureConflicts={resolved.conflicts} />;
 }
 
