@@ -1,15 +1,15 @@
 export type AreaUnit = "坪" | "m²";
 
-export const SQUARE_METERS_TO_PING = 0.3025;
+export const PING_TO_SQUARE_METERS = 3.305785;
 
 const roundArea = (value: number) => Number(value.toFixed(2));
 
 export function squareMetersToPing(squareMeters: number): number {
-  return roundArea(squareMeters * SQUARE_METERS_TO_PING);
+  return roundArea(squareMeters / PING_TO_SQUARE_METERS);
 }
 
 export function pingToSquareMeters(ping: number): number {
-  return roundArea(ping / SQUARE_METERS_TO_PING);
+  return roundArea(ping * PING_TO_SQUARE_METERS);
 }
 
 export function areaInputToPing(value: string | number, unit: AreaUnit): number {

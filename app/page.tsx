@@ -16,7 +16,7 @@ import { migrateLegacyStorageValue, scopedDraftKey, scopedStorageKey } from "../
 import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-lifecycle";
 import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
-import { importableUnitRows, importProductKey, safeImportedEstimated } from "../lib/unit-import";
+import { findExactUnitProduct, importableUnitRows, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated } from "../lib/unit-import";
 import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, resolveUnitSignatures, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 
@@ -1809,11 +1809,13 @@ function ProjectOnboarding({
   };
   const updateRow = (index: number, key: string, value: string) => setRows(rows.map((row, i) => i === index ? { ...row, [key]: value, ...(key === "model" ? { colorNo: "" } : {}) } : row));
   const finish = () => {
-    const invalid = rows.findIndex((r) => !r.building || !r.floor || !r.number || !r.model || !r.colorNo || !Number(r.estimated));
-    if (invalid >= 0) return setError(`第 ${invalid + 1} 戶資料不完整，請確認固定欄位與坪數。`);
+    const invalid = rows.findIndex((r) => !onboardingUnitRowIsValid(r, areaInputToPing(r.estimated, r.areaUnit || "坪")));
+    if (invalid >= 0) return setError(`第 ${invalid + 1} 戶資料不完整，請確認棟別、樓層、戶別與坪數。`);
     const units = rows.map((r) => {
-      const p = products.find((x) => x.model === r.model && x.colorNo === r.colorNo)!;
-      return { ...blankUnit(), building: r.building, floor: r.floor, number: r.number, brand: p.brand, model: p.model, colorNo: p.colorNo, spec: p.spec, estimated: areaInputToPing(r.estimated, r.areaUnit || "坪"), note: r.note };
+      const model = r.model.trim();
+      const colorNo = r.colorNo.trim();
+      const product = findExactUnitProduct({ model, colorNo }, products);
+      return { ...blankUnit(), building: r.building, floor: r.floor, number: r.number, brand: product?.brand || "", model, colorNo, spec: product?.spec || "", estimated: areaInputToPing(r.estimated, r.areaUnit || "坪"), note: r.note };
     });
     complete({
       id: id(), name: basic.name.trim(), address: basic.address.trim(), builder: basic.builder.trim(), contact: basic.contact.trim(), phone: basic.phone.trim(), note: basic.note,
@@ -1832,7 +1834,7 @@ function ProjectOnboarding({
           <Field label="建案名稱（必填）" value={basic.name} set={(name) => setBasic({ ...basic, name })} /><Field label="案場地址（必填）" value={basic.address} set={(address) => setBasic({ ...basic, address })} /><Field label="建設公司" value={basic.builder} set={(builder) => setBasic({ ...basic, builder })} /><Field label="工地窗口" value={basic.contact} set={(contact) => setBasic({ ...basic, contact })} /><Field label="聯絡資訊" value={basic.phone} set={(phone) => setBasic({ ...basic, phone })} /><Field label="預計工程日期" type="date" value={basic.expectedDate} set={(expectedDate) => setBasic({ ...basic, expectedDate })} /><Field label="備註" value={basic.note} set={(note) => setBasic({ ...basic, note })} />
         </div><button className="primary next-step" disabled={!basic.name.trim() || !basic.address.trim()} onClick={() => setStep(2)}>下一步：確認SPC產品 →</button></section>}
         {step === 2 && <section className="panel form"><div><p className="eyebrow">全案場共用產品庫</p><h1>選擇或新增SPC產品</h1><p className="muted">點一下已有色號即可自動帶入下方欄位；沒有的產品只需新增一次。</p></div><div className="onboarding-products">{products.map((p) => <button type="button" className={product.id === p.id ? "selected" : ""} key={p.id} onClick={() => { setProduct({ ...p }); setError(""); }}><b>{p.model}</b><span>{p.colorNo}</span><small>{p.brand || "未填品牌"}</small></button>)}</div><div className="grid3 product-inline"><Field label="品牌／廠商" value={product.brand} set={(brand) => setProduct({ ...product, brand })} /><Field label="SPC編號" value={product.model} set={(model) => setProduct({ ...product, model })} /><Field label="色號" value={product.colorNo} set={(colorNo) => setProduct({ ...product, colorNo })} /><Field label="規格" value={product.spec} set={(spec) => setProduct({ ...product, spec })} /><button className="ghost" onClick={addProduct}>＋ 加入產品庫</button></div><div className="step-actions"><button className="ghost" onClick={() => setStep(1)}>← 上一步</button><button className="primary" disabled={!products.length} onClick={() => setStep(3)}>下一步：建立戶別 →</button></div></section>}
-        {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><AreaDraftInput value={r.estimated} unit={r.areaUnit || "坪"} setValue={(value) => updateRow(i, "estimated", value)} setUnit={(areaUnit) => updateRow(i, "areaUnit", areaUnit)} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={() => { setError(""); setStep(4); }}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: areaInputToPing(row.estimated, row.areaUnit || "坪") || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => [row.building, row.floor, row.number, row.model, row.colorNo, row.estimated, row.note].some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), areaUnit: "坪" as AreaUnit, note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
+        {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><AreaDraftInput value={r.estimated} unit={r.areaUnit || "坪"} setArea={(estimated, areaUnit) => setRows((current) => current.map((row, index) => index === i ? { ...row, estimated, areaUnit } : row))} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={() => { setError(""); setStep(4); }}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: areaInputToPing(row.estimated, row.areaUnit || "坪") || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => [row.building, row.floor, row.number, row.model, row.colorNo, row.estimated, row.note].some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), areaUnit: "坪" as AreaUnit, note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
         {step === 4 && <section className="panel form"><div><p className="eyebrow">最後確認</p><h1>確認並啟用案場</h1></div><div className="activation-summary"><span>建案<b>{basic.name}</b></span><span>案場地址<b>{basic.address}</b></span><span>SPC產品<b>{products.length} 筆</b></span><span>第一批戶別<b>{rows.length} 戶</b></span></div><div className="warning">確認後會正式建立案場，戶別基本資料將直接沿用至場勘、施工、驗收與報告。</div><div className="step-actions"><button className="ghost" onClick={() => setStep(3)}>← 返回修改</button><button className="primary" onClick={finish}>確認並開始使用</button></div></section>}
         {error && <div className="form-error">{error}</div>}
       </section>
@@ -2523,8 +2525,7 @@ function Units({
                 <AreaDraftInput
                   value={draft.estimated}
                   unit={draft.areaUnit || "坪"}
-                  setValue={(estimated) => setDraft({ ...draft, estimated })}
-                  setUnit={(areaUnit) => setDraft({ ...draft, areaUnit })}
+                  setArea={(estimated, areaUnit) => setDraft({ ...draft, estimated, areaUnit })}
                 />
                 <Field label="備註／特殊說明" value={draft.note} set={(note) => setDraft({ ...draft, note })} />
               </div>
@@ -2626,8 +2627,7 @@ function Units({
                         <AreaDraftInput
                           value={r.estimated}
                           unit={r.areaUnit || "坪"}
-                          setValue={(v) => updateRow(i, "estimated", v)}
-                          setUnit={(v) => updateRow(i, "areaUnit", v)}
+                          setArea={(estimated, areaUnit) => setRows((current) => current.map((row, index) => index === i ? { ...row, estimated, areaUnit } : row))}
                         />
                         <Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} />
                       </div>
@@ -6474,23 +6474,21 @@ function Field({
 function AreaDraftInput({
   value,
   unit,
-  setValue,
-  setUnit,
+  setArea,
 }: {
   value: string;
   unit: AreaUnit;
-  setValue: (value: string) => void;
-  setUnit: (unit: AreaUnit) => void;
+  setArea: (value: string, unit: AreaUnit) => void;
 }) {
   const switchUnit = (nextUnit: AreaUnit) => {
-    setValue(convertAreaInput(value, unit, nextUnit));
-    setUnit(nextUnit);
+    if (nextUnit === unit) return;
+    setArea(convertAreaInput(value, unit, nextUnit), nextUnit);
   };
   return (
     <label className="field">
       <span>預估施工坪數</span>
       <div className="area-input-row">
-        <input type="number" min="0" step="0.01" value={value} onChange={(event) => setValue(event.target.value)} />
+        <input type="number" min="0" step="0.01" value={value} onChange={(event) => setArea(event.target.value, unit)} />
         <select value={unit} onChange={(event) => switchUnit(event.target.value as AreaUnit)}>
           <option value="坪">坪</option>
           <option value="m²">m²</option>

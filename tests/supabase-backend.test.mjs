@@ -103,7 +103,11 @@ test("backups are daily with bounded retention instead of running on every save"
 
 test("unit estimated remains the canonical ping area and survey only displays it", async () => {
   const page = await read("app/page.tsx");
+  const areaDraftInput = page.slice(page.indexOf("function AreaDraftInput"), page.indexOf("function Tabs"));
   assert.match(page, /estimated: areaInputToPing/);
+  assert.match(areaDraftInput, /setArea\(convertAreaInput\(value, unit, nextUnit\), nextUnit\)/);
+  assert.match(areaDraftInput, /setArea\(event\.target\.value, unit\)/);
+  assert.doesNotMatch(areaDraftInput, /setValue|setUnit/);
   assert.match(page, /const importedEstimated = importedAreaToPing\(source\)/);
   assert.match(page, /const estimated = safeImportedEstimated\(importedEstimated\)/);
   assert.match(page, /survey-estimated-area/);
@@ -197,6 +201,16 @@ test("floor acceptances use the same non-destructive protected merge semantics",
   assert.match(sql, /revoke all on function public\.spc_json_merge_three_way_at[\s\S]*from anon/i);
   assert.doesNotMatch(sql, /\b(update|delete\s+from|truncate|insert\s+into|drop\s+table|alter\s+table)\b/i);
   assert.doesNotMatch(page, /\bcleanupRemovedPhotos\b/);
+});
+
+test("project onboarding keeps SPC optional and resolves product metadata safely", async () => {
+  const page = await read("app/page.tsx");
+  const onboarding = page.slice(page.indexOf("function ProjectOnboarding"), page.indexOf("function Empty"));
+  assert.match(onboarding, /onboardingUnitRowIsValid\(r, areaInputToPing\(r\.estimated, r\.areaUnit \|\| "坪"\)\)/);
+  assert.doesNotMatch(onboarding.slice(onboarding.indexOf("const finish"), onboarding.indexOf("return (", onboarding.indexOf("const finish"))), /!r\.model|!r\.colorNo|products\.find\([^)]*\)!/);
+  assert.match(onboarding, /findExactUnitProduct\(\{ model, colorNo \}, products\)/);
+  assert.match(onboarding, /brand: product\?\.brand \|\| "", model, colorNo, spec: product\?\.spec \|\| ""/);
+  assert.match(onboarding, /請確認棟別、樓層、戶別與坪數/);
 });
 
 test("project and unit deletion uses durable tombstones in client views and the additive server merge", async () => {
