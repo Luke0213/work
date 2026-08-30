@@ -4806,19 +4806,30 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       recheck: u.status === "待複驗",
       startedAt: stamp(),
     };
-  const [a, setA] = useState<Acceptance>(() => readDraft(draftKey(authUserId, "accept", u.id), fallback));
+  const [a, setA] = useState<Acceptance>(() => {
+    const restored = readDraft(draftKey(authUserId, "accept", u.id), fallback);
+    return restored.draft === false ? fallback : restored;
+  });
+  const setRestorableAcceptance = useRef((restored: Acceptance) => {
+    if (restored.draft !== false) setA(restored);
+  }).current;
   const [signRole, setSignRole] = useState<"installer" | "office" | "siteManager" | "supervisor" | null>(null);
   const [saved, setSaved] = useState("");
   const [confirming, setConfirming] = useState(false);
+  const [historyMode, setHistoryMode] = useState(false);
+  const historyModeRef = useRef(false);
+  const preHistoryAcceptanceRef = useRef<Acceptance | null>(null);
   const acceptanceDraftActiveRef = useRef(true);
   const skipNextDraftWrite = useRef(false);
   const pendingDraftWriteRef = useRef<Promise<void>>(Promise.resolve());
-  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setA, acceptanceDraftActiveRef);
+  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setRestorableAcceptance, acceptanceDraftActiveRef);
   useEffect(() => {
-    if (!acceptanceDraftActiveRef.current) {
-      if (skipNextDraftWrite.current) skipNextDraftWrite.current = false;
+    if (skipNextDraftWrite.current) {
+      skipNextDraftWrite.current = false;
       return;
     }
+    if (historyModeRef.current) return;
+    if (!acceptanceDraftActiveRef.current) return;
     pendingDraftWriteRef.current = pendingDraftWriteRef.current.then(() => writeLocalDraft(draftKey(authUserId, "accept", u.id), a, authUserId));
   }, [a, u.id, authUserId]);
   const bad = a.items.filter((x) => x.result === "不合格"),
@@ -4826,6 +4837,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
     invalidBad = bad.some((x) => !x.note.trim() || !x.photos?.length),
     allPhotos = [...a.photos, ...a.items.flatMap((x) => x.photos || [])],
     saveDraft = () => {
+      if (historyModeRef.current) return setSaved("歷史驗收只能正式保存；原本未完成草稿不會被覆蓋");
       const draft = { ...a, draft: true };
       patch({ acceptances: [draft, ...u.acceptances.filter((item) => item.id !== a.id)] });
       pendingDraftWriteRef.current = pendingDraftWriteRef.current.then(() => writeLocalDraft(draftKey(authUserId, "accept", u.id), draft, authUserId));
@@ -4833,6 +4845,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       setSaved("✓ 驗收草稿已暫存；重新整理或換裝置後可繼續填寫");
     },
     save = async () => {
+      const savingHistory = historyModeRef.current;
       const completed: Acceptance = { ...a, draft: false };
       acceptanceDraftActiveRef.current = false;
       skipNextDraftWrite.current = true;
@@ -4873,7 +4886,16 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       setA(completed);
       queueRecordChange(authUserId, "accept", u.id, completed, "complete");
       await pendingDraftWriteRef.current;
-      await removeDurableDraft(draftKey(authUserId, "accept", u.id));
+      if (!savingHistory) await removeDurableDraft(draftKey(authUserId, "accept", u.id));
+      if (savingHistory) {
+        const resumeAcceptance = preHistoryAcceptanceRef.current;
+        skipNextDraftWrite.current = true;
+        historyModeRef.current = false;
+        acceptanceDraftActiveRef.current = true;
+        preHistoryAcceptanceRef.current = null;
+        setHistoryMode(false);
+        if (resumeAcceptance) setA(resumeAcceptance);
+      }
       setSaved(`✓ ${completed.recheck ? "複驗" : "驗收"}結果已儲存成功`);
       setConfirming(false);
     };
@@ -4955,7 +4977,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         <div className="form-error">不合格項目必須填寫說明並上傳照片。</div>
       )}
       <div className="form-actions">
-        <button className="ghost" type="button" onClick={saveDraft}>暫存未完成驗收</button>
+        <button className="ghost" type="button" disabled={historyMode} onClick={saveDraft}>{historyMode ? "歷史查看不覆蓋草稿" : "暫存未完成驗收"}</button>
         <button className="primary" disabled={!a.person || incomplete || invalidBad} onClick={() => setConfirming(true)}>進入最後確認</button>
       </div>
       {confirming && <Modal close={() => setConfirming(false)} title={`最後確認｜${a.recheck ? "複驗" : "驗收"}`}>
@@ -4988,7 +5010,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
           a: x.date,
           b: x.person,
           c: x.draft ? "驗收草稿（未完成）" : `${x.recheck ? "複驗" : "驗收"}：${x.result}`,
-          onOpen: () => { setA(x); setSaved("已開啟既有驗收紀錄，可查看或修改"); window.scrollTo({ top: 0, behavior: "smooth" }); },
+          onOpen: () => { if (!historyModeRef.current) preHistoryAcceptanceRef.current = a; historyModeRef.current = true; acceptanceDraftActiveRef.current = false; setHistoryMode(true); setA(x); setSaved("已開啟既有驗收紀錄，可查看或修改；未正式保存不會覆蓋原本草稿"); window.scrollTo({ top: 0, behavior: "smooth" }); },
         }))}
       />
     </div>
