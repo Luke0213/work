@@ -724,6 +724,26 @@ test("completion export confirmation edits one temporary draft shared by all thr
   assert.match(billingPrint, /body\.printing-billing/);
 });
 
+test("acceptance editor remounts by unit and rejects stale cross-unit draft restores", async () => {
+  const page = await read("app/page.tsx");
+  const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
+  const acceptance = page.slice(page.indexOf("function AcceptTab("), page.indexOf("function DefectsTab("));
+  const restore = page.slice(page.indexOf("function useOfflineDraftRestore"), page.indexOf("function queueRecordChange"));
+
+  assert.match(unitDetail, /<AcceptTab key=\{unit\.id\} project=\{project\} u=\{unit\}/);
+  assert.doesNotMatch(unitDetail, /key=\{(?:unit\.acceptances|acceptance|unit\.status|unit\.updatedAt)/);
+  assert.match(acceptance, /readDraft\(draftKey\(authUserId, "accept", u\.id\), fallback\)/);
+  assert.match(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setA, acceptanceDraftActiveRef\)/);
+  assert.match(acceptance, /writeLocalDraft\(draftKey\(authUserId, "accept", u\.id\), a, authUserId\)/);
+  assert.match(acceptance, /rows=\{u\.acceptances\.map/);
+  assert.match(acceptance, /onOpen: \(\) => \{ setA\(x\)/);
+  assert.match(acceptance, /acceptances: \[completed, \.\.\.u\.acceptances\.filter/);
+  assert.match(restore, /let active = true/);
+  assert.match(restore, /if \(!active \|\| !draft/);
+  assert.match(restore, /return \(\) => \{ active = false; \}/);
+  assert.doesNotMatch(acceptance, /cleanupRemovedPhotos|deletePhoto|removePhoto/);
+});
+
 test("shipment preview exposes the company summary fields without changing other exporters", async () => {
   const page = await read("app/page.tsx");
   for (const value of ["出貨日期", "客戶名稱", "商品", "片／件 *0.3025", "單價／元", "進價／元", "record.areaSquareMeters", "record.areaPing", "record.unitPrice", "record.amount", "record.vendor"])

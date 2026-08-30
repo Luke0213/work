@@ -4022,7 +4022,7 @@ function UnitDetail({
         )}{" "}
         {tab === "work" && <WorkTab u={unit} patch={patch} add={addEvent} />}{" "}
         {tab === "accept" && (
-          <AcceptTab project={project} u={unit} patch={patch} add={addEvent} />
+          <AcceptTab key={unit.id} project={project} u={unit} patch={patch} add={addEvent} />
         )}{" "}
         {tab === "journal" && <UnitJournalTab project={project} u={unit} patch={patch} />}{" "}
         {tab === "defect" && (
