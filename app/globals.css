@@ -1120,6 +1120,8 @@ img,canvas{max-width:100%}
   body.printing-billing .billing-print-area,body.printing-billing .billing-print-area *{visibility:visible}
   body.printing-billing .billing-print-area{position:absolute;inset:0;width:100%;margin:0;padding:0;background:#fff}
   body.printing-billing .billing-no-print{display:none!important}
+  body.printing-billing .billing-screen-only,body.printing-billing input.money{display:none!important}
+  body.printing-billing .billing-print-only{display:inline!important}
   body.printing-billing .billing-print-area table{min-width:0;font-size:11px}
   body.printing-billing .billing-print-area .table-wrap{overflow:visible}
   body.printing-billing .billing-print-area tbody button.ghost{display:inline-block!important;border:0;padding:0;background:transparent;color:inherit}
@@ -1172,6 +1174,7 @@ img,canvas{max-width:100%}
   .modal-card:has(> .floor-batch-export){width:calc(100vw - 32px);max-width:none;max-height:calc(100dvh - 32px)}
   .floor-batch-unit-grid,.floor-batch-export-editor-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
+.billing-print-only{display:none}
 
 @media(max-width:700px){
   .acceptance-checklist .inspection-grid{grid-template-columns:1fr}

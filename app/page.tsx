@@ -5541,11 +5541,17 @@ function Journal({
     </div>
   );
 }
+type BillingUnitDraft = { rate: string; priced: boolean };
+
 function Billing({ p, patch }: { p: Project; patch: any }) {
   const [y, setY] = useState(String(new Date().getFullYear())),
     [m, setM] = useState(String(new Date().getMonth() + 1).padStart(2, "0")),
     [shipmentPreview, setShipmentPreview] = useState(false),
     [shipmentExporting, setShipmentExporting] = useState(false),
+    [editing, setEditing] = useState(false),
+    [billingDrafts, setBillingDrafts] = useState<Record<string, BillingUnitDraft>>({}),
+    [saveConfirmation, setSaveConfirmation] = useState(false),
+    [billingMessage, setBillingMessage] = useState(""),
     ym = `${y}-${m}`,
     monthlyBillingRecords = buildAcceptanceExportRecords(p).filter((record) => record.exportDate.startsWith(ym)),
     monthlyUnitIds = new Set(monthlyBillingRecords.map((record) => record.unitId)),
@@ -5561,6 +5567,71 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
     shipmentRecords = monthlyBillingRecords,
     billSubtotal = billRecords.reduce((sum, record) => sum + record.amount, 0),
     printBilling = () => printWithLifecycleCleanup("printing-billing");
+  const safeDraftRate = (value: string | number) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    },
+    draftFor = (unit: Unit): BillingUnitDraft => billingDrafts[unit.id] || {
+      rate: String(unit.rate ?? ""),
+      priced: unit.status === "已計價",
+    },
+    previewRows = billRows.map(({ unit, record }) => {
+      const draft = draftFor(unit), rate = editing ? safeDraftRate(draft.rate) : Number(unit.rate || 0);
+      return { unit, savedRecord: record, record: { ...record, unitPrice: rate, amount: Number((record.areaPing * rate).toFixed(0)) }, draft };
+    }),
+    previewSubtotal = previewRows.reduce((sum, row) => sum + row.record.amount, 0),
+    billingChanges = previewRows.filter(({ unit, draft }) =>
+      safeDraftRate(draft.rate) !== Number(unit.rate || 0) || draft.priced !== (unit.status === "已計價"),
+    ),
+    startEditing = () => {
+      setBillingDrafts(Object.fromEntries(billRows.map(({ unit }) => [unit.id, {
+        rate: String(unit.rate ?? ""),
+        priced: unit.status === "已計價",
+      }])));
+      setBillingMessage("");
+      setEditing(true);
+    },
+    cancelEditing = () => {
+      setBillingDrafts({});
+      setSaveConfirmation(false);
+      setBillingMessage("");
+      setEditing(false);
+    },
+    requestSave = () => {
+      if (!billingChanges.length) return setBillingMessage("沒有需要保存的修改");
+      setBillingMessage("");
+      setSaveConfirmation(true);
+    },
+    confirmSave = () => {
+      const changes = new Map(billingChanges.map((row) => [row.unit.id, row]));
+      patch({
+        units: p.units.map((unit) => {
+          const changed = changes.get(unit.id);
+          if (!changed) return unit;
+          const rate = safeDraftRate(changed.draft.rate), newlyPriced = unit.status !== "已計價" && changed.draft.priced;
+          return {
+            ...unit,
+            rate,
+            ...(newlyPriced ? {
+              status: "已計價",
+              pricedAt: day(),
+              events: [{ id: id(), at: stamp(), title: "月結已計價", detail: `金額 ${changed.record.amount}`, photos: [] }, ...unit.events],
+            } : {}),
+          };
+        }),
+      });
+      setSaveConfirmation(false);
+      setBillingDrafts({});
+      setEditing(false);
+    },
+    changeBillingPeriod = (kind: "year" | "month", value: string) => {
+      if (editing && billingChanges.length) {
+        setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。");
+        return;
+      }
+      if (editing) cancelEditing();
+      if (kind === "year") setY(value); else setM(value);
+    };
   return (
     <div className="panel form billing-print-area">
       <div className="panel-head">
@@ -5568,13 +5639,19 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
           <h2>月結／計價總表</h2>
           <p>已驗收戶別自動進入，可人工確認單價與金額。</p>
         </div>
+        <div className="form-actions billing-no-print">
+          {!editing ? <button type="button" className="primary" onClick={startEditing}>編輯月結</button> : <>
+            <button type="button" className="ghost" onClick={cancelEditing}>取消修改</button>
+            <button type="button" className="primary" onClick={requestSave}>保存修改</button>
+          </>}
+        </div>
       </div>
       <div className="filters billing-no-print">
-        <select value={y} onChange={(e) => setY(e.target.value)}>
+        <select value={y} onChange={(e) => changeBillingPeriod("year", e.target.value)}>
           <option>2026</option>
           <option>2027</option>
         </select>
-        <select value={m} onChange={(e) => setM(e.target.value)}>
+        <select value={m} onChange={(e) => changeBillingPeriod("month", e.target.value)}>
           {Array.from({ length: 12 }, (_, i) =>
             String(i + 1).padStart(2, "0"),
           ).map((x) => (
@@ -5582,6 +5659,8 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
           ))}
         </select>
       </div>
+      {billingMessage && <div className="warning billing-no-print">{billingMessage}</div>}
+      {editing && billingChanges.length > 0 && <div className="warning billing-no-print">目前有尚未保存的月結修改；匯出內容仍以已保存資料為準。</div>}
       <div className="billing-print-month">計價月份：{ym}</div>
       <section className="acceptance-exports billing-no-print">
         <div className="checklist-head"><div><h3>報表／匯出</h3><small>依目前月份與案場資料預覽、下載或列印報表。</small></div></div>
@@ -5623,7 +5702,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
           </b>
         </span>
         <span>
-          本月計價<b>NT$ {billSubtotal.toLocaleString()}</b>
+          本月計價<b><span className="billing-screen-only">NT$ {(editing ? previewSubtotal : billSubtotal).toLocaleString()}</span><span className="billing-print-only">NT$ {billSubtotal.toLocaleString()}</span></b>
         </span>
       </div>
       <div className="table-wrap">
@@ -5642,7 +5721,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
             </tr>
           </thead>
           <tbody>
-            {billRows.map(({ unit: u, record }) => (
+            {previewRows.map(({ unit: u, record, savedRecord, draft }) => (
               <tr key={u.id}>
                 <td>{u.building}</td>
                 <td>{u.floor}</td>
@@ -5656,57 +5735,33 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
                   <input
                     className="money"
                     type="number"
-                    value={u.rate}
-                    onChange={(e) =>
-                      patch({
-                        units: p.units.map((x) =>
-                          x.id === u.id
-                            ? { ...x, rate: Number(e.target.value) }
-                            : x,
-                        ),
-                      })
-                    }
+                    min="0"
+                    step="any"
+                    disabled={!editing}
+                    value={editing ? draft.rate : u.rate}
+                    onChange={(e) => setBillingDrafts((current) => ({ ...current, [u.id]: { ...draft, rate: e.target.value } }))}
                   />
+                  <span className="billing-print-only">{Number(u.rate || 0).toLocaleString()}</span>
                 </td>
-                <td>{record.amount.toLocaleString()}</td>
+                <td><span className="billing-screen-only">{record.amount.toLocaleString()}</span><span className="billing-print-only">{savedRecord.amount.toLocaleString()}</span></td>
                 <td>
-                  <button
-                    className="ghost"
-                    onClick={() =>
-                      patch({
-                        units: p.units.map((x) =>
-                          x.id === u.id
-                            ? {
-                                ...x,
-                                status: "已計價",
-                                pricedAt: day(),
-                                events: [
-                                  {
-                                    id: id(),
-                                    at: stamp(),
-                                    title: "月結已計價",
-                                    detail: `金額 ${record.amount}`,
-                                    photos: [],
-                                  },
-                                  ...x.events,
-                                ],
-                              }
-                            : x,
-                        ),
-                      })
-                    }
-                  >
-                    {u.status}
-                  </button>
+                  <span className="billing-screen-only">{editing && u.status !== "已計價" ? <label className="check"><input type="checkbox" checked={draft.priced} onChange={(e) => setBillingDrafts((current) => ({ ...current, [u.id]: { ...draft, priced: e.target.checked } }))} />標記已計價</label> : <span>{u.status}</span>}</span><span className="billing-print-only">{u.status}</span>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      {saveConfirmation && <Modal close={() => setSaveConfirmation(false)} title="確認保存月結修改">
+        <div className="form">
+          <div className="export-summary"><span>案場名稱<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>修改戶別數<b>{billingChanges.length}</b></span><span>保存後總額<b>NT$ {previewSubtotal.toLocaleString()}</b></span></div>
+          <div className="table-wrap"><table><thead><tr><th>戶別</th><th>單價變更</th><th>狀態變更</th></tr></thead><tbody>{billingChanges.map(({ unit, draft }) => <tr key={unit.id}><td>{unit.building} {unit.floor} {unit.number}</td><td>{safeDraftRate(draft.rate) !== Number(unit.rate || 0) ? `${Number(unit.rate || 0).toLocaleString()} → ${safeDraftRate(draft.rate).toLocaleString()}` : "—"}</td><td>{unit.status !== "已計價" && draft.priced ? "改為已計價" : "—"}</td></tr>)}</tbody></table></div>
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => setSaveConfirmation(false)}>返回修改</button><button type="button" className="primary" onClick={confirmSave}>確認保存</button></div>
+        </div>
+      </Modal>}
       {shipmentPreview && <Modal close={() => setShipmentPreview(false)} title="SPC 已出貨明細總表｜匯出預覽">
         <div className="form export-preview">
-          <Field label="匯出月份" type="month" value={ym} set={(value) => { const [year, month] = value.split("-"); if (year) setY(year); if (month) setM(month); }} />
+          <Field label="匯出月份" type="month" value={ym} set={(value) => { const [year, month] = value.split("-"); if (year && month) { if (editing && billingChanges.length) setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。"); else { if (editing) cancelEditing(); setY(year); setM(month); } } }} />
           <div className="export-summary"><span>案場<b>{p.name}</b></span><span>戶別筆數<b>{shipmentRecords.length}</b></span><span>總坪數<b>{shipmentRecords.reduce((sum, record) => sum + record.areaPing, 0).toFixed(2)}</b></span><span>總 m²<b>{shipmentRecords.reduce((sum, record) => sum + record.areaSquareMeters, 0).toFixed(2)}</b></span></div>
           {shipmentRecords.some((record) => record.areaPing <= 0) && <div className="warning">部分戶別坪數仍待補；檔案會清楚標記，不會自行填入未知數字。</div>}
           <div className="export-preview-table"><table><thead><tr><th>出貨日期</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th></tr></thead><tbody>{shipmentRecords.map((record) => <tr key={record.unitId}><td>{record.exportDate || "待補"}</td><td>{record.projectName}</td><td>{[record.model, record.colorNo].filter(Boolean).join(" ")}</td><td>{record.unitDisplay}</td><td>{record.areaSquareMeters.toFixed(2)}</td><td>{record.areaPing > 0 ? `${record.areaPing.toFixed(2)} 坪` : "待補"}</td><td>{record.unitPrice > 0 ? `${record.unitPrice.toLocaleString()} 元` : "待確認"}</td><td>{record.unitPrice > 0 ? record.amount.toLocaleString() : "待確認"}</td><td>{record.vendor || "—"}</td><td>—</td><td>{record.note || ""}</td></tr>)}</tbody></table></div>

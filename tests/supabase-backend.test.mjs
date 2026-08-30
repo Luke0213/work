@@ -454,6 +454,37 @@ test("work journal Word export uses adaptive borderless six-photo pages", async 
   assert.match(css, /\.word-preview-first-row\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1\.08fr\)/);
 });
 
+test("billing edits stay local until one confirmed project patch", async () => {
+  const page = await read("app/page.tsx");
+  const billing = page.slice(page.indexOf("type BillingUnitDraft"), page.indexOf("type CompletionExportDraft"));
+
+  assert.match(billing, /type BillingUnitDraft = \{ rate: string; priced: boolean \}/);
+  assert.match(billing, /setBillingDrafts\(\(current\) =>/);
+  assert.match(billing, /保存修改/);
+  assert.match(billing, /確認保存月結修改/);
+  assert.match(billing, /確認保存/);
+  assert.match(billing, /const changes = new Map\(billingChanges/);
+  assert.equal((billing.match(/\bpatch\(\{/g) || []).length, 1);
+  assert.match(billing, /units: p\.units\.map/);
+  assert.match(billing, /if \(!changed\) return unit/);
+  assert.match(billing, /沒有需要保存的修改/);
+  assert.match(billing, /record\.areaPing \* rate/);
+  assert.match(billing, /editing \? previewSubtotal : billSubtotal/);
+  assert.match(billing, /newlyPriced = unit\.status !== "已計價" && changed\.draft\.priced/);
+  assert.match(billing, /title: "月結已計價"/);
+  assert.match(billing, /if \(editing && billingChanges\.length\)/);
+  assert.match(billing, /匯出內容仍以已保存資料為準/);
+  assert.match(billing, /createReceivableWorkbook\(p, billRecords, ym\)/);
+  assert.match(billing, /exportCsv\(p, billRecords, ym\)/);
+  assert.match(billing, /shipmentRecords = monthlyBillingRecords/);
+  assert.match(billing, /savedRecord: record/);
+  assert.match(billing, /billing-print-only/);
+  assert.doesNotMatch(billing, /onChange=\{\(e\) =>\s*patch\(/);
+  const css = await read("app/globals.css");
+  assert.match(css, /body\.printing-billing \.billing-screen-only,body\.printing-billing input\.money\{display:none!important\}/);
+  assert.match(css, /body\.printing-billing \.billing-print-only\{display:inline!important\}/);
+});
+
 test("IndexedDB photo drafts restore through markers without overriding full local drafts", async () => {
   const page = await read("app/page.tsx");
   const restore = page.slice(page.indexOf("function useOfflineDraftRestore"), page.indexOf("function queueRecordChange"));
