@@ -17,7 +17,7 @@ import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-
 import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { findExactUnitProduct, importableUnitRows, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated } from "../lib/unit-import";
-import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, resolveUnitSignatures, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
+import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 
 type Status =
@@ -3855,7 +3855,6 @@ function FloorBatchExport({ project, units, context, close }: { project: Project
   const [drafts, setDrafts] = useState<Record<string, CompletionExportDraft>>({});
   const [resolvedByUnit, setResolvedByUnit] = useState<Record<string, ResolvedFloorSignatures>>({});
   const [currentUnitId, setCurrentUnitId] = useState("");
-  const floorRecord = (project.floorAcceptances || []).find((record) => record.building === context.building && record.floor === context.floor);
   const exportableIds = floorBatchSelectableIds(units);
   const selectedUnits = units.filter((unit) => selectedIds.includes(unit.id));
   const currentUnit = selectedUnits.find((unit) => unit.id === currentUnitId) || selectedUnits[0];
@@ -3864,7 +3863,7 @@ function FloorBatchExport({ project, units, context, close }: { project: Project
   const createUnitExport = (unit: Unit) => {
     const acceptance = getLatestFinalAcceptance(unit)!;
     const completion = completionDefaults(acceptance, unit);
-    const resolved = resolveUnitSignatures(unit, floorRecord, units);
+    const resolved: ResolvedFloorSignatures = { signatures: floorUnitSignatures(unit), conflicts: [] };
     const draft = buildCompletionExportDraft(project, unit, acceptance, completion);
     return {
       resolved,
@@ -3884,27 +3883,24 @@ function FloorBatchExport({ project, units, context, close }: { project: Project
     setDrafts((record) => updateUnitScopedRecord(record, currentUnit.id, update));
   };
   const currentDraft = currentUnit ? drafts[currentUnit.id] : undefined;
-  const conflictUnits = selectedUnits.filter((unit) => (resolvedByUnit[unit.id]?.conflicts.length || 0) > 0);
   const incompleteSignatureUnits = selectedUnits.filter((unit) => floorSignatureRoles.filter((role) => resolvedByUnit[unit.id]?.signatures[role]?.valid).length < 4);
   return <>
     <Modal close={close} title={`${context.building} · ${context.floor}｜樓層驗收單批次匯出`}>
       <div className="floor-batch-export">
         <div className="floor-batch-steps"><span className={stage === "select" ? "current" : ""}>1 選擇戶別</span><span className={stage === "edit" ? "current" : ""}>2 編輯確認</span><span className={stage === "confirm" ? "current" : ""}>3 匯出確認</span></div>
         {stage === "select" && <section className="floor-batch-select">
-          <div className="panel-head"><div><h3>選擇本樓層要匯出的戶別</h3><p>只有正式驗收可匯出；簽名未滿或舊資料衝突仍可選取並會顯示提醒。</p></div><button className="ghost" onClick={() => setSelectedIds(exportableIds)}>全選可匯出</button></div>
+          <div className="panel-head"><div><h3>選擇本樓層要匯出的戶別</h3><p>只有正式驗收可匯出；每戶簽名只取該戶自己的最新正式驗收。</p></div><button className="ghost" onClick={() => setSelectedIds(exportableIds)}>全選可匯出</button></div>
           <div className="floor-batch-unit-grid">{units.map((unit) => {
             const acceptance = getLatestFinalAcceptance(unit);
-            const resolved = acceptance ? resolveUnitSignatures(unit, floorRecord, units) : undefined;
-            const signatureCount = resolved ? floorSignatureRoles.filter((role) => resolved.signatures[role]?.valid).length : 0;
+            const signatureCount = acceptance ? floorUnitSignatureCount(unit) : 0;
             const disabled = !acceptance;
-            return <label className={`floor-batch-unit ${disabled ? "disabled" : ""}`} key={unit.id}><input type="checkbox" disabled={disabled} checked={selectedIds.includes(unit.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, unit.id] : ids.filter((id) => id !== unit.id))} /><span><b>{unit.number || "未命名戶別"}</b><small>{disabled ? "尚未完成正式驗收" : `${floorUnitAcceptanceState(unit) === "qualified" ? "驗收合格" : "驗收待改善"} · ${signatureCount === 4 ? "✓ 四簽 4/4" : `⚠ 四簽 ${signatureCount}/4`}`}</small>{!!resolved?.conflicts.length && <em>⚠ 舊簽名資料不一致</em>}</span></label>;
+            return <label className={`floor-batch-unit ${disabled ? "disabled" : ""}`} key={unit.id}><input type="checkbox" disabled={disabled} checked={selectedIds.includes(unit.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, unit.id] : ids.filter((id) => id !== unit.id))} /><span><b>{unit.number || "未命名戶別"}</b><small>{disabled ? "尚未完成正式驗收" : `${floorUnitAcceptanceState(unit) === "qualified" ? "驗收合格" : "驗收待改善"} · ${signatureCount === 4 ? "✓ 四簽 4/4" : `⚠ 四簽 ${signatureCount}/4`}`}</small></span></label>;
           })}</div>
           <div className="floor-batch-footer"><b>已選 {selectedIds.length} 戶</b><div className="actions"><button className="ghost" onClick={close}>取消</button><button className="primary" disabled={!selectedIds.length} onClick={beginEdit}>下一步：編輯資料</button></div></div>
         </section>}
         {stage === "edit" && currentUnit && currentDraft && <section className="floor-batch-edit">
           <div className="floor-batch-unit-selector" aria-label="批次匯出戶別切換">{selectedUnits.map((unit, index) => <button className={unit.id === currentUnit.id ? "current" : ""} key={unit.id} onClick={() => setCurrentUnitId(unit.id)}>{unit.number || "未命名"}<small>{index + 1}/{selectedUnits.length}</small></button>)}</div>
           <div className="panel-head"><div><p className="eyebrow">準備匯出 {selectedUnits.length} 戶</p><h3>{currentUnit.number || "未命名戶別"}｜文件資料</h3><p>第 {currentIndex + 1} 戶，共 {selectedUnits.length} 戶；修改只影響本次匯出。</p></div><button className="ghost" onClick={() => { const initialized = createUnitExport(currentUnit); setDrafts((record) => ({ ...record, [currentUnit.id]: initialized.draft })); }}>還原此戶自動資料</button></div>
-          {!!resolvedByUnit[currentUnit.id]?.conflicts.length && <div className="warning">此戶舊簽名資料不一致：{resolvedByUnit[currentUnit.id].conflicts.map((role) => signatureLabels[role]).join("、")}。</div>}
           <div className="floor-batch-export-editor-grid">
             {([['department','部門別'],['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={currentDraft[key]} set={(value) => setCurrentDraft((draft) => ({ ...draft, [key]: value }))} />)}
             <CompletionDraftBoolean label="地坪是否異常" value={currentDraft.floorAbnormal} set={(value) => setCurrentDraft((draft) => ({ ...draft, floorAbnormal: value }))} />
@@ -3917,8 +3913,7 @@ function FloorBatchExport({ project, units, context, close }: { project: Project
         {stage === "confirm" && <section className="floor-batch-confirm">
           <div><p className="eyebrow">{context.building} · {context.floor}</p><h3>準備匯出 {selectedUnits.length} 戶</h3></div><div className="floor-batch-summary"><span>戶別<b>{selectedUnits.length}</b></span><span>三聯驗收單組數<b>{selectedUnits.length}</b></span><span>驗收單聯數<b>{selectedUnits.length * 3}</b></span></div>
           {!!incompleteSignatureUnits.length && <div className="warning">{incompleteSignatureUnits.length} 戶簽名未滿 4/4，空缺簽名將保持空白。</div>}
-          {!!conflictUnits.length && <div className="warning">{conflictUnits.length} 戶有舊簽名資料衝突，系統不會自行選用衝突簽名。</div>}
-          <div className="floor-batch-review">{selectedUnits.map((unit) => { const count = floorSignatureRoles.filter((role) => resolvedByUnit[unit.id]?.signatures[role]?.valid).length; return <div key={unit.id}><b>{unit.number || "未命名戶別"}</b><span>{[unit.model, unit.colorNo].filter(Boolean).join("／") || "—"} · {drafts[unit.id]?.area ? `${drafts[unit.id].area} 坪` : "坪數 —"}</span><small>{floorUnitAcceptanceState(unit) === "qualified" ? "驗收合格" : "驗收待改善"} · {count === 4 ? "四簽 4/4" : `四簽 ${count}/4 ⚠`}</small>{!!resolvedByUnit[unit.id]?.conflicts.length && <em>⚠ legacy 簽名資料衝突</em>}</div>; })}</div>
+          <div className="floor-batch-review">{selectedUnits.map((unit) => { const count = floorSignatureRoles.filter((role) => resolvedByUnit[unit.id]?.signatures[role]?.valid).length; return <div key={unit.id}><b>{unit.number || "未命名戶別"}</b><span>{[unit.model, unit.colorNo].filter(Boolean).join("／") || "—"} · {drafts[unit.id]?.area ? `${drafts[unit.id].area} 坪` : "坪數 —"}</span><small>{floorUnitAcceptanceState(unit) === "qualified" ? "驗收合格" : "驗收待改善"} · {count === 4 ? "四簽 4/4" : `四簽 ${count}/4 ⚠`}</small></div>; })}</div>
           <div className="floor-batch-footer"><button className="ghost" onClick={() => setStage("edit")}>返回修改</button><button className="primary" onClick={() => printWithLifecycleCleanup("printing-completion-batch")}>確認並匯出</button></div>
         </section>}
       </div>
@@ -5832,10 +5827,7 @@ function buildCompletionExportDraft(project: Project, unit: Unit, acceptance: Ac
 function Sheet({ project, u }: { project: Project; u: Unit }) {
   const a = getLatestFinalAcceptance(u);
   if (!a) return <div className="panel empty"><h2>尚無正式驗收資料</h2><p>目前尚無正式驗收紀錄，完成驗收後即可產生電子驗收單。</p></div>;
-  const floorRecord = (project.floorAcceptances || []).find((record) => record.building === u.building && record.floor === u.floor);
-  const floorUnits = floorUnitsFor(project.units, u.building, u.floor);
-  const resolved = resolveUnitSignatures(u, floorRecord, floorUnits);
-  return <CompletionReport project={project} unit={u} acceptance={a} completion={completionDefaults(a, u)} signatures={resolved.signatures} signatureConflicts={resolved.conflicts} />;
+  return <CompletionReport project={project} unit={u} acceptance={a} completion={completionDefaults(a, u)} signatures={floorUnitSignatures(u)} />;
 }
 
 function CompletionReport({ project, unit, acceptance, completion, signatures, signatureConflicts = [] }: { project: Project; unit: Unit; acceptance: Acceptance; completion: NonNullable<Acceptance["completion"]>; signatures?: NonNullable<Acceptance["completion"]>["signatures"]; signatureConflicts?: FloorSignatureRole[] }) {

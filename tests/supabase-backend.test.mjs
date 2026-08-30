@@ -683,7 +683,9 @@ test("floor batch acceptance export keeps unit-scoped drafts, signatures, and on
   assert.match(batch, /buildUnitScopedRecord\(targets, createUnitExport\)/);
   assert.match(batch, /updateUnitScopedRecord\(record, currentUnit\.id, update\)/);
   assert.match(batch, /buildCompletionExportDraft\(project, unit, acceptance, completion\)/);
-  assert.match(batch, /resolveUnitSignatures\(unit, floorRecord, units\)/);
+  assert.match(batch, /signatures: floorUnitSignatures\(unit\), conflicts: \[\]/);
+  assert.match(batch, /const signatureCount = acceptance \? floorUnitSignatureCount\(unit\) : 0/);
+  assert.doesNotMatch(batch, /resolveUnitSignatures|resolveFloorSignatures|floorRecord|舊簽名資料不一致/);
   assert.match(batch, /還原此戶自動資料/);
   assert.match(batch, /className="floor-batch-export-editor-grid"/);
   assert.doesNotMatch(batch, /className="grid3"/);
@@ -711,7 +713,8 @@ test("completion export confirmation edits one temporary draft shared by all thr
   assert.match(report, /const \[exportDraft, setExportDraft\]/);
   assert.match(report, /const reportSignatures = signatures \|\| completion\.signatures/);
   assert.match(report, /\.map\(\(copy\) => <CompletionCopy key=\{copy\} copy=\{copy\} draft=\{exportDraft\} signatures=\{reportSignatures\}/);
-  assert.match(report, /resolveUnitSignatures\(u, floorRecord, floorUnits\)/);
+  assert.match(report, /signatures=\{floorUnitSignatures\(u\)\}/);
+  assert.doesNotMatch(report.slice(report.indexOf("function Sheet("), report.indexOf("function CompletionReport(")), /resolveUnitSignatures|resolveFloorSignatures|floorAcceptances|signatureConflicts/);
   assert.match(report, /setText\("projectName"|\['projectName','案場名稱'\]/);
   assert.match(report, /setText\("area"|\['area','坪數確認'\]/);
   assert.match(report, /CompletionDraftBoolean label="地坪是否異常"/);

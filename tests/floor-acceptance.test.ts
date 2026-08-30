@@ -11,6 +11,7 @@ import {
   floorIdentity,
   floorUnitNeedsAction,
   floorUnitSignatureCount,
+  floorUnitSignatures,
   floorUnitAcceptanceState,
   floorUnitsFor,
   floorWorkbenchSummary,
@@ -60,6 +61,24 @@ test("floor batch export selects only formal acceptances and keeps incomplete si
   assert.equal(floorBatchExportable(formal), true);
   assert.equal(floorBatchExportable(draftOnly), false);
   assert.deepEqual(floorBatchSelectableIds(scoped), ["formal", "conflicted"]);
+});
+
+test("per-unit document signatures never inherit floor or sibling signatures", () => {
+  const ownInstaller = signature("a1-installer"), ownOffice = signature("a1-office"), ownManager = signature("a1-manager");
+  const a1 = unit("a1", "A棟", "14F", [acceptance("a1-final", ["合格"], { completion: { signatures: { installer: ownInstaller, office: ownOffice, siteManager: ownManager } } })]);
+  const a2 = unit("a2", "A棟", "14F", [acceptance("a2-final", ["合格"], { completion: { signatures: {} } })]);
+  const a3Installer = signature("a3-installer");
+  const a3 = unit("a3", "A棟", "14F", [acceptance("a3-final", ["合格"], { completion: { signatures: { installer: a3Installer } } })]);
+  const source = structuredClone([a1, a2, a3]);
+
+  assert.deepEqual(floorUnitSignatures(a1), { installer: ownInstaller, office: ownOffice, siteManager: ownManager });
+  assert.equal(floorUnitSignatureCount(a1), 3);
+  assert.equal(floorUnitSignatures(a1).supervisor, undefined);
+  assert.deepEqual(floorUnitSignatures(a2), {});
+  assert.equal(floorUnitSignatureCount(a2), 0);
+  assert.equal(floorUnitSignatures(a1).installer?.name, "a1-installer");
+  assert.equal(floorUnitSignatures(a3).installer?.name, "a3-installer");
+  assert.deepEqual([a1, a2, a3], source);
 });
 
 test("floor batch drafts update independently without mutating source values", () => {
