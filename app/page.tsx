@@ -11,12 +11,12 @@ import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageExce
 import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, saveReceivableWorkbook, saveShipmentWorkbook } from "../lib/acceptance-exports";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
-import { AuthResolveGuard, resolveAuthIdentity, type AuthIdentity } from "../lib/auth-session";
+import { AUTH_TIMEOUT_MS, AuthResolveGuard, resolveAuthIdentity, withAuthTimeout, type AuthIdentity } from "../lib/auth-session";
 import { migrateLegacyStorageValue, scopedDraftKey, scopedStorageKey } from "../lib/auth-storage";
 import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-lifecycle";
-import { areaInputToPing, areaValueFromPing, convertAreaInput, importedAreaToPing, type AreaUnit } from "../lib/area";
+import { areaInputToPing, areaValueFromPing, convertAreaInput, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
-import { findExactUnitProduct, importableUnitRows, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated } from "../lib/unit-import";
+import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, importedAreaEntry, importedAreaToCanonicalPing, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated, type ImportAreaDetection } from "../lib/unit-import";
 import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 
@@ -669,7 +669,28 @@ export default function App() {
   useEffect(() => {
     let active = true;
     let retryTimer: number | undefined;
+    const getSessionWithTimeout = () => withAuthTimeout(supabase.auth.getSession(), AUTH_TIMEOUT_MS, "AUTH_GET_SESSION_TIMEOUT");
+    const scheduleRetry = () => {
+      if (!active) return;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(async () => {
+        retryTimer = undefined;
+        try {
+          const { data, error } = await getSessionWithTimeout();
+          if (error) throw error;
+          if (active) await resolveAccess("VALIDATION_RETRY", data.session);
+        } catch {
+          if (!active) return;
+          setAuthError("登入狀態暫時無法讀取，系統會自動重試；目前不會將您登出。");
+          scheduleRetry();
+        }
+      }, 1500);
+    };
     const resolveAccess = async (event: string, session: Awaited<ReturnType<typeof supabase.auth.getSession>>["data"]["session"]) => {
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
       const generation = authGuardRef.current.begin();
       authDebug({ event, generation, sessionUserId: session?.user.id || null, validatedUserId: null, workspaceOwner: authSnapshotRef.current?.userId || null });
       if (!session) {
@@ -730,7 +751,7 @@ export default function App() {
         setAuthError("登入驗證暫時無法完成，系統會自動重試；目前不會將您登出。");
         if (result.identity) setAuthReady(true);
         authDebug({ event: `${event}:temporary-error`, generation, sessionUserId: session.user.id, validatedUserId: result.identity?.userId || null, email: result.identity?.email || null, role: result.identity?.role || null, workspaceOwner: result.identity?.userId || null });
-        retryTimer = window.setTimeout(() => void supabase.auth.getSession().then(({ data }) => resolveAccess("VALIDATION_RETRY", data.session)), 1500);
+        scheduleRetry();
       }
     };
     const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
@@ -741,13 +762,14 @@ export default function App() {
       }
       window.setTimeout(() => void resolveAccess(event, session), 0);
     });
-    void supabase.auth.getSession().then(({ data, error }) => {
+    void getSessionWithTimeout().then(({ data, error }) => {
       if (!active) return;
-      if (error) {
-        setAuthError("登入狀態暫時無法讀取，系統會等待瀏覽器恢復。");
-        return;
-      }
+      if (error) throw error;
       void resolveAccess("INITIAL_SESSION", data.session);
+    }).catch(() => {
+      if (!active) return;
+      setAuthError("登入狀態暫時無法讀取，系統會自動重試；目前不會將您登出。");
+      scheduleRetry();
     });
     return () => {
       active = false;
@@ -1808,6 +1830,10 @@ function ProjectOnboarding({
     setError("");
   };
   const updateRow = (index: number, key: string, value: string) => setRows(rows.map((row, i) => i === index ? { ...row, [key]: value, ...(key === "model" ? { colorNo: "" } : {}) } : row));
+  const goToConfirmation = () => {
+    setError("");
+    setStep(4);
+  };
   const finish = () => {
     const invalid = rows.findIndex((r) => !onboardingUnitRowIsValid(r, areaInputToPing(r.estimated, r.areaUnit || "坪")));
     if (invalid >= 0) return setError(`第 ${invalid + 1} 戶資料不完整，請確認棟別、樓層、戶別與坪數。`);
@@ -1834,7 +1860,7 @@ function ProjectOnboarding({
           <Field label="建案名稱（必填）" value={basic.name} set={(name) => setBasic({ ...basic, name })} /><Field label="案場地址（必填）" value={basic.address} set={(address) => setBasic({ ...basic, address })} /><Field label="建設公司" value={basic.builder} set={(builder) => setBasic({ ...basic, builder })} /><Field label="工地窗口" value={basic.contact} set={(contact) => setBasic({ ...basic, contact })} /><Field label="聯絡資訊" value={basic.phone} set={(phone) => setBasic({ ...basic, phone })} /><Field label="預計工程日期" type="date" value={basic.expectedDate} set={(expectedDate) => setBasic({ ...basic, expectedDate })} /><Field label="備註" value={basic.note} set={(note) => setBasic({ ...basic, note })} />
         </div><button className="primary next-step" disabled={!basic.name.trim() || !basic.address.trim()} onClick={() => setStep(2)}>下一步：確認SPC產品 →</button></section>}
         {step === 2 && <section className="panel form"><div><p className="eyebrow">全案場共用產品庫</p><h1>選擇或新增SPC產品</h1><p className="muted">點一下已有色號即可自動帶入下方欄位；沒有的產品只需新增一次。</p></div><div className="onboarding-products">{products.map((p) => <button type="button" className={product.id === p.id ? "selected" : ""} key={p.id} onClick={() => { setProduct({ ...p }); setError(""); }}><b>{p.model}</b><span>{p.colorNo}</span><small>{p.brand || "未填品牌"}</small></button>)}</div><div className="grid3 product-inline"><Field label="品牌／廠商" value={product.brand} set={(brand) => setProduct({ ...product, brand })} /><Field label="SPC編號" value={product.model} set={(model) => setProduct({ ...product, model })} /><Field label="色號" value={product.colorNo} set={(colorNo) => setProduct({ ...product, colorNo })} /><Field label="規格" value={product.spec} set={(spec) => setProduct({ ...product, spec })} /><button className="ghost" onClick={addProduct}>＋ 加入產品庫</button></div><div className="step-actions"><button className="ghost" onClick={() => setStep(1)}>← 上一步</button><button className="primary" disabled={!products.length} onClick={() => setStep(3)}>下一步：建立戶別 →</button></div></section>}
-        {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><AreaDraftInput value={r.estimated} unit={r.areaUnit || "坪"} setArea={(estimated, areaUnit) => setRows((current) => current.map((row, index) => index === i ? { ...row, estimated, areaUnit } : row))} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={() => { setError(""); setStep(4); }}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: areaInputToPing(row.estimated, row.areaUnit || "坪") || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => [row.building, row.floor, row.number, row.model, row.colorNo, row.estimated, row.note].some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), areaUnit: "坪" as AreaUnit, note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
+        {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button><button className="primary" onClick={goToConfirmation}>下一步：確認資料 →</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><AreaDraftInput value={r.estimated} unit={r.areaUnit || "坪"} setArea={(estimated, areaUnit) => setRows((current) => current.map((row, index) => index === i ? { ...row, estimated, areaUnit } : row))} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={goToConfirmation}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: areaInputToPing(row.estimated, row.areaUnit || "坪") || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => [row.building, row.floor, row.number, row.model, row.colorNo, row.estimated, row.note].some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), areaUnit: "坪" as AreaUnit, note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
         {step === 4 && <section className="panel form"><div><p className="eyebrow">最後確認</p><h1>確認並啟用案場</h1></div><div className="activation-summary"><span>建案<b>{basic.name}</b></span><span>案場地址<b>{basic.address}</b></span><span>SPC產品<b>{products.length} 筆</b></span><span>第一批戶別<b>{rows.length} 戶</b></span></div><div className="warning">確認後會正式建立案場，戶別基本資料將直接沿用至場勘、施工、驗收與報告。</div><div className="step-actions"><button className="ghost" onClick={() => setStep(3)}>← 返回修改</button><button className="primary" onClick={finish}>確認並開始使用</button></div></section>}
         {error && <div className="form-error">{error}</div>}
       </section>
@@ -2225,6 +2251,7 @@ function Units({
     [expanded, setExpanded] = useState<string[]>([]),
     [openBuildings, setOpenBuildings] = useState<string[]>([]),
     [filtersOpen, setFiltersOpen] = useState(false),
+    [areaDisplayUnit, setAreaDisplayUnit] = useState<AreaUnit>("坪"),
     [creating, setCreating] = useState(false),
     [batchStatus, setBatchStatus] = useState<Status>("待場勘"),
     [creationDraftReady, setCreationDraftReady] = useState(() => !!readLocal(draftKey(authUserId, "unit-create", p.id)));
@@ -2447,6 +2474,7 @@ function Units({
               <p>先選擇已建立的 SPC 產品，確認後才產生戶別案件。</p>
             </div>
             <div className="actions">
+              <label className="field"><span>面積顯示</span><select value={areaDisplayUnit} onChange={(event) => setAreaDisplayUnit(event.target.value as AreaUnit)}><option>坪</option><option>m²</option></select></label>
               <button
                 className="ghost"
                 onClick={() => {
@@ -2910,7 +2938,7 @@ function Units({
                                 <div>
                                   <b>{u.number || "未命名"}</b>
                                   <small>
-                                    {u.model || "未填型號"}｜{u.colorNo || "未填色號"}｜{u.estimated || 0} 坪
+                                    {u.model || "未填型號"}｜{u.colorNo || "未填色號"}｜{areaValueFromPing(u.estimated || 0, areaDisplayUnit)} {areaDisplayUnit}
                                   </small>
                                   {u.note.includes("【特殊案件】") && (
                                     <span className="special-badge">
@@ -2975,6 +3003,8 @@ function ImportUnits({
   );
   const [rows, setRows] = useState<ImportUnitRow[]>([]);
   const [message, setMessage] = useState("");
+  const [areaUnitChoice, setAreaUnitChoice] = useState<"auto" | AreaUnit>("auto");
+  const [areaDetection, setAreaDetection] = useState<ImportAreaDetection>({ unit: null, basis: "uncertain", validCount: 0 });
   const clean = (value: unknown) => String(value ?? "").trim();
   const read = (source: Record<string, unknown>, aliases: string[]) => {
     const normalized = Object.fromEntries(
@@ -2993,6 +3023,7 @@ function ImportUnits({
     if (!file) return;
     setMessage("");
     setRows([]);
+    setAreaUnitChoice("auto");
     setFileName(file.name);
     try {
       const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
@@ -3131,13 +3162,15 @@ function ImportUnits({
         p.units.map((u) => `${u.building}|${u.floor}|${u.number}`),
       );
       const inFile = new Set<string>();
+      const detectedArea = detectImportAreaBatch(raw);
+      setAreaDetection(detectedArea);
       const parsed = raw.map((source, index) => {
         const building = read(source, ["棟別"]);
         const floor = read(source, ["樓層"]);
         const number = read(source, ["戶別"]);
         const model = read(source, ["SPC編號", "型號", "SPC型號"]);
         const colorNo = read(source, ["色號", "顏色"]);
-        const importedEstimated = importedAreaToPing(source);
+        const importedEstimated = importedAreaEntry(source)?.value ?? Number.NaN;
         const estimated = safeImportedEstimated(importedEstimated);
         const statusText = read(source, ["工程狀態", "狀態"]);
         const status = statuses.includes(statusText as Status)
@@ -3193,6 +3226,7 @@ function ImportUnits({
     }
   };
   const importable = importableUnitRows(rows);
+  const interpretedAreaUnit = areaUnitChoice === "auto" ? areaDetection.unit : areaUnitChoice;
   const pending = importable.filter((row) => row.warning).length;
   const blanks = rows.filter((row) => !row.hasData).length;
   const duplicates = rows.filter((row) => row.duplicate).length;
@@ -3207,34 +3241,22 @@ function ImportUnits({
   ];
   const confirmImport = () => {
     if (!importable.length) return;
+    if (!interpretedAreaUnit) return setMessage("無法確定本批面積單位，請先選擇坪或 m²。");
     if (
       !confirm(
-        `建案名稱：${projectName || "未填寫"}\n即將匯入 ${importable.length} 戶，其中 ${pending} 戶待補資料、${specialCount} 戶標記為特殊案件。\n同時新增 ${newProductKeys.length} 筆 SPC 產品資料到共用產品庫。\n重複 ${duplicates} 列、完全空白 ${blanks} 列不會匯入。\n\n是否確認？`,
+        `建案名稱：${projectName || "未填寫"}\n本批面積單位：${interpretedAreaUnit}\n即將匯入 ${importable.length} 戶，其中 ${pending} 戶待補資料、${specialCount} 戶標記為特殊案件。\n同時新增 ${newProductKeys.length} 筆 SPC 產品資料到共用產品庫。\n重複 ${duplicates} 列、完全空白 ${blanks} 列不會匯入。\n\n是否確認？`,
       )
     )
       return;
-    const units = importable.map((row) => ({
-      ...blankUnit(),
-      building: row.building,
-      floor: row.floor,
-      number: row.number,
-      brand: row.product?.brand || "",
-      model: row.model,
-      colorNo: row.colorNo,
-      spec: row.product?.spec || "",
-      estimated: row.estimated,
-      status: row.status,
-      note: row.note,
-      events: [
-        {
-          id: id(),
-          at: stamp(),
-          title: "由 Excel 匯入戶別資料",
-          detail: `${row.special ? "特殊案件／" : ""}${row.model || "SPC 待確認"}／${row.colorNo}／${row.estimated}坪`,
-          photos: [],
-        },
-      ],
-    }));
+    const units = importable.map((row) => {
+      const estimated = importedAreaToCanonicalPing(row.estimated, interpretedAreaUnit);
+      return {
+        ...blankUnit(), building: row.building, floor: row.floor, number: row.number,
+        brand: row.product?.brand || "", model: row.model, colorNo: row.colorNo, spec: row.product?.spec || "",
+        estimated, status: row.status, note: row.note,
+        events: [{ id: id(), at: stamp(), title: "由 Excel 匯入戶別資料", detail: `${row.special ? "特殊案件／" : ""}${row.model || "SPC 待確認"}／${row.colorNo}／${estimated}坪`, photos: [] }],
+      };
+    });
     const products = newProductKeys.map((key) => {
       const [model, colorNo] = key.split("|");
       return {
@@ -3312,6 +3334,7 @@ function ImportUnits({
             <p className="import-sheet">
               來源工作表：{sheetName}｜辨識格式：{formatName}
             </p>
+            <div className="field import-area-unit"><span>本批面積單位</span><select value={areaUnitChoice} onChange={(event) => { setAreaUnitChoice(event.target.value as "auto" | AreaUnit); setMessage(""); }}><option value="auto">自動判定</option><option value="坪">坪</option><option value="m²">m²</option></select><small>{areaUnitChoice !== "auto" ? `人工指定：${areaUnitChoice}` : areaDetection.basis === "header" ? `自動判定：${areaDetection.unit}｜判定依據：Excel 表頭「${areaDetection.header}」` : areaDetection.unit ? `自動判定：${areaDetection.unit}｜判定依據：有效 ${areaDetection.validCount} 戶，中位數 ${areaDetection.median}` : `自動判定：無法確定｜${areaDetection.median !== undefined ? `有效 ${areaDetection.validCount} 戶，中位數 ${areaDetection.median}；` : ""}請選擇坪或 m²`}</small></div>
             <div className="table-wrap import-preview">
               <table>
                 <thead>
@@ -3319,7 +3342,7 @@ function ImportUnits({
                     <th>列</th>
                     <th>棟／樓／戶</th>
                     <th>SPC 編號／色號</th>
-                    <th>換算後坪數</th>
+                    <th>面積解讀</th>
                     <th>狀態</th>
                     <th>檢查結果</th>
                   </tr>
@@ -3335,7 +3358,7 @@ function ImportUnits({
                         {row.model || "待確認"}／{row.colorNo}
                       </td>
                       <td>
-                        {Number.isFinite(row.estimated) ? `${row.estimated.toFixed(2)} 坪` : "—"}
+                        {Number.isFinite(row.estimated) && row.estimated > 0 ? interpretedAreaUnit === "m²" ? `${row.estimated} m² → ${importedAreaToCanonicalPing(row.estimated, "m²").toFixed(2)} 坪` : interpretedAreaUnit === "坪" ? `${row.estimated} 坪` : `${row.estimated}（待選單位）` : "—"}
                       </td>
                       <td>{row.status}</td>
                       <td>
@@ -3380,7 +3403,7 @@ function ImportUnits({
           </button>
           <button
             className="primary"
-            disabled={!importable.length}
+            disabled={!importable.length || !interpretedAreaUnit}
             onClick={confirmImport}
           >
             匯入可匯入的 {importable.length} 戶

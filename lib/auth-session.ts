@@ -30,6 +30,18 @@ type SessionUser = {
   user_metadata?: Record<string, unknown>;
 };
 
+export const AUTH_TIMEOUT_MS = 10_000;
+
+export function withAuthTimeout<T>(promise: Promise<T>, timeoutMs: number, errorCode: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(errorCode)), timeoutMs);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 export async function resolveAuthIdentity<Role extends string>(input: {
   generation: number;
   guard: AuthResolveGuard;
@@ -39,19 +51,21 @@ export async function resolveAuthIdentity<Role extends string>(input: {
   loadRole: () => Promise<Role>;
   currentSessionUserId: () => Promise<string | null>;
   accountLabel: (user: SessionUser) => string;
+  timeoutMs?: number;
 }): Promise<AuthResolution<Role>> {
   const { generation, guard, sessionUser } = input;
+  const timeoutMs = input.timeoutMs ?? AUTH_TIMEOUT_MS;
   if (!guard.isCurrent(generation)) return { kind: "stale" };
   if (!sessionUser) return { kind: "signed-out" };
 
   try {
-    const validated = await input.validateUser();
+    const validated = await withAuthTimeout(input.validateUser(), timeoutMs, "AUTH_VALIDATE_TIMEOUT");
     if (!guard.isCurrent(generation)) return { kind: "stale" };
     if (validated.id !== sessionUser.id) throw new Error("AUTH_USER_MISMATCH");
 
-    const role = await input.loadRole();
+    const role = await withAuthTimeout(input.loadRole(), timeoutMs, "AUTH_ROLE_TIMEOUT");
     if (!guard.isCurrent(generation)) return { kind: "stale" };
-    const currentUserId = await input.currentSessionUserId();
+    const currentUserId = await withAuthTimeout(input.currentSessionUserId(), timeoutMs, "AUTH_SESSION_CHECK_TIMEOUT");
     if (!guard.isCurrent(generation)) return { kind: "stale" };
     if (currentUserId !== sessionUser.id) throw new Error("AUTH_SESSION_CHANGED");
 

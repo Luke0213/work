@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { findExactUnitProduct, importableUnitRows, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated } from "../lib/unit-import.ts";
+import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, importedAreaToCanonicalPing, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated } from "../lib/unit-import.ts";
 
 const row = (change: Partial<{ hasData: boolean; duplicate: boolean; model: string; colorNo: string }> = {}) => ({
   hasData: true,
@@ -38,6 +38,32 @@ test("a shared product requires both model and color number", () => {
   assert.equal(importProductKey(row()), "SPC-01|C01");
   assert.equal(importProductKey(row({ model: "" })), null);
   assert.equal(importProductKey(row({ colorNo: "" })), null);
+});
+
+test("explicit area headers take priority over batch median", () => {
+  assert.deepEqual(detectImportAreaBatch([{ 預估坪數: 65.4 }]), { unit: "坪", basis: "header", header: "預估坪數", validCount: 1 });
+  assert.deepEqual(detectImportAreaBatch([{ "施工面積(m²)": 18.7 }]), { unit: "m²", basis: "header", header: "施工面積(m²)", validCount: 1 });
+  assert.deepEqual(detectImportAreaBatch([{ 面積: 18.7 }]), { unit: "坪", basis: "median", validCount: 1, median: 18.7 });
+});
+
+test("generic area headers use valid-value median with an inclusive uncertainty band", () => {
+  assert.equal(detectImportAreaBatch([{ 面積: 10 }, { 面積: 20 }, { 面積: 21 }]).median, 20);
+  assert.equal(detectImportAreaBatch([{ 面積: 30 }, { 面積: 50 }]).median, 40);
+  assert.equal(detectImportAreaBatch([{ 面積: 10 }, { 面積: 21 }]).median, 15.5);
+  assert.equal(detectImportAreaBatch([{ 面積: 22 }]).unit, null);
+  assert.equal(detectImportAreaBatch([{ 面積: 28 }]).unit, null);
+  assert.equal(detectImportAreaBatch([{ 面積: 25.2 }]).unit, null);
+  assert.equal(detectImportAreaBatch([{ 面積: 21.99 }]).unit, "坪");
+  assert.equal(detectImportAreaBatch([{ 面積: 28.01 }]).unit, "m²");
+  assert.deepEqual(detectImportAreaBatch([{ 面積: "" }, { 面積: 0 }, { 面積: "x" }, { 面積: 40 }]), { unit: "m²", basis: "median", validCount: 1, median: 40 });
+});
+
+test("manual import interpretation converts to canonical ping exactly once", () => {
+  assert.equal(importedAreaToCanonicalPing(20.21, "坪"), 20.21);
+  assert.equal(importedAreaToCanonicalPing(66.8, "m²"), 20.21);
+  assert.equal(importedAreaToCanonicalPing(0, "m²"), 0);
+  assert.equal(importedAreaToCanonicalPing(Number.NaN, "坪"), 0);
+  assert.notEqual(importedAreaToCanonicalPing(importedAreaToCanonicalPing(66.8, "m²"), "坪"), 6.11);
 });
 
 test("onboarding allows SPC fields to remain pending while required unit fields still block", () => {

@@ -108,8 +108,9 @@ test("unit estimated remains the canonical ping area and survey only displays it
   assert.match(areaDraftInput, /setArea\(convertAreaInput\(value, unit, nextUnit\), nextUnit\)/);
   assert.match(areaDraftInput, /setArea\(event\.target\.value, unit\)/);
   assert.doesNotMatch(areaDraftInput, /setValue|setUnit/);
-  assert.match(page, /const importedEstimated = importedAreaToPing\(source\)/);
+  assert.match(page, /const importedEstimated = importedAreaEntry\(source\)\?\.value \?\? Number\.NaN/);
   assert.match(page, /const estimated = safeImportedEstimated\(importedEstimated\)/);
+  assert.match(page, /const estimated = importedAreaToCanonicalPing\(row\.estimated, interpretedAreaUnit\)/);
   assert.match(page, /survey-estimated-area/);
   assert.match(page, /沿用戶別主資料，此處僅供查看/);
   assert.doesNotMatch(page, /pendingSurvey/);
@@ -452,6 +453,18 @@ test("work journal Word export uses adaptive borderless six-photo pages", async 
   assert.match(page, /word-preview-first-row[\s\S]*entry\.photos\[0\][\s\S]*JournalWordPreviewPhotoRows photos=\{entry\.photos\}/);
   assert.match(page, /function JournalWordPreviewPhotoRows[\s\S]*planJournalPhotoRows\(measured\)/);
   assert.match(css, /\.word-preview-first-row\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1\.08fr\)/);
+});
+
+test("unit import confirms one batch area unit before canonical ping conversion", async () => {
+  const page = await read("app/page.tsx");
+  const unitImport = page.slice(page.indexOf("function ImportUnits("), page.indexOf("function ProjectForm("));
+  assert.match(unitImport, /detectImportAreaBatch\(raw\)/);
+  assert.match(unitImport, /本批面積單位/);
+  assert.match(unitImport, /自動判定/);
+  assert.match(unitImport, /areaUnitChoice === "auto" \? areaDetection\.unit : areaUnitChoice/);
+  assert.match(unitImport, /if \(!interpretedAreaUnit\) return setMessage/);
+  assert.match(unitImport, /importedAreaToCanonicalPing\(row\.estimated, interpretedAreaUnit\)/);
+  assert.doesNotMatch(unitImport.slice(unitImport.indexOf("const parsed ="), unitImport.indexOf("const importable =")), /areaInputToPing|importedAreaToCanonicalPing/);
 });
 
 test("billing edits stay local until one confirmed project patch", async () => {

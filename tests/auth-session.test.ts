@@ -48,3 +48,73 @@ test("a null authoritative session produces a real signed-out result", async () 
   });
   assert.equal(result.kind, "signed-out");
 });
+
+test("a normally completed validation resolves as authenticated", async () => {
+  const guard = new AuthResolveGuard();
+  const result = await resolveAuthIdentity({
+    generation: guard.begin(), guard, sessionUser: user("A"), previous: null,
+    validateUser: async () => user("A"), loadRole: async () => "admin",
+    currentSessionUserId: async () => "A", accountLabel: (value) => value.email || "",
+  });
+  assert.equal(result.kind, "authenticated");
+});
+
+test("a rejected validation is a temporary error and never signed-out", async () => {
+  const guard = new AuthResolveGuard();
+  const result = await resolveAuthIdentity({
+    generation: guard.begin(), guard, sessionUser: user("A"), previous: null,
+    validateUser: async () => { throw new Error("network"); }, loadRole: async () => "admin",
+    currentSessionUserId: async () => "A", accountLabel: (value) => value.email || "",
+  });
+  assert.equal(result.kind, "temporary-error");
+  assert.notEqual(result.kind, "signed-out");
+});
+
+test("a pending validation times out as temporary error and retains same-user identity", async () => {
+  const guard = new AuthResolveGuard();
+  const previous = { userId: "A", email: "A@example.com", role: "admin" };
+  const result = await resolveAuthIdentity({
+    generation: guard.begin(), guard, sessionUser: user("A"), previous,
+    validateUser: () => new Promise(() => {}), loadRole: async () => "admin",
+    currentSessionUserId: async () => "A", accountLabel: (value) => value.email || "", timeoutMs: 5,
+  });
+  assert.equal(result.kind, "temporary-error");
+  assert.deepEqual(result.kind === "temporary-error" && result.identity, previous);
+  assert.equal(result.kind === "temporary-error" && (result.error as Error).message, "AUTH_VALIDATE_TIMEOUT");
+});
+
+test("pending role and session checks time out as temporary errors", async () => {
+  for (const pendingStep of ["role", "session"] as const) {
+    const guard = new AuthResolveGuard();
+    const result = await resolveAuthIdentity({
+      generation: guard.begin(), guard, sessionUser: user("A"), previous: null,
+      validateUser: async () => user("A"),
+      loadRole: pendingStep === "role" ? () => new Promise(() => {}) : async () => "admin",
+      currentSessionUserId: pendingStep === "session" ? () => new Promise(() => {}) : async () => "A",
+      accountLabel: (value) => value.email || "", timeoutMs: 5,
+    });
+    assert.equal(result.kind, "temporary-error");
+    assert.equal(
+      result.kind === "temporary-error" && (result.error as Error).message,
+      pendingStep === "role" ? "AUTH_ROLE_TIMEOUT" : "AUTH_SESSION_CHECK_TIMEOUT",
+    );
+  }
+});
+
+test("user mismatch and changed session remain temporary errors", async () => {
+  for (const scenario of ["mismatch", "changed"] as const) {
+    const guard = new AuthResolveGuard();
+    const result = await resolveAuthIdentity({
+      generation: guard.begin(), guard, sessionUser: user("A"), previous: null,
+      validateUser: async () => user(scenario === "mismatch" ? "B" : "A"),
+      loadRole: async () => "admin",
+      currentSessionUserId: async () => scenario === "changed" ? "B" : "A",
+      accountLabel: (value) => value.email || "",
+    });
+    assert.equal(result.kind, "temporary-error");
+    assert.equal(
+      result.kind === "temporary-error" && (result.error as Error).message,
+      scenario === "mismatch" ? "AUTH_USER_MISMATCH" : "AUTH_SESSION_CHANGED",
+    );
+  }
+});
