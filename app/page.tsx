@@ -19,6 +19,7 @@ import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, importedAreaEntry, importedAreaToCanonicalPing, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated, type ImportAreaDetection } from "../lib/unit-import";
 import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
+import { canWriteAcceptanceLifecycle, canWriteWorkLifecycle } from "../lib/unit-lifecycle";
 
 type Status =
   | "待確認"
@@ -4657,11 +4658,13 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       readDraft(draftKey(authUserId, "work", u.id), fallback),
     ),
     [saved, setSaved] = useState("");
+  const canWriteWork = canWriteWorkLifecycle(u.status);
   useOfflineDraftRestore(draftKey(authUserId, "work", u.id), setW);
   useEffect(() => {
     writeLocalDraft(draftKey(authUserId, "work", u.id), w, authUserId);
   }, [w, u.id, authUserId]);
   const saveDraft = () => {
+    if (!canWriteWork) return setSaved("目前狀態不可寫入施工紀錄；請先完成場勘／改善並確認可進場");
     const draft = { ...w, draft: true };
     patch({ works: [draft, ...u.works.filter((record) => record.id !== w.id)] });
     writeLocalDraft(draftKey(authUserId, "work", u.id), draft, authUserId);
@@ -4669,6 +4672,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
     setSaved("✓ 施工草稿已暫存；上午暫存後，下午可繼續補寫");
   };
   const save = (done: boolean) => {
+    if (!canWriteWork) return setSaved("目前狀態不可寫入施工紀錄；請先完成場勘／改善並確認可進場");
     const status: Status = done ? "待驗收" : "施工中",
       title = done ? "施工完成" : "新增施工紀錄";
     patch({
@@ -4703,7 +4707,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       </div>
       <InspectionGuide />
       <AutoRecord label="施工紀錄時間" at={w.startedAt || w.date} />
-      {!["可進場", "施工中"].includes(u.status) && (
+      {!canWriteWork && (
         <div className="warning">
           目前狀態不是「可進場／施工中」，請先完成前一節點。
         </div>
@@ -4744,17 +4748,17 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       />
       <Checklist node="施工" items={w.items || [{ label: "施工品質／現場狀況", result: "", note: "", photos: [] }]} set={(items) => setW({ ...w, items })} />
       <div className="decision">
-        <button className="ghost" disabled={!w.crew} onClick={saveDraft}>暫存未完成施工</button>
+        <button className="ghost" disabled={!canWriteWork || !w.crew} onClick={saveDraft}>暫存未完成施工</button>
         <button
           className="ghost"
-          disabled={!w.crew}
+          disabled={!canWriteWork || !w.crew}
           onClick={() => save(false)}
         >
           儲存並維持施工中
         </button>
         <button
           className="primary"
-          disabled={!w.crew}
+          disabled={!canWriteWork || !w.crew}
           onClick={() => save(true)}
         >
           施工完成 → 待驗收
@@ -4856,6 +4860,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
     allPhotos = [...a.photos, ...a.items.flatMap((x) => x.photos || [])],
     saveDraft = () => {
       if (historyModeRef.current) return setSaved("歷史驗收只能正式保存；原本未完成草稿不會被覆蓋");
+      if (!canWriteAcceptanceLifecycle(u.status, a.recheck)) return setSaved("目前工程狀態不可建立或暫存新的驗收；請先完成前一節點");
       const draft = { ...a, draft: true };
       patch({ acceptances: [draft, ...u.acceptances.filter((item) => item.id !== a.id)] });
       pendingDraftWriteRef.current = pendingDraftWriteRef.current.then(() => writeLocalDraft(draftKey(authUserId, "accept", u.id), draft, authUserId));
@@ -4864,42 +4869,52 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
     },
     save = async () => {
       const savingHistory = historyModeRef.current;
+      if (!canWriteAcceptanceLifecycle(u.status, a.recheck, savingHistory)) {
+        setSaved("目前工程狀態不可完成新的驗收；請先完成前一節點");
+        setConfirming(false);
+        return;
+      }
       const completed: Acceptance = { ...a, draft: false };
       acceptanceDraftActiveRef.current = false;
       skipNextDraftWrite.current = true;
-      const fail = a.result !== "合格" || bad.length > 0,
-        status: Status = fail ? "驗收缺失" : "已驗收",
-        newDef = fail
-          ? bad.map((x) => ({
+      const acceptanceUpdate = { acceptances: [completed, ...u.acceptances.filter((item) => item.id !== completed.id)] };
+      if (savingHistory) {
+        patch(acceptanceUpdate);
+      } else {
+        const fail = a.result !== "合格" || bad.length > 0,
+          status: Status = fail ? "驗收缺失" : "已驗收",
+          newDef = fail
+            ? bad.map((x) => ({
+                id: id(),
+                source: "驗收" as const,
+                type: x.label,
+                content: x.note,
+                unit: "施工工班",
+                due: "",
+                status: "待改善" as const,
+                before: x.photos || [],
+                after: [],
+                fix: "",
+                completed: "",
+              }))
+            : [];
+        patch({
+          ...acceptanceUpdate,
+          status,
+          defects: [...newDef, ...u.defects],
+          events: [
+            {
               id: id(),
-              source: "驗收" as const,
-              type: x.label,
-              content: x.note,
-              unit: "施工工班",
-              due: "",
-              status: "待改善" as const,
-              before: x.photos || [],
-              after: [],
-              fix: "",
-              completed: "",
-            }))
-          : [];
-      patch({
-        acceptances: [completed, ...u.acceptances.filter((item) => item.id !== completed.id)],
-        status,
-        defects: [...newDef, ...u.defects],
-        events: [
-          {
-            id: id(),
-            at: stamp(),
-            title: completed.recheck ? "完成複驗" : "完成驗收",
-            detail: `結果：${completed.result}`,
-            photos: allPhotos,
-          },
-          ...u.events,
-        ],
-      });
-      add(completed.recheck ? "完成複驗" : "完成驗收", completed.result, allPhotos);
+              at: stamp(),
+              title: completed.recheck ? "完成複驗" : "完成驗收",
+              detail: `結果：${completed.result}`,
+              photos: allPhotos,
+            },
+            ...u.events,
+          ],
+        });
+        add(completed.recheck ? "完成複驗" : "完成驗收", completed.result, allPhotos);
+      }
       localStorage.setItem(scopedKey("spc-last-acceptance-person", authUserId), completed.person);
       setA(completed);
       queueRecordChange(authUserId, "accept", u.id, completed, "complete");
@@ -4927,6 +4942,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       </div>
       <InspectionGuide />
       <AutoRecord label={a.recheck ? "複驗開始時間" : "驗收開始時間"} at={a.startedAt || a.date} />
+      {!historyMode && !canWriteAcceptanceLifecycle(u.status, a.recheck) && <div className="warning">目前工程狀態不可建立新的{a.recheck ? "複驗" : "驗收"}；仍可查看既有驗收歷史。</div>}
       <div className="summary">
         <span>
           實際施工坪數<b>{u.works.reduce((s, w) => s + w.area, 0)}</b>
@@ -4995,8 +5011,8 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         <div className="form-error">不合格項目必須填寫說明並上傳照片。</div>
       )}
       <div className="form-actions">
-        <button className="ghost" type="button" disabled={historyMode} onClick={saveDraft}>{historyMode ? "歷史查看不覆蓋草稿" : "暫存未完成驗收"}</button>
-        <button className="primary" disabled={!a.person || incomplete || invalidBad} onClick={() => setConfirming(true)}>進入最後確認</button>
+        <button className="ghost" type="button" disabled={historyMode || !canWriteAcceptanceLifecycle(u.status, a.recheck)} onClick={saveDraft}>{historyMode ? "歷史查看不覆蓋草稿" : "暫存未完成驗收"}</button>
+        <button className="primary" disabled={!canWriteAcceptanceLifecycle(u.status, a.recheck, historyMode) || !a.person || incomplete || invalidBad} onClick={() => setConfirming(true)}>進入最後確認</button>
       </div>
       {confirming && <Modal close={() => setConfirming(false)} title={`最後確認｜${a.recheck ? "複驗" : "驗收"}`}>
         <RecordConfirmation title="驗收資料" rows={[
