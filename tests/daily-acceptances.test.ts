@@ -36,5 +36,5 @@ test("single-day shipment export contains only that day and restarts serial at o
   assert.deepEqual(records.map((record) => record.acceptanceDate), [yesterday]);
   assert.deepEqual(records.map((record) => record.exportDate), [yesterday]);
   const workbook = createShipmentWorkbook(project, records, "2026-08") as { Sheets: Record<string, Record<string, { v?: unknown }>> };
-  assert.equal(workbook.Sheets["已出貨明細總表"]["B4"].v, 1);
+  assert.equal(workbook.Sheets["已出貨明細總表"]["B3"].v, 1);
 });

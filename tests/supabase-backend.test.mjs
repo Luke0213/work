@@ -41,7 +41,9 @@ test("completed acceptance cannot restore or rewrite a stale durable draft", asy
   assert.match(acceptance, /const completed: Acceptance = \{ \.\.\.a, draft: false \}/);
   assert.match(acceptance, /acceptances: \[completed,[\s\S]*setA\(completed\)[\s\S]*queueRecordChange\(authUserId, "accept", u\.id, completed, "complete"\)/);
   assert.match(acceptance, /acceptanceDraftActiveRef\.current = false[\s\S]*skipNextDraftWrite\.current = true/);
-  assert.match(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setRestorableAcceptance, acceptanceDraftActiveRef\)/);
+  assert.match(acceptance, /const setRestorableAcceptance = useRef\(\(restored: Acceptance\) => \{\s*if \(restored\.draft === false\) return;\s*if \(historyModeRef\.current\) preHistoryAcceptanceRef\.current = restored;\s*else setA\(restored\);/);
+  assert.match(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setRestorableAcceptance\)/);
+  assert.doesNotMatch(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setRestorableAcceptance, acceptanceDraftActiveRef\)/);
   assert.match(acceptance, /await pendingDraftWriteRef\.current;[\s\S]*await removeDurableDraft/);
   assert.match(acceptance, /add\(completed\.recheck[\s\S]*completed\.result/);
   assert.match(page, /signatures: a\.completion\?\.signatures \|\| \(a\.signature \? \{ office: a\.signature \} : \{\}\)/);
@@ -312,6 +314,118 @@ test("project navigation omits survey overview while unit survey remains availab
   assert.match(unitDetail, /tab === "survey"[\s\S]*<SurveyTab/);
 });
 
+test("project basic data saves one confirmed local draft and unit master cannot bypass it", async () => {
+  const page = await read("app/page.tsx");
+  const projectForm = page.slice(page.indexOf("function ProjectForm("), page.indexOf("function GlobalProducts("));
+  const requestSave = projectForm.slice(projectForm.indexOf("const requestSave"), projectForm.indexOf("const confirmSave"));
+  const confirmSave = projectForm.slice(projectForm.indexOf("const confirmSave"), projectForm.indexOf("return ("));
+  const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Master("));
+  const master = page.slice(page.indexOf("function Master("), page.indexOf("function SurveyTab("));
+
+  for (const field of ["name", "address", "builder", "contact", "phone", "expectedDate", "note"])
+    assert.match(projectForm, new RegExp(`\\["${field}",`));
+  assert.match(projectForm, /const \[draft, setDraft\] = useState<ProjectFormDraft>/);
+  assert.match(projectForm, /value=\{draft\[key\]\}[\s\S]*updateDraft\(key, value\)/);
+  assert.doesNotMatch(projectForm, /writeLocalDraft|readDraft|loadOfflineDraft|saveOfflineDraft/);
+  assert.match(projectForm, /const valid = !!draft\.name\.trim\(\) && !!draft\.address\.trim\(\)/);
+  assert.match(projectForm, /disabled=\{!changes\.length\}[\s\S]*onClick=\{requestSave\}>儲存修改/);
+  assert.doesNotMatch(requestSave, /\bpatch\(/);
+  assert.equal((confirmSave.match(/\bpatch\(/g) || []).length, 1);
+  assert.match(confirmSave, /const updates: Partial<ProjectFormDraft> = \{\}[\s\S]*changes\.forEach[\s\S]*patch\(updates\)/);
+  assert.match(projectForm, /以下資料將更新為全案共用的專案基本資料/);
+  assert.match(projectForm, />返回修改<\/button>[\s\S]*>確認儲存<\/button>/);
+  assert.doesNotMatch(projectForm, /units\s*:|acceptances\s*:|surveys\s*:|works\s*:|journals\s*:|events\s*:/);
+  assert.match(projectForm, /editedKeysRef\.current\.forEach\(\(key\) => \{[\s\S]*merged\[key\] = current\[key\][\s\S]*return merged/);
+
+  assert.doesNotMatch(unitDetail, /<Master[\s\S]*patchProject=/);
+  assert.match(master, /label="建案名稱（全案共用）"[\s\S]*value=\{p\.name\}[\s\S]*disabled[\s\S]*set=\{\(\) => undefined\}/);
+  assert.match(master, /請至「專案資料」修改全案共用資料/);
+  assert.doesNotMatch(master, /patchProject\(\{ name \}\)/);
+  assert.match(unitDetail, /<p className="eyebrow">\{project\.name\}<\/p>/);
+});
+
+test("dashboard shows read-only project data instead of pending unit actions", async () => {
+  const page = await read("app/page.tsx");
+  const dashboard = page.slice(page.indexOf("function Dashboard"), page.indexOf("function DashAction"));
+  const projectDataStart = dashboard.indexOf('<section className="dash-card task-card dashboard-project-data">');
+  const projectData = dashboard.slice(projectDataStart, dashboard.indexOf("</section>", projectDataStart));
+
+  assert.ok(projectDataStart >= 0);
+  assert.doesNotMatch(dashboard, /待處理戶別|等待安排現場場勘|目前沒有待處理戶別/);
+  assert.match(projectData, /<h2>專案資料<\/h2>/);
+  for (const [label, field] of [
+    ["建案名稱", "name"],
+    ["案場地址", "address"],
+    ["建設公司", "builder"],
+    ["工地窗口", "contact"],
+    ["聯絡資訊", "phone"],
+    ["預計工程日期", "expectedDate"],
+    ["備註", "note"],
+  ]) {
+    assert.match(projectData, new RegExp(`\\["${label}", p\\.${field} \\|\\| "—"\\]`));
+  }
+  assert.doesNotMatch(projectData, /<Field|<input|<textarea|patch\(|onClick=/);
+});
+
+test("global product catalog edits the visible product row without changing units", async () => {
+  const page = await read("app/page.tsx");
+  const globalProducts = page.slice(page.indexOf("function GlobalProducts("), page.indexOf("function Products("));
+  const reset = globalProducts.slice(globalProducts.indexOf("const resetForm ="), globalProducts.indexOf("const beginEdit ="));
+  const beginEdit = globalProducts.slice(globalProducts.indexOf("const beginEdit ="), globalProducts.indexOf("const add ="));
+  const save = globalProducts.slice(globalProducts.indexOf("const add ="), globalProducts.indexOf("return ("));
+  const editBranch = save.slice(save.indexOf("if (editingProductId)"), save.indexOf("} else {"));
+
+  assert.match(globalProducts, /\[editingProductId, setEditingProductId\] = useState\(""\)/);
+  assert.match(beginEdit, /setEditingProductId\(product\.id\)[\s\S]*setForm\(\{ \.\.\.product \}\)/);
+  assert.doesNotMatch(beginEdit, /setProducts\(/);
+  assert.match(save, /if \(!form\.model\.trim\(\) \|\| !form\.colorNo\.trim\(\)\) return/);
+  assert.match(save, /x\.id !== editingProductId &&[\s\S]*x\.model\.trim\(\) === form\.model\.trim\(\)[\s\S]*x\.colorNo\.trim\(\) === form\.colorNo\.trim\(\)/);
+  assert.match(editBranch, /setProducts\(products\.map\(\(product\) => product\.id === editingProductId \? \{/);
+  for (const field of ["brand", "spec", "note"])
+    assert.match(editBranch, new RegExp(`${field}: form\\.${field}`));
+  assert.match(editBranch, /model: form\.model\.trim\(\)/);
+  assert.match(editBranch, /colorNo: form\.colorNo\.trim\(\)/);
+  assert.doesNotMatch(editBranch, /\bunits\s*:|\.filter\(|id\(\)|\.\.\.form/);
+  assert.match(save, /setProducts\(\[[\s\S]*\{ \.\.\.form, model: form\.model\.trim\(\), colorNo: form\.colorNo\.trim\(\) \}[\s\S]*\.\.\.products/);
+  assert.match(save, /resetForm\(\)[\s\S]*removeDurableDraft\(formDraftKey\)[\s\S]*removeOfflineDraft\(formDraftKey\)/);
+  assert.match(reset, /setEditingProductId\(""\)[\s\S]*setForm\(blank\(\)\)/);
+  assert.doesNotMatch(reset, /setProducts\(/);
+  assert.match(globalProducts, /editingProductId && <button type="button" className="ghost" onClick=\{resetForm\}>取消修改<\/button>/);
+  assert.match(globalProducts, /\{editingProductId \? "儲存修改" : "＋ 新增至共用產品庫"\}/);
+  assert.match(globalProducts, /className="ghost" onClick=\{\(\) => beginEdit\(x\)\}>修改<\/button>[\s\S]*className="danger"/);
+  assert.match(globalProducts, /confirm\("刪除此產品色號？既有戶別資料不會被改動。"\)[\s\S]*setProducts\(products\.filter\(\(p\) => p\.id !== x\.id\)\)/);
+  assert.doesNotMatch(globalProducts, /\bunits\s*:|p\.units|patch\(/);
+});
+
+test("project product catalog edits one existing product without changing units", async () => {
+  const page = await read("app/page.tsx");
+  const products = page.slice(page.indexOf("function Products("), page.indexOf("function FloorAcceptanceView("));
+  const assign = products.slice(products.indexOf("const assign ="), products.indexOf("const resetProductForm ="));
+  const reset = products.slice(products.indexOf("const resetProductForm ="), products.indexOf("const beginProductEdit ="));
+  const beginEdit = products.slice(products.indexOf("const beginProductEdit ="), products.indexOf("const addProduct ="));
+  const save = products.slice(products.indexOf("const addProduct ="), products.indexOf("return ("));
+  const editBranch = save.slice(save.indexOf("if (editingProductId)"), save.indexOf("} else {"));
+
+  assert.match(products, /\[editingProductId, setEditingProductId\] = useState\(""\)/);
+  assert.match(beginEdit, /setEditingProductId\(product\.id\)[\s\S]*setForm\(\{ \.\.\.product \}\)/);
+  assert.doesNotMatch(beginEdit, /\bpatch\(|assign\(/);
+  assert.match(save, /if \(!form\.model \|\| !form\.colorNo\) return/);
+  assert.match(save, /x\.id !== editingProductId && x\.model === form\.model && x\.colorNo === form\.colorNo/);
+  assert.match(editBranch, /products: p\.products\.map\(\(product\) => product\.id === editingProductId \? \{/);
+  for (const field of ["brand", "model", "colorNo", "spec", "note"])
+    assert.match(editBranch, new RegExp(`${field}: form\\.${field}`));
+  assert.doesNotMatch(editBranch, /\bunits\s*:|\.filter\(|id\(\)|assign\(/);
+  assert.match(save, /patch\(\{ products: \[form, \.\.\.p\.products\] \}\)/);
+  assert.match(save, /resetProductForm\(\)[\s\S]*removeDurableDraft\(productDraftKey\)[\s\S]*removeOfflineDraft\(productDraftKey\)/);
+  assert.match(reset, /setEditingProductId\(""\)[\s\S]*id: id\(\)[\s\S]*brand: ""[\s\S]*model: ""[\s\S]*colorNo: ""[\s\S]*spec: ""[\s\S]*note: ""/);
+  assert.doesNotMatch(reset, /\bpatch\(/);
+  assert.match(products, /editingProductId && <button type="button" className="ghost" onClick=\{resetProductForm\}>取消修改<\/button>/);
+  assert.match(products, /\{editingProductId \? "儲存修改" : "＋ 新增產品色號"\}/);
+  assert.match(products, /className="ghost" onClick=\{\(\) => beginProductEdit\(x\)\}>修改<\/button>[\s\S]*className="danger"/);
+  assert.match(products, /confirm\("刪除此產品色號？既有戶別資料不會被改動。"\)[\s\S]*products: p\.products\.filter\(\(q\) => q\.id !== x\.id\)/);
+  assert.match(assign, /products\.find\(\(x\) => x\.id === selected\)[\s\S]*units: p\.units\.map[\s\S]*brand: product\.brand[\s\S]*model: product\.model[\s\S]*colorNo: product\.colorNo[\s\S]*spec: product\.spec/);
+});
+
 test("floor progress summaries count one normalized current status per unit", async () => {
   const page = await read("app/page.tsx");
   for (const value of ["unitProgressStatuses", "getUnitCurrentStatus", 'case "待確認"', 'case "場勘待改善"', 'case "驗收缺失"', 'case "待複驗"', 'case "已計價"']) {
@@ -387,31 +501,29 @@ test("offline IndexedDB outbox and acceptance exports are wired", async () => {
   assert.doesNotMatch(page, /帳單 Word|createReceivableDocx|應收帳款明細表\.docx/);
 });
 
-test("billing screen, receivable Excel, CSV, totals, and print share the selected month records", async () => {
+test("billing screen, receivable Excel, totals, and print share the selected month records", async () => {
   const page = await read("app/page.tsx");
   for (const value of [
     "monthlyBillingRecords = buildAcceptanceExportRecords(p).filter",
     "record.exportDate.startsWith(ym)",
     "shipmentRecords = monthlyBillingRecords",
     "billSubtotal = billRecords.reduce",
-    "exportCsv(p, billRecords, ym)",
     "record.areaPing",
     "record.amount",
     "printing-billing",
   ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.doesNotMatch(page, /exportCsv\(p, eligible\)/);
+  assert.doesNotMatch(page, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV|月結\.csv/);
 });
 
-test("electronic acceptance excludes drafts and billing labels its CSV accurately", async () => {
+test("electronic acceptance excludes drafts after billing CSV export removal", async () => {
   const page = await read("app/page.tsx");
   const acceptanceRecords = await read("lib/acceptance-records.ts");
   const acceptanceExports = await read("lib/acceptance-exports.ts");
   for (const value of [
     "const a = getLatestFinalAcceptance(u)",
     "目前尚無正式驗收紀錄，完成驗收後即可產生電子驗收單。",
-    "CSV 匯出",
-    "月結戶別明細 · CSV",
   ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(page, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV/);
   for (const value of ["getLatestFinalAcceptance", "acceptance.draft !== true", "acceptanceRecordTime(acceptance) > acceptanceRecordTime(latest)"])
     assert.match(acceptanceRecords, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(acceptanceExports, /const acceptance = getLatestFinalAcceptance\(unit\)/);
@@ -470,25 +582,37 @@ test("unit import confirms one batch area unit before canonical ping conversion"
 test("billing edits stay local until one confirmed project patch", async () => {
   const page = await read("app/page.tsx");
   const billing = page.slice(page.indexOf("type BillingUnitDraft"), page.indexOf("type CompletionExportDraft"));
+  const confirmSave = billing.slice(billing.indexOf("confirmSave = () => {"), billing.indexOf("startShipmentReportEdit ="));
 
   assert.match(billing, /type BillingUnitDraft = \{ rate: string; priced: boolean \}/);
   assert.match(billing, /setBillingDrafts\(\(current\) =>/);
   assert.match(billing, /保存修改/);
   assert.match(billing, /確認保存月結修改/);
   assert.match(billing, /確認保存/);
-  assert.match(billing, /const changes = new Map\(billingChanges/);
-  assert.equal((billing.match(/\bpatch\(\{/g) || []).length, 1);
-  assert.match(billing, /units: p\.units\.map/);
-  assert.match(billing, /if \(!changed\) return unit/);
+  assert.match(confirmSave, /const changes = new Map\(billingChanges/);
+  assert.equal((confirmSave.match(/\bpatch\(\{/g) || []).length, 1);
+  assert.match(confirmSave, /units: p\.units\.map/);
+  assert.match(confirmSave, /if \(!changed\) return unit/);
   assert.match(billing, /沒有需要保存的修改/);
   assert.match(billing, /record\.areaPing \* rate/);
   assert.match(billing, /editing \? previewSubtotal : billSubtotal/);
-  assert.match(billing, /newlyPriced = unit\.status !== "已計價" && changed\.draft\.priced/);
-  assert.match(billing, /title: "月結已計價"/);
+  assert.match(billing, /priced: unit\.status === "已計價"/);
+  assert.match(confirmSave, /rate,/);
+  assert.match(confirmSave, /pricingStatusChanged = changed\.draft\.priced !== wasPriced/);
+  assert.match(confirmSave, /status: changed\.draft\.priced \? "已計價" : "已驗收"/);
+  assert.match(confirmSave, /pricedAt: changed\.draft\.priced \? day\(\) : ""/);
+  assert.match(confirmSave, /title: changed\.draft\.priced \? "月結已計價" : "月結取消計價"/);
+  assert.match(confirmSave, /detail: changed\.draft\.priced \? `金額 \$\{changed\.record\.amount\}` : "狀態恢復為已驗收"/);
+  assert.match(confirmSave, /events: \[\{[\s\S]*\}, \.\.\.unit\.events\]/);
+  assert.doesNotMatch(confirmSave, /acceptances\s*:/);
+  assert.match(billing, /editing \? <label className="check"><input type="checkbox" checked=\{draft\.priced\}/);
+  assert.match(billing, /\{draft\.priced \? "已計價" : "已驗收"\}/);
+  assert.match(billing, /`\$\{unit\.status\} → \$\{draft\.priced \? "已計價" : "已驗收"\}`/);
+  assert.match(billing, /unit\.status === "已驗收" \|\| unit\.status === "已計價"/);
   assert.match(billing, /if \(editing && billingChanges\.length\)/);
   assert.match(billing, /匯出內容仍以已保存資料為準/);
-  assert.match(billing, /createReceivableWorkbook\(p, billRecords, ym\)/);
-  assert.match(billing, /exportCsv\(p, billRecords, ym\)/);
+  assert.match(billing, /createReceivableWorkbook\(p, billRecords, ym, receivableDraft\)/);
+  assert.doesNotMatch(billing, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV/);
   assert.match(billing, /shipmentRecords = monthlyBillingRecords/);
   assert.match(billing, /savedRecord: record/);
   assert.match(billing, /billing-print-only/);
@@ -511,7 +635,9 @@ test("IndexedDB photo drafts restore through markers without overriding full loc
   assert.match(durability, /return isIndexedDbMarker\(JSON\.parse\(localValue\)\)/);
   assert.match(durability, /catch \(error\)[\s\S]*logStorageException\("localStorage", "read", error\)[\s\S]*return true/);
   assert.match(survey, /readDraft\(draftKey\(authUserId, "survey", u\.id\)/);
-  assert.match(survey, /useOfflineDraftRestore\(draftKey\(authUserId, "survey", u\.id\), setS\)/);
+  assert.match(survey, /const setRestorableSurvey = useRef\(\(restored: Survey\) => \{\s*if \(surveyHistoryModeRef\.current\) preHistorySurveyRef\.current = restored;\s*else setS\(restored\);/);
+  assert.match(survey, /useOfflineDraftRestore\(draftKey\(authUserId, "survey", u\.id\), setRestorableSurvey\)/);
+  assert.doesNotMatch(survey, /useOfflineDraftRestore\(draftKey\(authUserId, "survey", u\.id\), setS\)/);
   assert.match(survey, /writeLocalDraft\(draftKey\(authUserId, "survey", u\.id\), s, authUserId\)/);
 });
 
@@ -627,11 +753,126 @@ test("unit and project journals reopen and update the same record without duplic
 
 test("project daily acceptance view derives final history and reuses shipment workbook", async () => {
   const page = await read("app/page.tsx");
+  const daily = page.slice(page.indexOf("function DailyAcceptanceView"), page.indexOf("function Dashboard"));
   assert.match(page, /\["daily-acceptance", "✓", "今日驗收"\]/);
-  assert.match(page, /buildDailyAcceptanceEntries<Acceptance, Unit>/);
-  assert.match(page, /buildAcceptanceExportRecord\(p, unit, acceptance, true\)/);
-  assert.match(page, /createShipmentWorkbook\(p, exportRecords/);
-  assert.doesNotMatch(page, /function createDaily.*Workbook/i);
+  assert.match(daily, /buildDailyAcceptanceEntries<Acceptance, Unit>/);
+  assert.match(daily, /dailyExportRecords = records\.map\(\(\{ unit, acceptance \}\) => buildAcceptanceExportRecord\(p, unit, acceptance, true\)\)/);
+  assert.match(daily, /onClick=\{\(\) => \{ setShipmentPreview\(true\); setReportMessage\(""\); \}\}/);
+  assert.doesNotMatch(daily, /onClick=\{exportDay\}/);
+  assert.match(daily, /title="當日總細表｜匯出預覽"/);
+  assert.match(daily, /dailyExportRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
+  assert.match(daily, /<ReportMetadataEditor draft=\{reportDraft\}/);
+  assert.match(daily, /disabled=\{shipmentExporting \|\| !dailyExportRecords\.length \|\| !!reportDraft\}/);
+  assert.match(daily, /"確認產生 Excel"/);
+  assert.match(daily, /const workbook = createShipmentWorkbook\(p, dailyExportRecords/);
+  assert.match(daily, /saveShipmentWorkbook\(workbook/);
+  assert.doesNotMatch(daily, /function createDaily.*Workbook/i);
+});
+
+test("receivable Excel uses a local billRecords preview draft before export", async () => {
+  const page = await read("app/page.tsx");
+  const exports = await read("lib/acceptance-exports.ts");
+  const css = await read("app/globals.css");
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
+  const receivableFlow = billing.slice(billing.indexOf("openReceivablePreview ="), billing.indexOf("changeBillingPeriod ="));
+  const receivableModal = billing.slice(billing.indexOf("{receivablePreview && receivableDraft"), billing.indexOf("{shipmentPreview &&"));
+
+  assert.match(billing, /onClick=\{openReceivablePreview\}[\s\S]*<b>應收帳款 Excel<\/b>[\s\S]*<em>預覽 ›<\/em>/);
+  assert.match(receivableFlow, /setReceivableDraft\(buildReceivableExportDraft\(p, billRecords\)\)/);
+  assert.match(receivableModal, /title="應收帳款 Excel｜匯出預覽"/);
+  assert.match(receivableModal, /billRecords\.map\(\(record, index\)/);
+  assert.match(receivableModal, /className="export-preview-table receivable-preview-table"/);
+  assert.match(receivableModal, /<th>數量\(坪\)<\/th><th>單價／元<\/th><th>合計<\/th><th>備註<\/th>/);
+  assert.match(receivableModal, /type="number" min="0" step="0\.01" value=\{detail\.quantity\}/);
+  assert.match(receivableModal, /label="送貨聯絡人"/);
+  assert.match(receivableModal, /實際戶別筆數<b>\{billRecords\.length\}<\/b>/);
+  assert.match(receivableModal, /createReceivableWorkbook\(p, billRecords, ym, receivableDraft\)/);
+  assert.match(billing, /receivableTotals = receivableDraft \? receivableDraftTotals\(receivableDraft\) : null/);
+  assert.match(receivableModal, /saveReceivableWorkbook\(workbook/);
+  assert.match(receivableModal, /receivableExporting \? "產生中…" : "確認產生 Excel"/);
+  for (const field of ["deliveryContact", "deliveryAddress", "invoiceTrack", "invoiceDate", "receivedAmount", "receivedDate", "preparedBy", "paymentMethod", "deliveryDate", "handler", "supervisor", "accounting"])
+    assert.match(receivableModal, new RegExp(`receivableDraft\\.${field}`));
+  for (const field of ["date", "model", "sizeCm", "quantity", "unitPrice", "note"])
+    assert.match(receivableModal, new RegExp(`detail\\.${field}`));
+  assert.match(receivableModal, /value=\{detail\.note\}[\s\S]*updateDetail\(\{ note: event\.target\.value \}\)/);
+  for (const field of ["bankAccount", "contactPerson", "mobile", "phone", "fax", "address"])
+    assert.match(receivableModal, new RegExp(`companyReportConfig\\.${field}`));
+  assert.doesNotMatch(receivableFlow + receivableModal, /\bpatch\(|queueRecordChange|writeLocalDraft|saveOfflineDraft|localStorage|indexedDB|\bstatus\s*:|events\s*:/i);
+
+  assert.match(exports, /const detailCount = records\.length/);
+  assert.match(exports, /deliveryAddress: project\.address \|\| ""/);
+  assert.match(exports, /\["日期", "型號", "尺寸cm", "數量\(坪\)", "單價／元", "合計", "備註"\]/);
+  assert.match(exports, /\["送貨聯絡人：", draft\.deliveryContact/);
+  assert.match(exports, /`\$\{project\.name \|\| ""\} SPC`/);
+  assert.match(exports, /note: record\.noteText \?\? record\.note/);
+  assert.match(exports, /detail\.note/);
+  assert.match(exports, /\["SPC", "", "", "", "", "", ""\]/);
+  assert.match(exports, /`A1:G1`[\s\S]*`A\$\{summaryTitle\}:G\$\{summaryTitle\}`[\s\S]*`A\$\{bankLabelRow\}:G\$\{bankLabelRow\}`/);
+  assert.match(exports, /worksheet\["!cols"\] = \[13, 18, 14, 13, 15, 17, 28\]/);
+  assert.match(exports, /worksheet\["!printArea"\] = `A1:G\$\{addressRow\}`/);
+  assert.match(exports, /col === 3\) cell\.z = "0\.00"/);
+  assert.doesNotMatch(exports, /Math\.max\(records\.length,\s*10\)/);
+  assert.match(exports, /F\$\{subtotalRow\}-F\$\{taxRow\}/);
+  for (const field of ["bankAccount", "contactPerson", "mobile", "phone", "fax", "address"])
+    assert.match(exports, new RegExp(`companyReportConfig\\.${field}`));
+  assert.match(css, /\.receivable-preview-table input\{[^}]*width:100%[^}]*max-width:150px[^}]*border:1px solid[^}]*border-radius:[^;]+;[^}]*background:#fff[^}]*padding:/);
+  assert.match(css, /\.receivable-preview-table input:focus\{[^}]*border-color:var\(--green\)[^}]*box-shadow:/);
+});
+
+test("daily and monthly shipment report edits persist only approved formal source fields", async () => {
+  const page = await read("app/page.tsx");
+  const exports = await read("lib/acceptance-exports.ts");
+  const sourceUpdate = page.slice(page.indexOf("const updateReportSource"), page.indexOf("function DailyAcceptanceView"));
+  const editor = page.slice(page.indexOf("function ReportMetadataEditor"), page.indexOf("function DailyAcceptanceView"));
+  const daily = page.slice(page.indexOf("function DailyAcceptanceView"), page.indexOf("function Dashboard"));
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
+  const dailySave = daily.slice(daily.indexOf("const saveReportSource"), daily.indexOf("return ("));
+  const shipmentOpen = billing.slice(billing.indexOf("startShipmentReportEdit ="), billing.indexOf("saveShipmentReportSource ="));
+  const shipmentSave = billing.slice(billing.indexOf("saveShipmentReportSource ="), billing.indexOf("changeBillingPeriod ="));
+
+  assert.match(sourceUpdate, /unit\.acceptances\.map\(\(acceptance\) => acceptance\.id === draft\.acceptanceId\s*\? \{ \.\.\.acceptance, report: \{/);
+  const textFields = [
+    "shipmentDateText", "sequenceText", "customerNameText", "productText", "unitDisplayText", "squareMetersText",
+    "pingText", "unitPriceText", "amountText", "vendorText", "purchasePriceText", "noteText",
+    "incomingVoOriginal", "incomingVoCopy", "outgoingVoOriginal", "outgoingVoCopy", "submitted", "vendorInvoice",
+    "tier", "payable", "profitPercent", "profit",
+  ];
+  for (const field of [
+    ...textFields, "signedOriginal", "signedCopy",
+  ]) {
+    assert.match(sourceUpdate, new RegExp(`${field}: draft\\.${field}`));
+    assert.match(exports, new RegExp(`${field}: report\\?\\.${field}`));
+  }
+  for (const field of textFields) assert.match(editor, new RegExp(`value=\\{draft\\.${field}\\}`));
+  assert.match(editor, /checked=\{draft\.signedOriginal\}/);
+  assert.match(editor, /checked=\{draft\.signedCopy\}/);
+  assert.doesNotMatch(editor, /type="(?:number|date)"/);
+  assert.doesNotMatch(sourceUpdate, /\bstatus\b|defects|events|\badd\(|removeDurableDraft|id: id\(\)|model: draft|colorNo: draft|brand: draft|rate:|area: draft|note: draft/);
+
+  for (const save of [dailySave, shipmentSave]) {
+    assert.match(save, /acceptance\.id === .*acceptanceId && acceptance\.draft !== true/);
+    assert.match(save, /updateReportSource\(currentUnit/);
+    assert.match(save, /patch\(\{ units: p\.units\.map\(\(unit\) => unit\.id === updatedUnit\.id \? updatedUnit : unit\) \}\)/);
+    assert.match(save, /queueRecordChange\(authUserId, "accept", updatedUnit\.id, updatedAcceptance, "complete"\)/);
+    assert.doesNotMatch(save, /\bstatus\b|defects:|events:|\badd\(|removeDurableDraft|id: id\(\)/);
+  }
+
+  assert.match(daily, /buildAcceptanceExportRecord\(p, unit, acceptance, true\)/);
+  assert.match(billing, /monthlyBillingRecords = buildAcceptanceExportRecords\(p\)/);
+  assert.equal((page.match(/<ReportMetadataEditor draft=/g) || []).length, 3);
+  assert.doesNotMatch(shipmentOpen, /\bpatch\(|queueRecordChange|updateReportSource/);
+  assert.match(daily, /onClick=\{\(\) => \{ setSelected\(entry\); setReportDraft\(null\); setReportMessage\(""\); \}\}/);
+  assert.match(daily, /onClick=\{\(\) => \{ setReportDraft\(null\); setReportMessage\(""\); \}\}>取消修改/);
+  assert.match(billing, /onClick=\{\(\) => \{ setShipmentReportDraft\(null\); setShipmentReportMessage\(""\); \}\}>取消修改/);
+  assert.match(billing, /createShipmentWorkbook\(p, shipmentRecords, ym\)/);
+  assert.match(billing, /disabled=\{shipmentExporting \|\| !shipmentRecords\.length \|\| !!shipmentReportDraft\}/);
+  assert.doesNotMatch(billing, /createShipmentWorkbook\(p, shipmentReportDraft/);
+  assert.doesNotMatch(exports, /Array\(12\)\.fill/);
+  assert.match(exports, /record\.shipmentDateText !== undefined \? display\.shipmentDateText : excelDate\(record\.exportDate\)/);
+  assert.match(exports, /record\.pingText !== undefined \? display\.pingText : \{ f: `ROUND/);
+  assert.match(exports, /record\.amountText !== undefined \? display\.amountText : \{ f: `IF/);
+  assert.match(exports, /records\.map\(\(record\) => \(\{ hpt: estimateShipmentRowHeight\(record\) \}\)\)/);
+  assert.match(exports, /wrapText: true/);
 });
 
 test("checklist measurement fields require an explicit item flag", async () => {
@@ -749,20 +990,23 @@ test("acceptance editor remounts by unit and rejects stale cross-unit draft rest
 
   assert.match(unitDetail, /<AcceptTab key=\{unit\.id\} project=\{project\} u=\{unit\}/);
   assert.doesNotMatch(unitDetail, /key=\{(?:unit\.acceptances|acceptance|unit\.status|unit\.updatedAt)/);
-  assert.match(acceptance, /const restored = readDraft\(draftKey\(authUserId, "accept", u\.id\), fallback\);\s*return restored\.draft === false \? fallback : restored;/);
-  assert.match(acceptance, /const setRestorableAcceptance = useRef\(\(restored: Acceptance\) => \{\s*if \(restored\.draft !== false\) setA\(restored\);/);
-  assert.match(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setRestorableAcceptance, acceptanceDraftActiveRef\)/);
+  assert.match(acceptance, /const latestFormalAcceptance = u\.acceptances\.find\(\(item\) => item\.draft !== true\)/);
+  assert.match(acceptance, /const historyModeRef = useRef\(!!latestFormalAcceptance\)/);
+  assert.match(acceptance, /const preHistoryAcceptanceRef = useRef<Acceptance \| null>\(null\)/);
+  assert.match(acceptance, /const acceptanceDraftActiveRef = useRef\(!latestFormalAcceptance\)/);
+  assert.match(acceptance, /const restored = readDraft\(draftKey\(authUserId, "accept", u\.id\), fallback\);\s*const initialAcceptance = restored\.draft === false \? fallback : restored;\s*if \(latestFormalAcceptance\) preHistoryAcceptanceRef\.current = initialAcceptance;\s*return latestFormalAcceptance \|\| initialAcceptance;/);
+  assert.match(acceptance, /const setRestorableAcceptance = useRef\(\(restored: Acceptance\) => \{\s*if \(restored\.draft === false\) return;\s*if \(historyModeRef\.current\) preHistoryAcceptanceRef\.current = restored;\s*else setA\(restored\);/);
+  assert.match(acceptance, /useOfflineDraftRestore\(draftKey\(authUserId, "accept", u\.id\), setRestorableAcceptance\)/);
   assert.doesNotMatch(acceptance, /restored\.draft !== true|restored\.draft === true \?/);
   assert.doesNotMatch(sharedReadDraft, /draft === false|draft !== false/);
   assert.doesNotMatch(restore, /draft === false|draft !== false/);
-  assert.match(acceptance, /const \[historyMode, setHistoryMode\] = useState\(false\)/);
-  assert.match(acceptance, /const historyModeRef = useRef\(false\)/);
-  assert.match(acceptance, /const preHistoryAcceptanceRef = useRef<Acceptance \| null>\(null\)/);
+  assert.match(acceptance, /const \[historyMode, setHistoryMode\] = useState\(!!latestFormalAcceptance\)/);
   assert.match(acceptance, /if \(skipNextDraftWrite\.current\) \{\s*skipNextDraftWrite\.current = false;\s*return;/);
   assert.match(acceptance, /if \(historyModeRef\.current\) return;/);
   assert.match(acceptance, /writeLocalDraft\(draftKey\(authUserId, "accept", u\.id\), a, authUserId\)/);
   assert.match(acceptance, /rows=\{u\.acceptances\.map/);
-  assert.match(acceptance, /onOpen: \(\) => \{ if \(!historyModeRef\.current\) preHistoryAcceptanceRef\.current = a; historyModeRef\.current = true; acceptanceDraftActiveRef\.current = false; setHistoryMode\(true\); setA\(x\)/);
+  assert.match(acceptance, /onOpen: \(\) => openAcceptanceRecord\(x\)/);
+  assert.match(acceptance, /if \(!historyModeRef\.current\) preHistoryAcceptanceRef\.current = a;[\s\S]*historyModeRef\.current = true;[\s\S]*acceptanceDraftActiveRef\.current = false;[\s\S]*setA\(record\)/);
   assert.match(acceptance, /acceptances: \[completed, \.\.\.u\.acceptances\.filter/);
   assert.match(acceptance, /const savingHistory = historyModeRef\.current/);
   assert.match(acceptance, /if \(!savingHistory\) await removeDurableDraft/);
@@ -770,8 +1014,8 @@ test("acceptance editor remounts by unit and rejects stale cross-unit draft rest
   assert.doesNotMatch(acceptance, /localStorage\.removeItem|removeOfflineDraft|deleteOfflineDraft/);
   assert.match(acceptance, /if \(savingHistory\) \{\s*const resumeAcceptance = preHistoryAcceptanceRef\.current;\s*skipNextDraftWrite\.current = true;\s*historyModeRef\.current = false;\s*acceptanceDraftActiveRef\.current = true;/);
   assert.match(acceptance, /setHistoryMode\(false\);\s*if \(resumeAcceptance\) setA\(resumeAcceptance\)/);
-  const historyOpen = acceptance.slice(acceptance.indexOf("onOpen: () => { if (!historyModeRef.current) preHistoryAcceptanceRef.current = a"));
-  assert.doesNotMatch(historyOpen.split("}," )[0], /removeDurableDraft/);
+  const historyOpen = acceptance.slice(acceptance.indexOf("openAcceptanceRecord ="), acceptance.indexOf("exitAcceptanceHistory ="));
+  assert.doesNotMatch(historyOpen, /removeDurableDraft/);
   assert.match(acceptance, /if \(historyModeRef\.current\) return setSaved\("歷史驗收只能正式保存；原本未完成草稿不會被覆蓋"\)/);
   assert.match(restore, /let active = true/);
   assert.match(restore, /if \(!active \|\| !draft/);
@@ -781,8 +1025,23 @@ test("acceptance editor remounts by unit and rejects stale cross-unit draft rest
 
 test("shipment preview exposes the company summary fields without changing other exporters", async () => {
   const page = await read("app/page.tsx");
-  for (const value of ["出貨日期", "客戶名稱", "商品", "片／件 *0.3025", "單價／元", "進價／元", "record.areaSquareMeters", "record.areaPing", "record.unitPrice", "record.amount", "record.vendor"])
-    assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const daily = page.slice(page.indexOf("function DailyAcceptanceView"), page.indexOf("function Dashboard"));
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
+  for (const preview of [daily, billing]) {
+    assert.match(preview, /<thead><tr><th>操作<\/th><th>出貨日期<\/th>/);
+  }
+  assert.match(daily, /<td><button type="button" className="primary" disabled=\{!!reportDraft\} onClick=\{\(\) => startDailyReportEdit\(record, index\)\}>修改<\/button><\/td><td>\{display\.shipmentDateText\}<\/td>/);
+  assert.match(billing, /<td><button type="button" className="primary" disabled=\{!!shipmentReportDraft\} onClick=\{\(\) => startShipmentReportEdit\(record, index\)\}>修改<\/button><\/td><td>\{display\.shipmentDateText\}<\/td>/);
+  assert.match(billing, /shipmentRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
+  for (const field of [
+    "shipmentDateText", "sequenceText", "customerNameText", "productText", "unitDisplayText", "squareMetersText",
+    "pingText", "unitPriceText", "amountText", "vendorText", "purchasePriceText", "noteText",
+    "signedOriginal", "signedCopy", "incomingVoOriginal", "incomingVoCopy", "outgoingVoOriginal", "outgoingVoCopy",
+    "submitted", "vendorInvoice", "tier", "payable", "profitPercent", "profit",
+  ]) for (const preview of [daily, billing]) assert.match(preview, new RegExp(`display\\.${field}`));
+  for (const heading of ["出貨日期", "序號", "客戶名稱", "商品", "戶別", "m²", "片／件 *0.3025", "單價／元", "合計", "廠商", "進價／元", "備註", "簽單正", "簽單影", "進VO正", "進VO影", "銷VO正", "銷VO影", "送單", "廠商帳單", "級距", "應付", "利潤%", "利潤"])
+    for (const preview of [daily, billing]) assert.match(preview, new RegExp(`<th>${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}<\\/th>`));
+  assert.match(billing, /<ReportMetadataEditor draft=\{shipmentReportDraft\}/);
 });
 
 test("overlapping saves keep the newest local state pending until Supabase confirms it", async () => {

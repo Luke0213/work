@@ -8,7 +8,8 @@ import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, t
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
 import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
-import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, saveReceivableWorkbook, saveShipmentWorkbook } from "../lib/acceptance-exports";
+import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDraftTotals, saveReceivableWorkbook, saveShipmentWorkbook, shipmentDisplayValues, type AcceptanceExportRecord, type AcceptanceReportMetadata, type ReceivableExportDraft } from "../lib/acceptance-exports";
+import { companyReportConfig } from "../lib/company-report-config";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
 import { AUTH_TIMEOUT_MS, AuthResolveGuard, resolveAuthIdentity, withAuthTimeout, type AuthIdentity } from "../lib/auth-session";
@@ -169,6 +170,7 @@ type Acceptance = {
   recheck?: boolean;
   startedAt?: string;
   draft?: boolean;
+  report?: AcceptanceReportMetadata;
 };
 type Unit = {
   id: string;
@@ -1595,7 +1597,6 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
               role={appRole}
               activity={activity.find((item) => item.entityType === "unit" && item.entityId === unit.id)}
               patch={patchUnit}
-              patchProject={patchProject}
               addEvent={addEvent}
               floorContext={floorContext}
               floorUnits={floorContext ? floorUnitsFor(project.units, floorContext.building, floorContext.floor) : []}
@@ -1803,26 +1804,16 @@ function ProjectOnboarding({
   const authUserId = useAuthOwner();
   const emptyRow = { building: "", floor: "", number: "", model: "", colorNo: "", estimated: "", areaUnit: "坪" as AreaUnit, note: "" };
   const onboardingKey = draftKey(authUserId, "project-onboarding", "new");
-  const recovered = readDraft(onboardingKey, { step: 1, basic: { name: "", address: "", builder: "", contact: "", phone: "", expectedDate: "", note: "" }, products: catalog, product: { id: id(), brand: "", model: "", colorNo: "", spec: "", note: "" } as Product, rows: [{ ...emptyRow }] });
-  const [step, setStep] = useState(recovered.step);
-  const [basic, setBasic] = useState(recovered.basic);
-  const [products, setProducts] = useState<Product[]>(recovered.products);
-  const [product, setProduct] = useState<Product>(recovered.product);
-  const [rows, setRows] = useState(recovered.rows);
+  const [step, setStep] = useState(1);
+  const [basic, setBasic] = useState({ name: "", address: "", builder: "", contact: "", phone: "", expectedDate: "", note: "" });
+  const [products, setProducts] = useState<Product[]>(catalog);
+  const [product, setProduct] = useState<Product>(() => ({ id: id(), brand: "", model: "", colorNo: "", spec: "", note: "" }));
+  const [rows, setRows] = useState([{ ...emptyRow }]);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
-  const [onboardingDraftReady, setOnboardingDraftReady] = useState(() => !!readLocal(onboardingKey));
   useEffect(() => {
-    if (readLocal(onboardingKey)) { setOnboardingDraftReady(true); return; }
-    void loadOfflineDraft<typeof recovered>(onboardingKey).then((saved) => {
-      if (saved) { setStep(saved.payload.step); setBasic(saved.payload.basic); setProducts(saved.payload.products); setProduct(saved.payload.product); setRows(saved.payload.rows); }
-      setOnboardingDraftReady(true);
-    }).catch(() => setOnboardingDraftReady(true));
+    void removeDurableDraft(onboardingKey);
   }, [onboardingKey]);
-  useEffect(() => {
-    if (!onboardingDraftReady) return;
-    writeLocalDraft(onboardingKey, { id: "project-onboarding-new", step, basic, products, product, rows }, authUserId);
-  }, [onboardingKey, onboardingDraftReady, step, basic, products, product, rows]);
   const addProduct = () => {
     if (!product.model.trim() || !product.colorNo.trim()) return setError("請填寫 SPC 編號與色號。");
     if (products.some((x) => x.model === product.model.trim() && x.colorNo === product.colorNo.trim())) return setError("此 SPC 編號與色號已存在，可直接在下一步選擇。");
@@ -1854,7 +1845,7 @@ function ProjectOnboarding({
   };
   return (
     <main className="onboarding-screen">
-      <header><div className="brand"><CompanyLogo /><div><b>建立新案場資料</b><small>固定欄位標準化</small></div></div><button className="ghost" onClick={cancel}>離開建立流程</button></header>
+      <header><div className="brand"><CompanyLogo /><div><b>建立新案場資料</b><small>固定欄位標準化</small></div></div><button className="ghost" onClick={() => { void removeDurableDraft(onboardingKey); cancel(); }}>離開建立流程</button></header>
       <section className="onboarding-wrap form">
         <div className="onboarding-steps"><span className={step >= 1 ? "active" : ""}>1 案場資料</span><span className={step >= 2 ? "active" : ""}>2 SPC產品</span><span className={step >= 3 ? "active" : ""}>3 戶別資料</span><span className={step >= 4 ? "active" : ""}>4 確認啟用</span></div>
         {step === 1 && <section className="panel form"><div><p className="eyebrow">前置統一表單</p><h1>案場基本資料</h1><p className="muted">所有工程節點與報告都會沿用，不必再次輸入。</p></div><div className="grid3">
@@ -1929,10 +1920,10 @@ function ProjectArea({
         ]}
       />
       {view === "dashboard" && (
-        <Dashboard p={project} open={open} setView={setView} />
+        <Dashboard p={project} setView={setView} />
       )}{" "}
       {view === "units" && <Units p={project} patch={patch} open={open} openFloor={openFloor} />}{" "}
-      {view === "daily-acceptance" && <DailyAcceptanceView p={project} />}{" "}
+      {view === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} />}{" "}
       {view === "products" && <Products p={project} patch={patch} />}{" "}
       {view === "journal" && <Journal p={project} patch={patch} />}{" "}
       {view === "billing" && <Billing p={project} patch={patch} />}{" "}
@@ -1940,7 +1931,95 @@ function ProjectArea({
     </>
   );
 }
-function DailyAcceptanceView({ p }: { p: Project }) {
+type ReportSourceDraft = {
+  unitId: string;
+  acceptanceId: string;
+  shipmentDateText: string;
+  sequenceText: string;
+  customerNameText: string;
+  productText: string;
+  unitDisplayText: string;
+  squareMetersText: string;
+  pingText: string;
+  unitPriceText: string;
+  amountText: string;
+  vendorText: string;
+  purchasePriceText: string;
+  noteText: string;
+  signedOriginal: boolean;
+  signedCopy: boolean;
+  incomingVoOriginal: string;
+  incomingVoCopy: string;
+  outgoingVoOriginal: string;
+  outgoingVoCopy: string;
+  submitted: string;
+  vendorInvoice: string;
+  tier: string;
+  payable: string;
+  profitPercent: string;
+  profit: string;
+};
+
+const reportSourceDraftFor = (record: AcceptanceExportRecord, index: number, unit: Unit, acceptance: Acceptance): ReportSourceDraft => {
+  const display = shipmentDisplayValues(record, index);
+  return {
+    unitId: unit.id, acceptanceId: acceptance.id,
+    ...display,
+  };
+};
+
+const updateReportSource = (unit: Unit, draft: ReportSourceDraft): Unit => ({
+  ...unit,
+  acceptances: unit.acceptances.map((acceptance) => acceptance.id === draft.acceptanceId
+    ? { ...acceptance, report: {
+        ...acceptance.report,
+        shipmentDateText: draft.shipmentDateText, sequenceText: draft.sequenceText,
+        customerNameText: draft.customerNameText, productText: draft.productText,
+        unitDisplayText: draft.unitDisplayText, squareMetersText: draft.squareMetersText,
+        pingText: draft.pingText, unitPriceText: draft.unitPriceText, amountText: draft.amountText,
+        vendorText: draft.vendorText, purchasePriceText: draft.purchasePriceText, noteText: draft.noteText,
+        signedOriginal: draft.signedOriginal, signedCopy: draft.signedCopy,
+        incomingVoOriginal: draft.incomingVoOriginal, incomingVoCopy: draft.incomingVoCopy,
+        outgoingVoOriginal: draft.outgoingVoOriginal, outgoingVoCopy: draft.outgoingVoCopy,
+        submitted: draft.submitted, vendorInvoice: draft.vendorInvoice, tier: draft.tier,
+        payable: draft.payable, profitPercent: draft.profitPercent, profit: draft.profit,
+      } }
+    : acceptance),
+});
+
+function ReportMetadataEditor({ draft, setDraft }: { draft: ReportSourceDraft; setDraft: (draft: ReportSourceDraft) => void }) {
+  return <><div className="grid3">
+    <Field label="出貨日期" value={draft.shipmentDateText} set={(shipmentDateText: string) => setDraft({ ...draft, shipmentDateText })} />
+    <Field label="序號" value={draft.sequenceText} set={(sequenceText: string) => setDraft({ ...draft, sequenceText })} />
+    <Field label="客戶名稱" value={draft.customerNameText} set={(customerNameText: string) => setDraft({ ...draft, customerNameText })} />
+    <Field label="商品" value={draft.productText} set={(productText: string) => setDraft({ ...draft, productText })} />
+    <Field label="戶別" value={draft.unitDisplayText} set={(unitDisplayText: string) => setDraft({ ...draft, unitDisplayText })} />
+    <Field label="m²" value={draft.squareMetersText} set={(squareMetersText: string) => setDraft({ ...draft, squareMetersText })} />
+    <Field label="片／件 *0.3025" value={draft.pingText} set={(pingText: string) => setDraft({ ...draft, pingText })} />
+    <Field label="單價／元" value={draft.unitPriceText} set={(unitPriceText: string) => setDraft({ ...draft, unitPriceText })} />
+    <Field label="合計" value={draft.amountText} set={(amountText: string) => setDraft({ ...draft, amountText })} />
+    <Field label="廠商" value={draft.vendorText} set={(vendorText: string) => setDraft({ ...draft, vendorText })} />
+    <Field label="進價／元" value={draft.purchasePriceText} set={(purchasePriceText: string) => setDraft({ ...draft, purchasePriceText })} />
+    <Field label="備註" value={draft.noteText} set={(noteText: string) => setDraft({ ...draft, noteText })} />
+  </div><div className="completion-checks">
+    <label className="check"><input type="checkbox" checked={draft.signedOriginal} onChange={(event) => setDraft({ ...draft, signedOriginal: event.target.checked })} />簽單正</label>
+    <label className="check"><input type="checkbox" checked={draft.signedCopy} onChange={(event) => setDraft({ ...draft, signedCopy: event.target.checked })} />簽單影</label>
+  </div><div className="grid3">
+    <Field label="進VO正" value={draft.incomingVoOriginal} set={(incomingVoOriginal: string) => setDraft({ ...draft, incomingVoOriginal })} />
+    <Field label="進VO影" value={draft.incomingVoCopy} set={(incomingVoCopy: string) => setDraft({ ...draft, incomingVoCopy })} />
+    <Field label="銷VO正" value={draft.outgoingVoOriginal} set={(outgoingVoOriginal: string) => setDraft({ ...draft, outgoingVoOriginal })} />
+    <Field label="銷VO影" value={draft.outgoingVoCopy} set={(outgoingVoCopy: string) => setDraft({ ...draft, outgoingVoCopy })} />
+    <Field label="送單" value={draft.submitted} set={(submitted: string) => setDraft({ ...draft, submitted })} />
+    <Field label="廠商帳單" value={draft.vendorInvoice} set={(vendorInvoice: string) => setDraft({ ...draft, vendorInvoice })} />
+    <Field label="級距" value={draft.tier} set={(tier: string) => setDraft({ ...draft, tier })} />
+    <Field label="應付" value={draft.payable} set={(payable: string) => setDraft({ ...draft, payable })} />
+    <Field label="利潤%" value={draft.profitPercent} set={(profitPercent: string) => setDraft({ ...draft, profitPercent })} />
+    <Field label="利潤" value={draft.profit} set={(profit: string) => setDraft({ ...draft, profit })} />
+  </div></>;
+}
+
+function DailyAcceptanceView({ p, patch }: { p: Project; patch: (x: Partial<Project>) => void }) {
+  const authUserId = useAuthOwner();
   const entries = useMemo(() => buildDailyAcceptanceEntries<Acceptance, Unit>(p.units), [p.units]);
   const dates = [...new Set(entries.map((entry) => entry.date))];
   const [selectedDate, setSelectedDate] = useState(() => {
@@ -1948,29 +2027,52 @@ function DailyAcceptanceView({ p }: { p: Project }) {
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   });
   const [selected, setSelected] = useState<(typeof entries)[number] | null>(null);
+  const [reportDraft, setReportDraft] = useState<ReportSourceDraft | null>(null);
+  const [reportMessage, setReportMessage] = useState("");
+  const [shipmentPreview, setShipmentPreview] = useState(false);
+  const [shipmentExporting, setShipmentExporting] = useState(false);
   const records = entries.filter((entry) => entry.date === selectedDate);
+  const dailyExportRecords = records.map(({ unit, acceptance }) => buildAcceptanceExportRecord(p, unit, acceptance, true));
   const exportDay = () => {
-    const exportRecords = records.map(({ unit, acceptance }) => buildAcceptanceExportRecord(p, unit, acceptance, true));
-    const workbook = createShipmentWorkbook(p, exportRecords, selectedDate.slice(0, 7));
+    const workbook = createShipmentWorkbook(p, dailyExportRecords, selectedDate.slice(0, 7));
     saveShipmentWorkbook(workbook, `${selectedDate}_${p.name}_SPC已出貨明細總表.xlsx`);
+  };
+  const startDailyReportEdit = (record: AcceptanceExportRecord, index: number) => {
+    const entry = records[index];
+    if (!entry || entry.unit.id !== record.unitId) return setReportMessage("找不到原正式驗收紀錄，未開啟修改");
+    setReportDraft(reportSourceDraftFor(record, index, entry.unit, entry.acceptance));
+    setReportMessage("");
+  };
+  const saveReportSource = () => {
+    if (!reportDraft) return;
+    const currentUnit = p.units.find((unit) => unit.id === reportDraft.unitId);
+    const currentAcceptance = currentUnit?.acceptances.find((acceptance) => acceptance.id === reportDraft.acceptanceId && acceptance.draft !== true);
+    if (!currentUnit || !currentAcceptance) return setReportMessage("找不到原正式驗收紀錄，未保存任何修改");
+    const updatedUnit = updateReportSource(currentUnit, reportDraft);
+    const updatedAcceptance = updatedUnit.acceptances.find((acceptance) => acceptance.id === reportDraft.acceptanceId)!;
+    patch({ units: p.units.map((unit) => unit.id === updatedUnit.id ? updatedUnit : unit) });
+    queueRecordChange(authUserId, "accept", updatedUnit.id, updatedAcceptance, "complete");
+    setReportDraft(null);
+    setSelected(null);
+    setReportMessage("✓ 正式報表來源資料已保存");
   };
   return (
     <div className="form daily-acceptance-view">
       <section className="panel">
         <div className="panel-head">
           <div><p className="eyebrow">案場正式驗收紀錄</p><h2>今日驗收</h2><p>依驗收／複驗紀錄本身的日期顯示，不含草稿。</p></div>
-          <button className="primary" disabled={!records.length} onClick={exportDay}>匯出當日細總表 Excel</button>
+          <button className="primary" disabled={!records.length || !!reportDraft} onClick={() => { setShipmentPreview(true); setReportMessage(""); }}>{reportDraft ? "請先保存或取消修改" : "當日總細表"}</button>
         </div>
         <div className="daily-acceptance-summary">
-          <label className="field"><span>日期</span><input type="date" value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)} /></label>
+          <label className="field"><span>日期</span><input type="date" value={selectedDate} onChange={(event) => reportDraft ? setReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換日期。") : setSelectedDate(event.target.value)} /></label>
           <article><span>當日正式驗收筆數</span><b>{records.length}</b></article>
         </div>
         <div className="table-wrap">
           <table>
             <thead><tr><th>棟／區域</th><th>樓層</th><th>戶別</th><th>型號</th><th>色號</th><th>坪數</th><th>驗收人</th><th>驗收結果</th><th>紀錄類型</th></tr></thead>
             <tbody>
-              {records.map((entry) => <tr key={`${entry.unit.id}-${entry.acceptance.id}`} className="clickable-row" onClick={() => setSelected(entry)}>
-                <td>{entry.unit.building || "—"}</td><td>{entry.unit.floor || "—"}</td><td>{entry.unit.number || "—"}</td><td>{entry.unit.model || "—"}</td><td>{entry.unit.colorNo || "—"}</td><td>{entry.acceptance.area || entry.unit.estimated || 0} 坪</td><td>{entry.acceptance.person || "—"}</td><td>{entry.acceptance.result}</td><td>{entry.acceptance.recheck ? "複驗" : "驗收"}</td>
+              {records.map((entry) => <tr key={`${entry.unit.id}-${entry.acceptance.id}`} className="clickable-row" onClick={() => { setSelected(entry); setReportDraft(null); setReportMessage(""); }}>
+                <td>{entry.unit.building || "—"}</td><td>{entry.unit.floor || "—"}</td><td>{entry.unit.number || "—"}</td><td>{entry.unit.model || "—"}</td><td>{entry.unit.colorNo || "—"}</td><td>{entry.acceptance.area ?? entry.unit.estimated ?? 0} 坪</td><td>{entry.acceptance.person || "—"}</td><td>{entry.acceptance.result}</td><td>{entry.acceptance.recheck ? "複驗" : "驗收"}</td>
               </tr>)}
               {!records.length && <tr><td colSpan={9}>此日期沒有正式驗收紀錄。</td></tr>}
             </tbody>
@@ -1980,14 +2082,15 @@ function DailyAcceptanceView({ p }: { p: Project }) {
       <section className="panel">
         <div className="panel-head"><div><h2>歷史驗收紀錄</h2><p>點選日期查看該日所有正式驗收與複驗。</p></div></div>
         <div className="daily-acceptance-history">
-          {dates.map((date) => <button key={date} className={selectedDate === date ? "primary" : "ghost"} onClick={() => setSelectedDate(date)}><b>{date.replaceAll("-", "/")}</b><span>{entries.filter((entry) => entry.date === date).length} 筆</span></button>)}
+          {dates.map((date) => <button key={date} className={selectedDate === date ? "primary" : "ghost"} onClick={() => reportDraft ? setReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換日期。") : setSelectedDate(date)}><b>{date.replaceAll("-", "/")}</b><span>{entries.filter((entry) => entry.date === date).length} 筆</span></button>)}
           {!dates.length && <p>尚無正式驗收紀錄。</p>}
         </div>
       </section>
-      {selected && <Modal close={() => setSelected(null)} title={`${selected.acceptance.recheck ? "複驗" : "驗收"}詳細內容｜${selected.date}`}>
-        <RecordConfirmation title={`${selected.unit.building} ${selected.unit.floor}-${selected.unit.number}`} rows={[
+      {reportMessage && <div className="save-success">{reportMessage}</div>}
+      {selected && <Modal close={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setSelected(null); setReportMessage(""); }} title={`${selected.acceptance.recheck ? "複驗" : "驗收"}詳細內容｜${selected.date}`}>
+        {!reportDraft ? <><RecordConfirmation title={`${selected.unit.building} ${selected.unit.floor}-${selected.unit.number}`} rows={[
           ["型號／色號", `${selected.unit.model || "—"}／${selected.unit.colorNo || "—"}`],
-          ["驗收坪數", `${selected.acceptance.area || selected.unit.estimated || 0} 坪`],
+          ["驗收坪數", `${selected.acceptance.area ?? selected.unit.estimated ?? 0} 坪`],
           ["驗收人", selected.acceptance.person || "—"],
           ["驗收結果", selected.acceptance.result],
           ["紀錄類型", selected.acceptance.recheck ? "複驗" : "驗收"],
@@ -1995,17 +2098,30 @@ function DailyAcceptanceView({ p }: { p: Project }) {
           ["檢查項目", selected.acceptance.items.map((item) => `${item.label}：${item.result || "未填"}`).join("；")],
         ]} />
         <PhotoGrid photos={selected.acceptance.photos || []} />
+        <div className="form-actions"><button type="button" className="primary" onClick={() => { setReportDraft(reportSourceDraftFor(buildAcceptanceExportRecord(p, selected.unit, selected.acceptance, true), records.findIndex((entry) => entry.acceptance.id === selected.acceptance.id), selected.unit, selected.acceptance)); setReportMessage(""); }}>修改報表資料</button></div></> : <div className="form">
+          <div className="warning">確認保存後會更新此戶別及同一筆正式驗收的報表來源資料；不會重新完成驗收或改變工程狀態。</div>
+          <ReportMetadataEditor draft={reportDraft} setDraft={setReportDraft} />
+          {reportMessage && <div className="form-error">{reportMessage}</div>}
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div>
+        </div>}
+      </Modal>}
+      {shipmentPreview && <Modal close={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }} title="當日總細表｜匯出預覽">
+        <div className="form export-preview">
+          <div className="export-summary"><span>日期<b>{selectedDate}</b></span><span>案場<b>{p.name}</b></span><span>正式驗收筆數<b>{dailyExportRecords.length}</b></span></div>
+          <div className="export-preview-table"><table><thead><tr><th>操作</th><th>出貨日期</th><th>序號</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th><th>簽單正</th><th>簽單影</th><th>進VO正</th><th>進VO影</th><th>銷VO正</th><th>銷VO影</th><th>送單</th><th>廠商帳單</th><th>級距</th><th>應付</th><th>利潤%</th><th>利潤</th></tr></thead><tbody>{dailyExportRecords.map((record, index) => { const display = shipmentDisplayValues(record, index); return <tr key={`${record.unitId}-${index}`}><td><button type="button" className="primary" disabled={!!reportDraft} onClick={() => startDailyReportEdit(record, index)}>修改</button></td><td>{display.shipmentDateText}</td><td>{display.sequenceText}</td><td>{display.customerNameText}</td><td>{display.productText}</td><td>{display.unitDisplayText}</td><td>{display.squareMetersText}</td><td>{display.pingText}</td><td>{display.unitPriceText}</td><td>{display.amountText}</td><td>{display.vendorText}</td><td>{display.purchasePriceText}</td><td>{display.noteText}</td><td>{display.signedOriginal ? "✓" : ""}</td><td>{display.signedCopy ? "✓" : ""}</td><td>{display.incomingVoOriginal}</td><td>{display.incomingVoCopy}</td><td>{display.outgoingVoOriginal}</td><td>{display.outgoingVoCopy}</td><td>{display.submitted}</td><td>{display.vendorInvoice}</td><td>{display.tier}</td><td>{display.payable}</td><td>{display.profitPercent}</td><td>{display.profit}</td></tr>; })}</tbody></table></div>
+          {reportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；請先保存或取消後再產生 Excel。</div><ReportMetadataEditor draft={reportDraft} setDraft={setReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div></section>}
+          {reportMessage && <div className={reportMessage.startsWith("✓") ? "save-success" : "form-error"}>{reportMessage}</div>}
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }}>返回</button><button type="button" className="primary" disabled={shipmentExporting || !dailyExportRecords.length || !!reportDraft} onClick={async () => { setShipmentExporting(true); try { exportDay(); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : reportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
+        </div>
       </Modal>}
     </div>
   );
 }
 function Dashboard({
   p,
-  open,
   setView,
 }: {
   p: Project;
-  open: (x: string) => void;
   setView: (x: string) => void;
 }) {
   const authUserId = useAuthOwner();
@@ -2033,35 +2149,12 @@ function Dashboard({
     done: p.units.filter((u) => ["已驗收", "已計價"].includes(u.status)),
   };
   const tasks = {
-      survey: p.units.filter((u) => getUnitCurrentStatus(u) === "待場勘"),
       fix: p.units.filter((u) => getUnitCurrentStatus(u) === "改善中"),
-      accept: p.units.filter((u) => getUnitCurrentStatus(u) === "待驗收"),
       overdue: p.units.filter((u) => overdueIds.has(u.id)),
     },
-    all = [
-      ...new Map(
-        [...tasks.overdue, ...tasks.fix, ...tasks.accept, ...tasks.survey].map(
-          (u) => [u.id, u],
-        ),
-      ).values(),
-    ],
     percent = p.units.length
       ? Math.round((groups.done.length / p.units.length) * 100)
       : 0;
-  const taskText = (u: Unit) =>
-    overdueIds.has(u.id)
-      ? u.defects.find((d) => d.status !== "已完成" && d.due && d.due < day())
-          ?.content || "缺失改善已逾期"
-      : u.status === "待驗收"
-        ? "施工完成，等待安排驗收"
-        : u.status === "待複驗"
-          ? "改善完成，等待複驗"
-          : u.status === "場勘待改善"
-            ? "場勘條件尚未符合進場要求"
-            : u.status === "驗收缺失" || u.status === "改善中"
-              ? u.defects.find((d) => d.status !== "已完成")?.content ||
-                "驗收缺失待改善"
-              : "等待安排現場場勘";
   const total = Math.max(p.units.length, 1),
     surveyEnd = (groups.survey.length / total) * 100,
     workEnd = surveyEnd + (groups.work.length / total) * 100,
@@ -2093,39 +2186,19 @@ function Dashboard({
           <DashAlert icon="◷" label="逾期戶" count={tasks.overdue.length} tone="red" active={false} click={() => go("__overdue")} />
         </div>
       </section>
-      <section className="dash-card task-card">
+      <section className="dash-card task-card dashboard-project-data">
         <div className="dash-card-head">
-          <div><h2>待處理戶別</h2><small>點擊戶別可直接開啟詳細資料</small></div>
+          <div><h2>專案資料</h2><small>目前全案共用的正式專案資料</small></div>
         </div>
-        {all.slice(0, 6).map((u) => (
-          <button className="task-row" key={u.id} onClick={() => open(u.id)}>
-            <span
-              className={`task-icon ${overdueIds.has(u.id) ? "red" : u.status.includes("驗收") || u.status === "待複驗" ? "blue" : u.status.includes("改善") ? "amber" : "green"}`}
-            >
-              {overdueIds.has(u.id)
-                ? "!"
-                : u.status.includes("驗收") || u.status === "待複驗"
-                  ? "▣"
-                  : u.status.includes("改善")
-                    ? "⌘"
-                    : "◷"}
-            </span>
-            <span className="task-main">
-              <b>
-                {u.building}｜{u.floor}｜{u.number}
-              </b>
-              <em>{taskText(u)}</em>
-              <small>目前狀態：{u.status}</small>
-            </span>
-            <span
-              className={`mini-status ${overdueIds.has(u.id) ? "red" : ""}`}
-            >
-              {overdueIds.has(u.id) ? "已逾期" : u.status}
-            </span>
-            <strong>›</strong>
-          </button>
-        ))}
-        {!all.length && <p className="clear-state">目前沒有待處理戶別。</p>}
+        <RecordConfirmation title="專案基本資料" rows={[
+          ["建案名稱", p.name || "—"],
+          ["案場地址", p.address || "—"],
+          ["建設公司", p.builder || "—"],
+          ["工地窗口", p.contact || "—"],
+          ["聯絡資訊", p.phone || "—"],
+          ["預計工程日期", p.expectedDate || "—"],
+          ["備註", p.note || "—"],
+        ]} />
       </section>
     </div>
   );
@@ -2247,14 +2320,11 @@ function Units({
     [batch, setBatch] = useState(!!recoveredCreate.batch),
     [rows, setRows] = useState(recoveredCreate.rows?.length ? recoveredCreate.rows : [{ ...empty }]),
     [error, setError] = useState(""),
-    [selected, setSelected] = useState<string[]>([]),
-    [bulkMode, setBulkMode] = useState(false),
     [expanded, setExpanded] = useState<string[]>([]),
     [openBuildings, setOpenBuildings] = useState<string[]>([]),
     [filtersOpen, setFiltersOpen] = useState(false),
     [areaDisplayUnit, setAreaDisplayUnit] = useState<AreaUnit>("坪"),
     [creating, setCreating] = useState(false),
-    [batchStatus, setBatchStatus] = useState<Status>("待場勘"),
     [creationDraftReady, setCreationDraftReady] = useState(() => !!readLocal(draftKey(authUserId, "unit-create", p.id)));
   useEffect(() => {
     if (!creationDraftReady) return;
@@ -2336,45 +2406,7 @@ function Units({
     ].filter(Boolean);
   const buildingNames = [
       ...new Set(shown.map((u) => u.building || "未分類棟")),
-    ].sort((a, b) => a.localeCompare(b, "zh-Hant", { numeric: true })),
-    toggleMany = (ids: string[], checked: boolean) =>
-      setSelected((xs) =>
-        checked
-          ? [...new Set([...xs, ...ids])]
-          : xs.filter((x) => !ids.includes(x)),
-      ),
-    allShownSelected =
-      shown.length > 0 && shown.every((u) => selected.includes(u.id)),
-    applyBatch = () => {
-      if (!selected.length) return;
-      const chosen = p.units.filter((u) => selected.includes(u.id)),
-        original = [...new Set(chosen.map((u) => u.status))],
-        when = stamp(),
-        mixed = original.length > 1,
-        summary = `即將變更 ${chosen.length} 戶工程狀態。\n\n選取戶數：${chosen.length} 戶\n原本狀態：${original.join("、")}${mixed ? "（包含不同原始狀態，請特別確認）" : ""}\n新狀態：${batchStatus}\n操作日期：${when}\n\n是否確認？`;
-      if (!confirm(summary)) return;
-      patch({
-        units: p.units.map((u) =>
-          selected.includes(u.id)
-            ? {
-                ...u,
-                status: batchStatus,
-                events: [
-                  {
-                    id: id(),
-                    at: when,
-                    title: "批次變更工程狀態",
-                    detail: `由 ${u.status} 更新為 ${batchStatus}`,
-                    photos: [],
-                  },
-                  ...u.events,
-                ],
-              }
-            : u,
-        ),
-      });
-      setSelected([]);
-    };
+    ].sort((a, b) => a.localeCompare(b, "zh-Hant", { numeric: true }));
   useEffect(() => {
     setOpenBuildings((current) => {
       const next = current.filter((name) => buildingNames.includes(name));
@@ -2738,10 +2770,7 @@ function Units({
                 <select
                   key={i}
                   value={x[0]}
-                  onChange={(e) => {
-                    x[1](e.target.value);
-                    setSelected([]);
-                  }}
+                  onChange={(e) => x[1](e.target.value)}
                 >
                   <option value="">{x[3]}：全部</option>
                   {x[2].map((v: string) => (
@@ -2770,54 +2799,12 @@ function Units({
                   setM("");
                   setColor("");
                   setStatus("");
-                  setSelected([]);
                 }}
               >
                 清除篩選
               </button>
             </div>
           )}
-          <div className="bulk-toolbar">
-            {!bulkMode ? (
-              <button className="ghost bulk-mode-toggle" onClick={() => setBulkMode(true)}>
-                批次操作
-              </button>
-            ) : <label>
-                <input
-                  type="checkbox"
-                  checked={allShownSelected}
-                  onChange={(e) =>
-                    toggleMany(
-                      shown.map((u) => u.id),
-                      e.target.checked,
-                    )
-                  }
-                />{" "}
-                全選目前篩選結果（{shown.length} 戶）
-              </label>}
-            {bulkMode && selected.length > 0 && (
-              <div>
-                <b>已選 {selected.length} 戶</b>
-                <select
-                  value={batchStatus}
-                  onChange={(e) => setBatchStatus(e.target.value as Status)}
-                >
-                  {statuses.map((s) => (
-                    <option key={s}>{s}</option>
-                  ))}
-                </select>
-                <button className="primary" onClick={applyBatch}>
-                  批次變更狀態
-                </button>
-                <button className="ghost" onClick={() => { setSelected([]); setBulkMode(false); }}>
-                  取消選取
-                </button>
-              </div>
-            )}
-            {bulkMode && selected.length === 0 && (
-              <button className="ghost" onClick={() => setBulkMode(false)}>結束批次操作</button>
-            )}
-          </div>
           <div className="building-groups">
             {buildingNames.map((building) => {
               const buildingUnits = shown.filter(
@@ -2857,9 +2844,6 @@ function Units({
                       ),
                       groupKey = `${building}__${floor}`,
                       isOpen = expanded.includes(groupKey),
-                      floorSelected = floorUnits.every((u) =>
-                        selected.includes(u.id),
-                      ),
                       floorStates = unitProgressStatuses
                         .map(
                           (s) =>
@@ -2873,20 +2857,8 @@ function Units({
                     return (
                       <div className="floor-group" key={groupKey}>
                         <div
-                          className={`${isOpen ? "floor-head open" : "floor-head"}${bulkMode ? " bulk" : ""}`}
+                          className={isOpen ? "floor-head open" : "floor-head"}
                         >
-                          {bulkMode && <label className="floor-check" onClick={(e) => e.stopPropagation()}>
-                            <input
-                              type="checkbox"
-                              checked={floorSelected}
-                              onChange={(e) =>
-                                toggleMany(
-                                  floorUnits.map((u) => u.id),
-                                  e.target.checked,
-                                )
-                              }
-                            />
-                          </label>}
                           <button
                             className="floor-row-main"
                             onClick={() =>
@@ -2911,31 +2883,22 @@ function Units({
                               {isOpen ? "⌃" : "›"}
                             </span>
                           </button>
-                          {!bulkMode && <button className="floor-acceptance-entry" type="button" onClick={() => openFloor(
+                          <button className="floor-acceptance-entry" type="button" onClick={() => openFloor(
                             floorUnits[0]?.building || (building === "未分類棟" ? "" : building),
                             floorUnits[0]?.floor || (floor === "未分類樓層" ? "" : floor),
                           )}>
                             <b>驗收／簽名</b>
                             <small>{acceptanceSummary.allQualified ? `✓ ${acceptanceSummary.total} / ${acceptanceSummary.total} 全部合格` : `合格 ${acceptanceSummary.qualified} · 待處理 ${acceptanceSummary.needsAction} · 未驗收 ${acceptanceSummary.uninspected}`}</small>
-                          </button>}
+                          </button>
                         </div>
                         {isOpen && (
                           <div className="unit-cards">
                             {floorUnits.map((u) => (
                               <article
-                                className={`unit-card${bulkMode ? " bulk" : ""}`}
+                                className="unit-card"
                                 key={u.id}
                                 onClick={() => open(u.id)}
                               >
-                                {bulkMode && <label onClick={(e) => e.stopPropagation()}>
-                                  <input
-                                    type="checkbox"
-                                    checked={selected.includes(u.id)}
-                                    onChange={(e) =>
-                                      toggleMany([u.id], e.target.checked)
-                                    }
-                                  />
-                                </label>}
                                 <div>
                                   <b>{u.number || "未命名"}</b>
                                   <small>
@@ -3422,6 +3385,81 @@ function ProjectForm({
   p: Project;
   patch: (x: Partial<Project>) => void;
 }) {
+  type ProjectFormDraft = Pick<Project, "name" | "address" | "builder" | "contact" | "phone" | "expectedDate" | "note">;
+  const fields: Array<[keyof ProjectFormDraft, string]> = [
+    ["name", "建案名稱"], ["address", "案場地址"], ["builder", "建設公司"], ["contact", "工地窗口"],
+    ["phone", "聯絡資訊"], ["expectedDate", "預計工程日期"], ["note", "備註"],
+  ];
+  const fromProject = (project: Project): ProjectFormDraft => ({
+    name: project.name || "", address: project.address || "", builder: project.builder || "", contact: project.contact || "",
+    phone: project.phone || "", expectedDate: project.expectedDate || "", note: project.note || "",
+  });
+  const sameDraft = (left: ProjectFormDraft, right: ProjectFormDraft) => fields.every(([key]) => left[key] === right[key]);
+  const [draft, setDraft] = useState<ProjectFormDraft>(() => fromProject(p));
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
+  const syncedRef = useRef<ProjectFormDraft>(fromProject(p));
+  const projectIdRef = useRef(p.id);
+  const editedKeysRef = useRef(new Set<keyof ProjectFormDraft>());
+  const formal = fromProject(p);
+  const changes = fields.filter(([key]) => editedKeysRef.current.has(key) && draft[key] !== formal[key]);
+  const valid = !!draft.name.trim() && !!draft.address.trim();
+  useEffect(() => {
+    const next = fromProject(p);
+    if (projectIdRef.current !== p.id) {
+      projectIdRef.current = p.id;
+      syncedRef.current = next;
+      editedKeysRef.current.clear();
+      setDraft(next);
+      setConfirming(false);
+      setError("");
+      setSaved("");
+      return;
+    }
+    setDraft((current) => {
+      const hadUnsavedChanges = editedKeysRef.current.size > 0 && !sameDraft(current, syncedRef.current);
+      syncedRef.current = next;
+      if (!hadUnsavedChanges) { editedKeysRef.current.clear(); return next; }
+      const merged = { ...next };
+      editedKeysRef.current.forEach((key) => {
+        if (current[key] === next[key]) editedKeysRef.current.delete(key);
+        else merged[key] = current[key];
+      });
+      return merged;
+    });
+  }, [p.id, p.name, p.address, p.builder, p.contact, p.phone, p.expectedDate, p.note]);
+  const updateDraft = (key: keyof ProjectFormDraft, value: string) => {
+    editedKeysRef.current.add(key);
+    setDraft((current) => ({ ...current, [key]: value }));
+    setError("");
+    setSaved("");
+  };
+  const requestSave = () => {
+    if (!valid) return setError("建案名稱與案場地址不可空白。");
+    if (!changes.length) return;
+    setError("");
+    setConfirming(true);
+  };
+  const confirmSave = () => {
+    if (!valid) return setError("建案名稱與案場地址不可空白。");
+    if (!changes.length) { setConfirming(false); return; }
+    const changedKeys = new Set(changes.map(([key]) => key));
+    const applied: ProjectFormDraft = {
+      ...draft,
+      name: changedKeys.has("name") ? draft.name.trim() : draft.name,
+      address: changedKeys.has("address") ? draft.address.trim() : draft.address,
+    };
+    const updates: Partial<ProjectFormDraft> = {};
+    changes.forEach(([key]) => { (updates as any)[key] = applied[key]; });
+    patch(updates);
+    editedKeysRef.current.clear();
+    syncedRef.current = applied;
+    setDraft(applied);
+    setConfirming(false);
+    setError("");
+    setSaved("✓ 專案資料已更新");
+  };
   return (
     <div className="form">
       <section className="panel form">
@@ -3433,20 +3471,20 @@ function ProjectForm({
           </div>
         </div>
         <div className="grid3">
-          {[
-            ["name", "建案名稱"],
-            ["address", "案場地址"],
-            ["builder", "建設公司"],
-            ["contact", "工地窗口"],
-            ["phone", "聯絡資訊"],
-            ["note", "備註"],
-          ].map(([k, l]) => (
-            <Field key={k} label={l} value={(p as any)[k]} set={(v: string) => patch({ [k]: v })} />
-          ))}
-          <Field label="預計工程日期" type="date" value={p.expectedDate || ""} set={(expectedDate: string) => patch({ expectedDate })} />
+          {fields.map(([key, label]) => <Field key={key} label={label} type={key === "expectedDate" ? "date" : undefined} value={draft[key]} set={(value: string) => updateDraft(key, value)} />)}
         </div>
-        <div className="save-success">✓ 專案資料會自動保存在此裝置</div>
+        {error && <div className="form-error">{error}</div>}
+        {saved && <div className="save-success">{saved}</div>}
+        <div className="form-actions"><button type="button" className="primary" disabled={!changes.length} onClick={requestSave}>儲存修改</button></div>
       </section>
+      {confirming && <Modal close={() => setConfirming(false)} title="確認儲存專案資料">
+        <div className="form">
+          <div className="warning">以下資料將更新為全案共用的專案基本資料，後續畫面與報告將使用更新後的專案資料。</div>
+          <div className="table-wrap"><table><thead><tr><th>欄位</th><th>原本</th><th>修改後</th></tr></thead><tbody>{changes.map(([key, label]) => <tr key={key}><td>{label}</td><td>{formal[key] || "—"}</td><td>{draft[key] || "—"}</td></tr>)}</tbody></table></div>
+          {error && <div className="form-error">{error}</div>}
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => setConfirming(false)}>返回修改</button><button type="button" className="primary" disabled={!valid || !changes.length} onClick={confirmSave}>確認儲存</button></div>
+        </div>
+      </Modal>}
     </div>
   );
 }
@@ -3468,7 +3506,8 @@ function GlobalProducts({
     }),
     formDraftKey = draftKey(authUserId, "global-product", "new"),
     [form, setForm] = useState<Product>(() => readDraft(formDraftKey, blank())),
-    [q, setQ] = useState("");
+    [q, setQ] = useState(""),
+    [editingProductId, setEditingProductId] = useState("");
   useOfflineDraftRestore(formDraftKey, setForm);
   useEffect(() => { writeLocalDraft(formDraftKey, form, authUserId); }, [formDraftKey, form, authUserId]);
   const shown = products.filter((x) =>
@@ -3477,10 +3516,20 @@ function GlobalProducts({
       .toLowerCase()
       .includes(q.toLowerCase()),
   );
+  const resetForm = () => {
+    setEditingProductId("");
+    setForm(blank());
+  };
+  const beginEdit = (product: Product) => {
+    setEditingProductId(product.id);
+    setForm({ ...product });
+  };
   const add = () => {
+    if (!form.model.trim() || !form.colorNo.trim()) return;
     if (
       products.some(
         (x) =>
+          x.id !== editingProductId &&
           x.model.trim() === form.model.trim() &&
           x.colorNo.trim() === form.colorNo.trim(),
       )
@@ -3488,11 +3537,22 @@ function GlobalProducts({
       alert("此 SPC 編號與色號已存在，請勿重複建立。");
       return;
     }
-    setProducts([
-      { ...form, model: form.model.trim(), colorNo: form.colorNo.trim() },
-      ...products,
-    ]);
-    setForm(blank());
+    if (editingProductId) {
+      setProducts(products.map((product) => product.id === editingProductId ? {
+        ...product,
+        brand: form.brand,
+        model: form.model.trim(),
+        colorNo: form.colorNo.trim(),
+        spec: form.spec,
+        note: form.note,
+      } : product));
+    } else {
+      setProducts([
+        { ...form, model: form.model.trim(), colorNo: form.colorNo.trim() },
+        ...products,
+      ]);
+    }
+    resetForm();
     removeDurableDraft(formDraftKey);
     void removeOfflineDraft(formDraftKey);
   };
@@ -3508,7 +3568,7 @@ function GlobalProducts({
       <section className="panel form">
         <div className="panel-head">
           <div>
-            <h2>新增 SPC 產品</h2>
+            <h2>{editingProductId ? "修改 SPC 產品" : "新增 SPC 產品"}</h2>
             <p>同一個 SPC 編號可以建立多個不同色號。</p>
           </div>
         </div>
@@ -3539,13 +3599,16 @@ function GlobalProducts({
             set={(note) => setForm({ ...form, note })}
           />
         </div>
-        <button
-          className="primary"
-          disabled={!form.model.trim() || !form.colorNo.trim()}
-          onClick={add}
-        >
-          ＋ 新增至共用產品庫
-        </button>
+        <div className="form-actions">
+          {editingProductId && <button type="button" className="ghost" onClick={resetForm}>取消修改</button>}
+          <button
+            className="primary"
+            disabled={!form.model.trim() || !form.colorNo.trim()}
+            onClick={add}
+          >
+            {editingProductId ? "儲存修改" : "＋ 新增至共用產品庫"}
+          </button>
+        </div>
       </section>
       <section className="panel">
         <div className="panel-head product-list-head">
@@ -3582,7 +3645,8 @@ function GlobalProducts({
                   <td>{x.colorNo}</td>
                   <td>{x.spec || "—"}</td>
                   <td>{x.note || "—"}</td>
-                  <td>
+                  <td><div className="actions">
+                    <button type="button" className="ghost" onClick={() => beginEdit(x)}>修改</button>
                     <button
                       className="danger"
                       onClick={() =>
@@ -3592,7 +3656,7 @@ function GlobalProducts({
                     >
                       刪除
                     </button>
-                  </td>
+                  </div></td>
                 </tr>
               ))}
             </tbody>
@@ -3621,7 +3685,8 @@ function Products({
       note: "",
     })),
     [selected, setSelected] = useState(""),
-    [unitId, setUnitId] = useState("");
+    [unitId, setUnitId] = useState(""),
+    [editingProductId, setEditingProductId] = useState("");
   useOfflineDraftRestore(productDraftKey, setForm);
   useEffect(() => { writeLocalDraft(productDraftKey, form, authUserId); }, [productDraftKey, form, authUserId]);
   const assign = () => {
@@ -3651,16 +3716,8 @@ function Products({
       ),
     });
   };
-  const addProduct = () => {
-    if (
-      p.products.some(
-        (x) => x.model === form.model && x.colorNo === form.colorNo,
-      )
-    ) {
-      alert("此 SPC 編號與色號已存在，請勿重複建立。");
-      return;
-    }
-    patch({ products: [form, ...p.products] });
+  const resetProductForm = () => {
+    setEditingProductId("");
     setForm({
       id: id(),
       brand: "",
@@ -3669,6 +3726,36 @@ function Products({
       spec: "",
       note: "",
     });
+  };
+  const beginProductEdit = (product: Product) => {
+    setEditingProductId(product.id);
+    setForm({ ...product });
+  };
+  const addProduct = () => {
+    if (!form.model || !form.colorNo) return;
+    if (
+      p.products.some(
+        (x) => x.id !== editingProductId && x.model === form.model && x.colorNo === form.colorNo,
+      )
+    ) {
+      alert("此 SPC 編號與色號已存在，請勿重複建立。");
+      return;
+    }
+    if (editingProductId) {
+      patch({
+        products: p.products.map((product) => product.id === editingProductId ? {
+          ...product,
+          brand: form.brand,
+          model: form.model,
+          colorNo: form.colorNo,
+          spec: form.spec,
+          note: form.note,
+        } : product),
+      });
+    } else {
+      patch({ products: [form, ...p.products] });
+    }
+    resetProductForm();
     removeDurableDraft(productDraftKey);
     void removeOfflineDraft(productDraftKey);
   };
@@ -3707,13 +3794,16 @@ function Products({
           set={(note) => setForm({ ...form, note })}
         />
       </div>
-      <button
-        className="primary"
-        disabled={!form.model || !form.colorNo}
-        onClick={addProduct}
-      >
-        ＋ 新增產品色號
-      </button>
+      <div className="form-actions">
+        {editingProductId && <button type="button" className="ghost" onClick={resetProductForm}>取消修改</button>}
+        <button
+          className="primary"
+          disabled={!form.model || !form.colorNo}
+          onClick={addProduct}
+        >
+          {editingProductId ? "儲存修改" : "＋ 新增產品色號"}
+        </button>
+      </div>
       <h3>指定產品給既有戶別</h3>
       <div className="filters">
         <select value={unitId} onChange={(e) => setUnitId(e.target.value)}>
@@ -3762,7 +3852,8 @@ function Products({
                 <td>{x.colorNo}</td>
                 <td>{x.spec}</td>
                 <td>{x.note}</td>
-                <td>
+                <td><div className="actions">
+                  <button type="button" className="ghost" onClick={() => beginProductEdit(x)}>修改</button>
                   <button
                     className="danger"
                     onClick={() =>
@@ -3774,7 +3865,7 @@ function Products({
                   >
                     刪除
                   </button>
-                </td>
+                </div></td>
               </tr>
             ))}
           </tbody>
@@ -3952,7 +4043,6 @@ function UnitDetail({
   role,
   activity,
   patch,
-  patchProject,
   addEvent,
   back,
   floorContext,
@@ -3965,7 +4055,6 @@ function UnitDetail({
   role: AppRole;
   activity?: EntityActivity;
   patch: (x: Partial<Unit>) => void;
-  patchProject: (x: Partial<Project>) => void;
   addEvent: (a: string, b: string, p?: Photo[]) => void;
   back: () => void;
   floorContext: FloorReturnContext | null;
@@ -3974,6 +4063,8 @@ function UnitDetail({
   remove: () => void;
 }) {
   const [tab, setTab] = useState(floorContext?.tab || "master");
+  const navigationUnits = floorContext ? floorUnits : liveEntities(project.units);
+  const currentNavigationIndex = navigationUnits.findIndex((item) => item.id === unit.id);
   useEffect(() => { if (floorContext?.tab) setTab(floorContext.tab); }, [unit.id, floorContext?.tab]);
   useEffect(() => {
     if (!canUseUnitTab(role, tab)) setTab("master");
@@ -3983,17 +4074,15 @@ function UnitDetail({
       <button className="back" onClick={back}>
         {floorContext ? `← 返回 ${floorContext.floor || "未分類樓層"} 樓層驗收` : "← 返回戶別管理"}
       </button>
-      {floorContext && <div className="floor-unit-navigation">
-        <button className="ghost" disabled={floorUnits.findIndex((item) => item.id === unit.id) <= 0} onClick={() => {
-          const index = floorUnits.findIndex((item) => item.id === unit.id);
-          if (index > 0) openUnit(floorUnits[index - 1].id);
+      <div className="floor-unit-navigation">
+        <button className="ghost" disabled={currentNavigationIndex <= 0} onClick={() => {
+          if (currentNavigationIndex > 0) openUnit(navigationUnits[currentNavigationIndex - 1].id);
         }}>← 上一戶</button>
-        <span>{floorContext.building} · {floorContext.floor}</span>
-        <button className="ghost" disabled={floorUnits.findIndex((item) => item.id === unit.id) < 0 || floorUnits.findIndex((item) => item.id === unit.id) >= floorUnits.length - 1} onClick={() => {
-          const index = floorUnits.findIndex((item) => item.id === unit.id);
-          if (index >= 0 && index < floorUnits.length - 1) openUnit(floorUnits[index + 1].id);
+        <span>{floorContext ? `${floorContext.building} · ${floorContext.floor} · ${unit.number}` : `${unit.building} · ${unit.floor} · ${unit.number}`}</span>
+        <button className="ghost" disabled={currentNavigationIndex < 0 || currentNavigationIndex >= navigationUnits.length - 1} onClick={() => {
+          if (currentNavigationIndex >= 0 && currentNavigationIndex < navigationUnits.length - 1) openUnit(navigationUnits[currentNavigationIndex + 1].id);
         }}>下一戶 →</button>
-      </div>}
+      </div>
       <div className="unit-head">
         <div className="unit-head-copy">
           <p className="eyebrow">{project.name}</p>
@@ -4032,14 +4121,13 @@ function UnitDetail({
             u={unit}
             role={role}
             patch={patch}
-            patchProject={patchProject}
             remove={remove}
           />
         )}{" "}
         {tab === "survey" && (
-          <SurveyTab project={project} u={unit} patch={patch} add={addEvent} />
+          <SurveyTab key={unit.id} project={project} u={unit} patch={patch} add={addEvent} />
         )}{" "}
-        {tab === "work" && <WorkTab u={unit} patch={patch} add={addEvent} />}{" "}
+        {tab === "work" && <WorkTab key={unit.id} u={unit} patch={patch} add={addEvent} />}{" "}
         {tab === "accept" && (
           <AcceptTab key={unit.id} project={project} u={unit} patch={patch} add={addEvent} />
         )}{" "}
@@ -4099,14 +4187,12 @@ function Master({
   u,
   role,
   patch,
-  patchProject,
   remove,
 }: {
   p: Project;
   u: Unit;
   role: AppRole;
   patch: (x: Partial<Unit>) => void;
-  patchProject: (x: Partial<Project>) => void;
   remove: () => void;
 }) {
   const isCrew = role === "crew";
@@ -4149,9 +4235,10 @@ function Master({
         <Field
           label="建案名稱（全案共用）"
           value={p.name}
-          disabled={!canManage}
-          set={(name: string) => patchProject({ name })}
+          disabled
+          set={() => undefined}
         />
+        <div className="muted">請至「專案資料」修改全案共用資料</div>
         <Field
           label="棟別"
           value={u.building}
@@ -4353,21 +4440,57 @@ function SurveyTab({
       stagingArea: { location: "", note: "", cautions: "", photos: [] },
       surveySignatures: [],
       startedAt: stamp(),
-    },
-    [s, setS] = useState<Survey>(() =>
-      readDraft(draftKey(authUserId, "survey", u.id), fallback),
-    ),
+    };
+  const latestFormalSurvey = u.surveys.find((record) => record.draft !== true);
+  const surveyHistoryModeRef = useRef(!!latestFormalSurvey);
+  const preHistorySurveyRef = useRef<Survey | null>(null);
+  const surveyDraftActiveRef = useRef(!latestFormalSurvey);
+  const [s, setS] = useState<Survey>(() => {
+      const initial = readDraft(draftKey(authUserId, "survey", u.id), fallback);
+      if (latestFormalSurvey) preHistorySurveyRef.current = initial;
+      return latestFormalSurvey || initial;
+    }),
     [risk, setRisk] = useState(false),
     [surveySigning, setSurveySigning] = useState(false),
     [surveyDetail, setSurveyDetail] = useState<"door" | "silicone" | "divider" | "parking" | "staging" | "signatures" | null>(null),
     [doorFlowActive, setDoorFlowActive] = useState(false),
     [doorFlowResume, setDoorFlowResume] = useState(0),
     [saved, setSaved] = useState(""),
-    [confirming, setConfirming] = useState(false);
-  useOfflineDraftRestore(draftKey(authUserId, "survey", u.id), setS);
+    [confirming, setConfirming] = useState(false),
+    [historyMode, setHistoryMode] = useState(!!latestFormalSurvey);
+  const setRestorableSurvey = useRef((restored: Survey) => {
+    if (surveyHistoryModeRef.current) preHistorySurveyRef.current = restored;
+    else setS(restored);
+  }).current;
+  useOfflineDraftRestore(draftKey(authUserId, "survey", u.id), setRestorableSurvey);
   useEffect(() => {
+    if (surveyHistoryModeRef.current || !surveyDraftActiveRef.current) return;
     writeLocalDraft(draftKey(authUserId, "survey", u.id), s, authUserId);
   }, [s, u.id, authUserId]);
+  const openSurveyRecord = (record: Survey) => {
+    if (record.draft === true) {
+      surveyHistoryModeRef.current = false;
+      surveyDraftActiveRef.current = true;
+      preHistorySurveyRef.current = null;
+      setHistoryMode(false);
+      setS(record);
+      return;
+    }
+    if (!surveyHistoryModeRef.current) preHistorySurveyRef.current = s;
+    surveyHistoryModeRef.current = true;
+    surveyDraftActiveRef.current = false;
+    setHistoryMode(true);
+    setS(record);
+  };
+  const exitSurveyHistory = () => {
+    const resumeSurvey = preHistorySurveyRef.current || { ...fallback, id: id(), date: day(), startedAt: stamp() };
+    surveyHistoryModeRef.current = false;
+    surveyDraftActiveRef.current = true;
+    preHistorySurveyRef.current = null;
+    setHistoryMode(false);
+    setS(resumeSurvey);
+    setSaved("已結束查看，可建立新的場勘紀錄");
+  };
   const door = s.doorInspection || { thresholdCm: undefined, meetsThreshold: false, hasGap: null, result: "不合格" as const, rationale: "", note: "", photos: [] },
     silicone = s.siliconeInspection || { matchesFloor: null, otherColor: "", note: "", photos: [] },
     divider = s.dividerInspection || { needed: "待確認" as const, quantity: undefined, location: "", note: "", photos: [] },
@@ -4405,6 +4528,7 @@ function SurveyTab({
     ],
     allPhotos = [...s.photos, ...s.items.flatMap((x) => x.photos || []), ...(door.photos || []), ...(silicone.photos || []), ...(divider.photos || []), ...(parking.photos || []), ...(stagingArea.photos || [])],
     saveDraft = () => {
+      if (surveyHistoryModeRef.current) return setSaved("正在查看正式場勘紀錄；請先結束查看再建立新場勘");
       const draft = { ...s, draft: true };
       patch({ surveys: [draft, ...u.surveys.filter((record) => record.id !== s.id)] });
       writeLocalDraft(draftKey(authUserId, "survey", u.id), draft, authUserId);
@@ -4417,11 +4541,22 @@ function SurveyTab({
         draft: false,
         doorInspection: { ...door, meetsThreshold: doorMeasured && Number(door.thresholdCm) >= 1.5, result: doorResult },
       };
-      const status: Status = s.decision === "可進場" ? "可進場" : "場勘待改善";
-      patch({
+      const surveyUpdate = {
         surveys: u.surveys.some((record) => record.id === survey.id)
           ? u.surveys.map((record) => record.id === survey.id ? survey : record)
           : [survey, ...u.surveys],
+      };
+      if (surveyHistoryModeRef.current) {
+        patch(surveyUpdate);
+        localStorage.setItem(scopedKey("spc-last-survey-person", authUserId), survey.person);
+        queueRecordChange(authUserId, "survey", u.id, survey, "complete");
+        setSaved("✓ 正式場勘紀錄修改已儲存；戶別狀態與歷史事件未變更");
+        setConfirming(false);
+        return;
+      }
+      const status: Status = s.decision === "可進場" ? "可進場" : "場勘待改善";
+      patch({
+        ...surveyUpdate,
         status,
         events: [
           {
@@ -4468,6 +4603,7 @@ function SurveyTab({
           <p>基本資料會沿用至後續所有工程節點。</p>
         </div>
       </div>
+      {historyMode && <div className="warning history-view-banner"><span>正在查看最新場勘紀錄</span><button className="ghost" type="button" onClick={exitSurveyHistory}>結束查看／建立新場勘</button></div>}
       <InspectionGuide />
       <AutoRecord label="場勘開始時間" at={s.startedAt || s.date} />
       <section className="survey-area-panel survey-estimated-area">
@@ -4598,7 +4734,7 @@ function SurveyTab({
       )}
       {surveySigning && <Sign close={() => setSurveySigning(false)} save={(signature) => { setS({ ...s, surveySignatures: [...surveySignatures, signature] }); setSurveySigning(false); }} />}
       <div className="form-actions">
-      <button className="ghost" type="button" onClick={saveDraft}>暫存未完成場勘</button>
+      <button className="ghost" type="button" disabled={historyMode} onClick={saveDraft}>暫存未完成場勘</button>
       <button
         className="primary"
         disabled={
@@ -4634,7 +4770,7 @@ function SurveyTab({
       {saved && <div className="save-success">{saved}</div>}
       <History
         title="歷次場勘"
-        rows={u.surveys.map((x) => ({ a: x.date, b: x.person, c: `${x.draft ? "暫存" : "完成"} · ${x.decision} · 預估 ${u.estimated} 坪`, onOpen: () => { setS(x); setSaved("已開啟既有場勘，可查看或修改後重新儲存"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))}
+        rows={u.surveys.map((x) => ({ a: x.date, b: x.person, c: `${x.draft ? "暫存" : "完成"} · ${x.decision} · 預估 ${u.estimated} 坪`, onOpen: () => { openSurveyRecord(x); setSaved(x.draft ? "已開啟場勘草稿" : "已開啟正式場勘紀錄，可查看或修改後重新儲存"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))}
       />
     </div>
   );
@@ -4653,17 +4789,54 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       photos: [],
       items: [{ label: "施工品質／現場狀況", result: "", note: "", photos: [], value: "", unit: "" }],
       startedAt: stamp(),
-    },
-    [w, setW] = useState<Work>(() =>
-      readDraft(draftKey(authUserId, "work", u.id), fallback),
-    ),
-    [saved, setSaved] = useState("");
+    };
+  const latestFormalWork = u.works.find((record) => record.draft !== true);
+  const workHistoryModeRef = useRef(!!latestFormalWork);
+  const preHistoryWorkRef = useRef<Work | null>(null);
+  const workDraftActiveRef = useRef(!latestFormalWork);
+  const [w, setW] = useState<Work>(() => {
+      const initial = readDraft(draftKey(authUserId, "work", u.id), fallback);
+      if (latestFormalWork) preHistoryWorkRef.current = initial;
+      return latestFormalWork || initial;
+    }),
+    [saved, setSaved] = useState(""),
+    [historyMode, setHistoryMode] = useState(!!latestFormalWork);
   const canWriteWork = canWriteWorkLifecycle(u.status);
-  useOfflineDraftRestore(draftKey(authUserId, "work", u.id), setW);
+  const setRestorableWork = useRef((restored: Work) => {
+    if (workHistoryModeRef.current) preHistoryWorkRef.current = restored;
+    else setW(restored);
+  }).current;
+  useOfflineDraftRestore(draftKey(authUserId, "work", u.id), setRestorableWork);
   useEffect(() => {
+    if (workHistoryModeRef.current || !workDraftActiveRef.current) return;
     writeLocalDraft(draftKey(authUserId, "work", u.id), w, authUserId);
   }, [w, u.id, authUserId]);
+  const openWorkRecord = (record: Work) => {
+    if (record.draft === true) {
+      workHistoryModeRef.current = false;
+      workDraftActiveRef.current = true;
+      preHistoryWorkRef.current = null;
+      setHistoryMode(false);
+      setW(record);
+      return;
+    }
+    if (!workHistoryModeRef.current) preHistoryWorkRef.current = w;
+    workHistoryModeRef.current = true;
+    workDraftActiveRef.current = false;
+    setHistoryMode(true);
+    setW(record);
+  };
+  const exitWorkHistory = () => {
+    const resumeWork = preHistoryWorkRef.current || { ...fallback, id: id(), date: day(), startedAt: stamp() };
+    workHistoryModeRef.current = false;
+    workDraftActiveRef.current = true;
+    preHistoryWorkRef.current = null;
+    setHistoryMode(false);
+    setW(resumeWork);
+    setSaved("已結束查看，可建立新的施工紀錄");
+  };
   const saveDraft = () => {
+    if (workHistoryModeRef.current) return setSaved("正在查看正式施工紀錄；請先結束查看再建立新施工紀錄");
     if (!canWriteWork) return setSaved("目前狀態不可寫入施工紀錄；請先完成場勘／改善並確認可進場");
     const draft = { ...w, draft: true };
     patch({ works: [draft, ...u.works.filter((record) => record.id !== w.id)] });
@@ -4672,11 +4845,20 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
     setSaved("✓ 施工草稿已暫存；上午暫存後，下午可繼續補寫");
   };
   const save = (done: boolean) => {
+    const completedWork: Work = { ...w, draft: false };
+    const workUpdate = { works: [completedWork, ...u.works.filter((record) => record.id !== completedWork.id)] };
+    if (workHistoryModeRef.current) {
+      patch(workUpdate);
+      localStorage.setItem(scopedKey("spc-last-crew", authUserId), completedWork.crew);
+      queueRecordChange(authUserId, "work", u.id, completedWork, "complete");
+      setSaved("✓ 歷史施工紀錄修改已儲存；戶別施工狀態與事件未變更");
+      return;
+    }
     if (!canWriteWork) return setSaved("目前狀態不可寫入施工紀錄；請先完成場勘／改善並確認可進場");
     const status: Status = done ? "待驗收" : "施工中",
       title = done ? "施工完成" : "新增施工紀錄";
     patch({
-      works: [{ ...w, draft: false }, ...u.works.filter((record) => record.id !== w.id)],
+      ...workUpdate,
       status,
       events: [
         {
@@ -4692,7 +4874,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
     add(title, w.content, w.photos);
     localStorage.setItem(scopedKey("spc-last-crew", authUserId), w.crew);
     removeDurableDraft(draftKey(authUserId, "work", u.id));
-    queueRecordChange(authUserId, "work", u.id, { ...w, draft: false }, done ? "complete" : "upsert");
+    queueRecordChange(authUserId, "work", u.id, completedWork, done ? "complete" : "upsert");
     setSaved(
       done ? "✓ 施工完成紀錄已儲存，狀態已改為待驗收" : "✓ 施工紀錄已儲存成功",
     );
@@ -4705,6 +4887,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
           <p>基本資料會沿用，施工時間由系統自動記錄。</p>
         </div>
       </div>
+      {historyMode && <div className="warning history-view-banner"><span>正在查看最新施工紀錄</span><button className="ghost" type="button" onClick={exitWorkHistory}>結束查看／建立新施工紀錄</button></div>}
       <InspectionGuide />
       <AutoRecord label="施工紀錄時間" at={w.startedAt || w.date} />
       {!canWriteWork && (
@@ -4748,21 +4931,11 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
       />
       <Checklist node="施工" items={w.items || [{ label: "施工品質／現場狀況", result: "", note: "", photos: [] }]} set={(items) => setW({ ...w, items })} />
       <div className="decision">
-        <button className="ghost" disabled={!canWriteWork || !w.crew} onClick={saveDraft}>暫存未完成施工</button>
-        <button
-          className="ghost"
-          disabled={!canWriteWork || !w.crew}
-          onClick={() => save(false)}
-        >
-          儲存並維持施工中
-        </button>
-        <button
-          className="primary"
-          disabled={!canWriteWork || !w.crew}
-          onClick={() => save(true)}
-        >
-          施工完成 → 待驗收
-        </button>
+        {historyMode ? <button className="primary" disabled={!w.crew} onClick={() => save(false)}>儲存歷史施工修改</button> : <>
+          <button className="ghost" disabled={!canWriteWork || !w.crew} onClick={saveDraft}>暫存未完成施工</button>
+          <button className="ghost" disabled={!canWriteWork || !w.crew} onClick={() => save(false)}>儲存並維持施工中</button>
+          <button className="primary" disabled={!canWriteWork || !w.crew} onClick={() => save(true)}>施工完成 → 待驗收</button>
+        </>}
       </div>
       {saved && <div className="save-success">{saved}</div>}
       <History
@@ -4771,7 +4944,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
           a: x.date,
           b: `${x.crew}／${x.people}人`,
           c: `${x.draft ? "暫存" : "完成"} · ${x.area}坪 ${x.content}`,
-          onOpen: () => { setW(x); setSaved("已開啟既有施工紀錄，可查看或修改"); window.scrollTo({ top: 0, behavior: "smooth" }); },
+          onOpen: () => { openWorkRecord(x); setSaved(x.draft ? "已開啟施工草稿" : "已開啟正式施工紀錄，可查看或修改"); window.scrollTo({ top: 0, behavior: "smooth" }); },
         }))}
       />
     </div>
@@ -4828,23 +5001,28 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
       recheck: u.status === "待複驗",
       startedAt: stamp(),
     };
+  const latestFormalAcceptance = u.acceptances.find((item) => item.draft !== true);
+  const historyModeRef = useRef(!!latestFormalAcceptance);
+  const preHistoryAcceptanceRef = useRef<Acceptance | null>(null);
+  const acceptanceDraftActiveRef = useRef(!latestFormalAcceptance);
   const [a, setA] = useState<Acceptance>(() => {
     const restored = readDraft(draftKey(authUserId, "accept", u.id), fallback);
-    return restored.draft === false ? fallback : restored;
+    const initialAcceptance = restored.draft === false ? fallback : restored;
+    if (latestFormalAcceptance) preHistoryAcceptanceRef.current = initialAcceptance;
+    return latestFormalAcceptance || initialAcceptance;
   });
   const setRestorableAcceptance = useRef((restored: Acceptance) => {
-    if (restored.draft !== false) setA(restored);
+    if (restored.draft === false) return;
+    if (historyModeRef.current) preHistoryAcceptanceRef.current = restored;
+    else setA(restored);
   }).current;
   const [signRole, setSignRole] = useState<"installer" | "office" | "siteManager" | "supervisor" | null>(null);
   const [saved, setSaved] = useState("");
   const [confirming, setConfirming] = useState(false);
-  const [historyMode, setHistoryMode] = useState(false);
-  const historyModeRef = useRef(false);
-  const preHistoryAcceptanceRef = useRef<Acceptance | null>(null);
-  const acceptanceDraftActiveRef = useRef(true);
+  const [historyMode, setHistoryMode] = useState(!!latestFormalAcceptance);
   const skipNextDraftWrite = useRef(false);
   const pendingDraftWriteRef = useRef<Promise<void>>(Promise.resolve());
-  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setRestorableAcceptance, acceptanceDraftActiveRef);
+  useOfflineDraftRestore(draftKey(authUserId, "accept", u.id), setRestorableAcceptance);
   useEffect(() => {
     if (skipNextDraftWrite.current) {
       skipNextDraftWrite.current = false;
@@ -4858,6 +5036,33 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
     incomplete = a.items.some((x) => !x.result),
     invalidBad = bad.some((x) => !x.note.trim() || !x.photos?.length),
     allPhotos = [...a.photos, ...a.items.flatMap((x) => x.photos || [])],
+    openAcceptanceRecord = (record: Acceptance) => {
+      if (record.draft === true) {
+        historyModeRef.current = false;
+        acceptanceDraftActiveRef.current = true;
+        preHistoryAcceptanceRef.current = null;
+        setHistoryMode(false);
+        setA(record);
+        setSaved("已開啟未完成驗收草稿");
+      } else {
+        if (!historyModeRef.current) preHistoryAcceptanceRef.current = a;
+        historyModeRef.current = true;
+        acceptanceDraftActiveRef.current = false;
+        setHistoryMode(true);
+        setA(record);
+        setSaved("已開啟既有驗收紀錄，可查看或修改；未正式保存不會覆蓋原本草稿");
+      }
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    },
+    exitAcceptanceHistory = () => {
+      const resumeAcceptance = preHistoryAcceptanceRef.current || { ...fallback, id: id(), date: day(), startedAt: stamp() };
+      historyModeRef.current = false;
+      acceptanceDraftActiveRef.current = true;
+      preHistoryAcceptanceRef.current = null;
+      setHistoryMode(false);
+      setA(resumeAcceptance);
+      setSaved("已結束查看正式紀錄，可繼續原本草稿或建立新驗收");
+    },
     saveDraft = () => {
       if (historyModeRef.current) return setSaved("歷史驗收只能正式保存；原本未完成草稿不會被覆蓋");
       if (!canWriteAcceptanceLifecycle(u.status, a.recheck)) return setSaved("目前工程狀態不可建立或暫存新的驗收；請先完成前一節點");
@@ -4940,6 +5145,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
           <p>基本資料與施工紀錄會自動帶入；戶別完成以逐項驗收結果為準，四人簽名統一於樓層驗收完成。</p>
         </div>
       </div>
+      {historyMode && <div className="warning">正在查看最新正式驗收／複驗紀錄；檢視期間不會寫入或覆蓋未完成草稿。 <button type="button" className="ghost" onClick={exitAcceptanceHistory}>結束查看／建立新驗收</button></div>}
       <InspectionGuide />
       <AutoRecord label={a.recheck ? "複驗開始時間" : "驗收開始時間"} at={a.startedAt || a.date} />
       {!historyMode && !canWriteAcceptanceLifecycle(u.status, a.recheck) && <div className="warning">目前工程狀態不可建立新的{a.recheck ? "複驗" : "驗收"}；仍可查看既有驗收歷史。</div>}
@@ -5044,7 +5250,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
           a: x.date,
           b: x.person,
           c: x.draft ? "驗收草稿（未完成）" : `${x.recheck ? "複驗" : "驗收"}：${x.result}`,
-          onOpen: () => { if (!historyModeRef.current) preHistoryAcceptanceRef.current = a; historyModeRef.current = true; acceptanceDraftActiveRef.current = false; setHistoryMode(true); setA(x); setSaved("已開啟既有驗收紀錄，可查看或修改；未正式保存不會覆蓋原本草稿"); window.scrollTo({ top: 0, behavior: "smooth" }); },
+          onOpen: () => openAcceptanceRecord(x),
         }))}
       />
     </div>
@@ -5600,14 +5806,20 @@ function Journal({
 type BillingUnitDraft = { rate: string; priced: boolean };
 
 function Billing({ p, patch }: { p: Project; patch: any }) {
+  const authUserId = useAuthOwner();
   const [y, setY] = useState(String(new Date().getFullYear())),
     [m, setM] = useState(String(new Date().getMonth() + 1).padStart(2, "0")),
+    [receivablePreview, setReceivablePreview] = useState(false),
+    [receivableExporting, setReceivableExporting] = useState(false),
+    [receivableDraft, setReceivableDraft] = useState<ReceivableExportDraft | null>(null),
     [shipmentPreview, setShipmentPreview] = useState(false),
     [shipmentExporting, setShipmentExporting] = useState(false),
     [editing, setEditing] = useState(false),
     [billingDrafts, setBillingDrafts] = useState<Record<string, BillingUnitDraft>>({}),
     [saveConfirmation, setSaveConfirmation] = useState(false),
     [billingMessage, setBillingMessage] = useState(""),
+    [shipmentReportDraft, setShipmentReportDraft] = useState<ReportSourceDraft | null>(null),
+    [shipmentReportMessage, setShipmentReportMessage] = useState(""),
     ym = `${y}-${m}`,
     monthlyBillingRecords = buildAcceptanceExportRecords(p).filter((record) => record.exportDate.startsWith(ym)),
     monthlyUnitIds = new Set(monthlyBillingRecords.map((record) => record.unitId)),
@@ -5622,6 +5834,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
     }),
     shipmentRecords = monthlyBillingRecords,
     billSubtotal = billRecords.reduce((sum, record) => sum + record.amount, 0),
+    receivableTotals = receivableDraft ? receivableDraftTotals(receivableDraft) : null,
     printBilling = () => printWithLifecycleCleanup("printing-billing");
   const safeDraftRate = (value: string | number) => {
       const parsed = Number(value);
@@ -5664,14 +5877,22 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
         units: p.units.map((unit) => {
           const changed = changes.get(unit.id);
           if (!changed) return unit;
-          const rate = safeDraftRate(changed.draft.rate), newlyPriced = unit.status !== "已計價" && changed.draft.priced;
+          const rate = safeDraftRate(changed.draft.rate),
+            wasPriced = unit.status === "已計價",
+            pricingStatusChanged = changed.draft.priced !== wasPriced;
           return {
             ...unit,
             rate,
-            ...(newlyPriced ? {
-              status: "已計價",
-              pricedAt: day(),
-              events: [{ id: id(), at: stamp(), title: "月結已計價", detail: `金額 ${changed.record.amount}`, photos: [] }, ...unit.events],
+            ...(pricingStatusChanged ? {
+              status: changed.draft.priced ? "已計價" : "已驗收",
+              pricedAt: changed.draft.priced ? day() : "",
+              events: [{
+                id: id(),
+                at: stamp(),
+                title: changed.draft.priced ? "月結已計價" : "月結取消計價",
+                detail: changed.draft.priced ? `金額 ${changed.record.amount}` : "狀態恢復為已驗收",
+                photos: [],
+              }, ...unit.events],
             } : {}),
           };
         }),
@@ -5679,6 +5900,30 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       setSaveConfirmation(false);
       setBillingDrafts({});
       setEditing(false);
+    },
+    startShipmentReportEdit = (record: AcceptanceExportRecord, index: number) => {
+      if (editing) return setShipmentReportMessage("請先保存或取消目前的月結修改，再修改報表來源資料");
+      const unit = p.units.find((candidate) => candidate.id === record.unitId);
+      const acceptance = unit ? getLatestFinalAcceptance(unit) : undefined;
+      if (!unit || !acceptance) return setShipmentReportMessage("此筆沒有可修改的正式驗收紀錄");
+      setShipmentReportDraft(reportSourceDraftFor(record, index, unit, acceptance as Acceptance));
+      setShipmentReportMessage("");
+    },
+    saveShipmentReportSource = () => {
+      if (!shipmentReportDraft) return;
+      const currentUnit = p.units.find((unit) => unit.id === shipmentReportDraft.unitId);
+      const currentAcceptance = currentUnit?.acceptances.find((acceptance) => acceptance.id === shipmentReportDraft.acceptanceId && acceptance.draft !== true);
+      if (!currentUnit || !currentAcceptance) return setShipmentReportMessage("找不到原正式驗收紀錄，未保存任何修改");
+      const updatedUnit = updateReportSource(currentUnit, shipmentReportDraft);
+      const updatedAcceptance = updatedUnit.acceptances.find((acceptance) => acceptance.id === shipmentReportDraft.acceptanceId)!;
+      patch({ units: p.units.map((unit) => unit.id === updatedUnit.id ? updatedUnit : unit) });
+      queueRecordChange(authUserId, "accept", updatedUnit.id, updatedAcceptance, "complete");
+      setShipmentReportDraft(null);
+      setShipmentReportMessage("✓ 正式報表來源資料已保存");
+    },
+    openReceivablePreview = () => {
+      setReceivableDraft(buildReceivableExportDraft(p, billRecords));
+      setReceivablePreview(true);
     },
     changeBillingPeriod = (kind: "year" | "month", value: string) => {
       if (editing && billingChanges.length) {
@@ -5721,10 +5966,9 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       <section className="acceptance-exports billing-no-print">
         <div className="checklist-head"><div><h3>報表／匯出</h3><small>依目前月份與案場資料預覽、下載或列印報表。</small></div></div>
         <div className="export-cards">
-          <button type="button" disabled={!billRecords.length} onClick={() => { const workbook = createReceivableWorkbook(p, billRecords, ym); saveReceivableWorkbook(workbook, `${ym}-${p.name}-SPC應收帳款明細表.xlsx`); }}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>下載 ›</em></button>
-          <button type="button" onClick={() => exportCsv(p, billRecords, ym)}><i className="excel">C</i><span><b>CSV 匯出</b><small>月結戶別明細 · CSV</small></span><em>下載 ›</em></button>
+          <button type="button" disabled={!billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>
           <button type="button" onClick={printBilling}><i>PDF</i><span><b>PDF／列印</b><small>列印目前月結頁面</small></span><em>列印 ›</em></button>
-          <button type="button" onClick={() => setShipmentPreview(true)}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>
+          <button type="button" onClick={() => { setShipmentPreview(true); setShipmentReportDraft(null); setShipmentReportMessage(""); }}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>
         </div>
       </section>
       <div className="summary">
@@ -5801,7 +6045,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
                 </td>
                 <td><span className="billing-screen-only">{record.amount.toLocaleString()}</span><span className="billing-print-only">{savedRecord.amount.toLocaleString()}</span></td>
                 <td>
-                  <span className="billing-screen-only">{editing && u.status !== "已計價" ? <label className="check"><input type="checkbox" checked={draft.priced} onChange={(e) => setBillingDrafts((current) => ({ ...current, [u.id]: { ...draft, priced: e.target.checked } }))} />標記已計價</label> : <span>{u.status}</span>}</span><span className="billing-print-only">{u.status}</span>
+                  <span className="billing-screen-only">{editing ? <label className="check"><input type="checkbox" checked={draft.priced} onChange={(e) => setBillingDrafts((current) => ({ ...current, [u.id]: { ...draft, priced: e.target.checked } }))} />{draft.priced ? "已計價" : "已驗收"}</label> : <span>{u.status}</span>}</span><span className="billing-print-only">{u.status}</span>
                 </td>
               </tr>
             ))}
@@ -5811,18 +6055,72 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       {saveConfirmation && <Modal close={() => setSaveConfirmation(false)} title="確認保存月結修改">
         <div className="form">
           <div className="export-summary"><span>案場名稱<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>修改戶別數<b>{billingChanges.length}</b></span><span>保存後總額<b>NT$ {previewSubtotal.toLocaleString()}</b></span></div>
-          <div className="table-wrap"><table><thead><tr><th>戶別</th><th>單價變更</th><th>狀態變更</th></tr></thead><tbody>{billingChanges.map(({ unit, draft }) => <tr key={unit.id}><td>{unit.building} {unit.floor} {unit.number}</td><td>{safeDraftRate(draft.rate) !== Number(unit.rate || 0) ? `${Number(unit.rate || 0).toLocaleString()} → ${safeDraftRate(draft.rate).toLocaleString()}` : "—"}</td><td>{unit.status !== "已計價" && draft.priced ? "改為已計價" : "—"}</td></tr>)}</tbody></table></div>
+          <div className="table-wrap"><table><thead><tr><th>戶別</th><th>單價變更</th><th>狀態變更</th></tr></thead><tbody>{billingChanges.map(({ unit, draft }) => <tr key={unit.id}><td>{unit.building} {unit.floor} {unit.number}</td><td>{safeDraftRate(draft.rate) !== Number(unit.rate || 0) ? `${Number(unit.rate || 0).toLocaleString()} → ${safeDraftRate(draft.rate).toLocaleString()}` : "—"}</td><td>{draft.priced !== (unit.status === "已計價") ? `${unit.status} → ${draft.priced ? "已計價" : "已驗收"}` : "—"}</td></tr>)}</tbody></table></div>
           <div className="form-actions"><button type="button" className="ghost" onClick={() => setSaveConfirmation(false)}>返回修改</button><button type="button" className="primary" onClick={confirmSave}>確認保存</button></div>
         </div>
       </Modal>}
-      {shipmentPreview && <Modal close={() => setShipmentPreview(false)} title="SPC 已出貨明細總表｜匯出預覽">
+      {receivablePreview && receivableDraft && <Modal close={() => { setReceivablePreview(false); setReceivableDraft(null); }} title="應收帳款 Excel｜匯出預覽">
         <div className="form export-preview">
-          <Field label="匯出月份" type="month" value={ym} set={(value) => { const [year, month] = value.split("-"); if (year && month) { if (editing && billingChanges.length) setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。"); else { if (editing) cancelEditing(); setY(year); setM(month); } } }} />
+          <div className="export-summary"><span>案場<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>實際戶別筆數<b>{billRecords.length}</b></span><span>資料來源<b>目前月結戶別</b></span></div>
+          <section className="panel form">
+            <div className="panel-head"><div><h3>送貨資料</h3><p>僅套用到這次匯出的 Excel。</p></div></div>
+            <div className="grid3">
+              <Field label="送貨聯絡人" value={receivableDraft.deliveryContact} set={(deliveryContact: string) => setReceivableDraft({ ...receivableDraft, deliveryContact })} />
+              <Field label="送貨地址" value={receivableDraft.deliveryAddress} set={(deliveryAddress: string) => setReceivableDraft({ ...receivableDraft, deliveryAddress })} />
+            </div>
+          </section>
+          <div className="export-preview-table receivable-preview-table"><table><thead><tr><th>日期</th><th>型號</th><th>尺寸cm</th><th>數量(坪)</th><th>單價／元</th><th>合計</th><th>備註</th></tr></thead><tbody>{billRecords.map((record, index) => {
+            const detail = receivableDraft.details[index];
+            const updateDetail = (updates: Partial<typeof detail>) => setReceivableDraft({ ...receivableDraft, details: receivableDraft.details.map((item, detailIndex) => detailIndex === index ? { ...item, ...updates } : item) });
+            const amount = Number(detail.quantity) * Number(detail.unitPrice);
+            return <tr key={record.unitId}>
+              <td><input value={detail.date} onChange={(event) => updateDetail({ date: event.target.value })} /></td>
+              <td><input value={detail.model} onChange={(event) => updateDetail({ model: event.target.value })} /></td>
+              <td><input value={detail.sizeCm} onChange={(event) => updateDetail({ sizeCm: event.target.value })} /></td>
+              <td><input type="number" min="0" step="0.01" value={detail.quantity} onChange={(event) => updateDetail({ quantity: event.target.value })} /></td>
+              <td><input type="number" min="0" step="any" value={detail.unitPrice} onChange={(event) => updateDetail({ unitPrice: event.target.value })} /></td>
+              <td>{Number.isFinite(amount) ? amount.toLocaleString() : "0"}</td>
+              <td><input value={detail.note} onChange={(event) => updateDetail({ note: event.target.value })} /></td>
+            </tr>;
+          })}</tbody></table></div>
+          <section className="panel form">
+            <div className="panel-head"><div><h3>應收資料</h3><p>銷貨小計、稅金與應收合計由 Excel 公式計算，無法手動覆寫。</p></div></div>
+            <div className="export-summary"><span>銷貨小計<b>{receivableTotals?.subtotal.toLocaleString()}</b></span><span>稅金（{companyReportConfig.receivableTaxRate * 100}%）<b>{receivableTotals?.tax.toLocaleString()}</b></span><span>應收合計<b>{receivableTotals?.receivable.toLocaleString()}</b></span></div>
+            <div className="grid3">
+              <Field label="發票字軌" value={receivableDraft.invoiceTrack} set={(invoiceTrack: string) => setReceivableDraft({ ...receivableDraft, invoiceTrack })} />
+              <Field label="發票日期" value={receivableDraft.invoiceDate} set={(invoiceDate: string) => setReceivableDraft({ ...receivableDraft, invoiceDate })} />
+              <Field label="已收款金額" value={receivableDraft.receivedAmount} set={(receivedAmount: string) => setReceivableDraft({ ...receivableDraft, receivedAmount })} />
+              <Field label="收款日期" value={receivableDraft.receivedDate} set={(receivedDate: string) => setReceivableDraft({ ...receivableDraft, receivedDate })} />
+              <Field label="製表" value={receivableDraft.preparedBy} set={(preparedBy: string) => setReceivableDraft({ ...receivableDraft, preparedBy })} />
+              <Field label="支付方式" value={receivableDraft.paymentMethod} set={(paymentMethod: string) => setReceivableDraft({ ...receivableDraft, paymentMethod })} />
+              <Field label="送單日期" value={receivableDraft.deliveryDate} set={(deliveryDate: string) => setReceivableDraft({ ...receivableDraft, deliveryDate })} />
+              <Field label="承辦人" value={receivableDraft.handler} set={(handler: string) => setReceivableDraft({ ...receivableDraft, handler })} />
+              <Field label="主管" value={receivableDraft.supervisor} set={(supervisor: string) => setReceivableDraft({ ...receivableDraft, supervisor })} />
+              <Field label="會計" value={receivableDraft.accounting} set={(accounting: string) => setReceivableDraft({ ...receivableDraft, accounting })} />
+            </div>
+            <div className="muted">客戶簽名：保留 Excel 固定簽名位置，不提供文字編輯。</div>
+          </section>
+          <RecordConfirmation title="固定公司資料（唯讀）" rows={[
+            ["匯款帳號", companyReportConfig.bankAccount],
+            ["聯絡人", companyReportConfig.contactPerson],
+            ["行動電話", companyReportConfig.mobile],
+            ["電話", companyReportConfig.phone],
+            ["傳真", companyReportConfig.fax],
+            ["地址", companyReportConfig.address],
+          ]} />
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReceivablePreview(false); setReceivableDraft(null); }}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !billRecords.length} onClick={async () => { setReceivableExporting(true); try { const workbook = createReceivableWorkbook(p, billRecords, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${p.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
+        </div>
+      </Modal>}
+      {shipmentPreview && <Modal close={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }} title="SPC 已出貨明細總表｜匯出預覽">
+        <div className="form export-preview">
+          <Field label="匯出月份" type="month" value={ym} set={(value) => { if (shipmentReportDraft) return setShipmentReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換月份。"); const [year, month] = value.split("-"); if (year && month) { if (editing && billingChanges.length) setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。"); else { if (editing) cancelEditing(); setY(year); setM(month); } } }} />
           <div className="export-summary"><span>案場<b>{p.name}</b></span><span>戶別筆數<b>{shipmentRecords.length}</b></span><span>總坪數<b>{shipmentRecords.reduce((sum, record) => sum + record.areaPing, 0).toFixed(2)}</b></span><span>總 m²<b>{shipmentRecords.reduce((sum, record) => sum + record.areaSquareMeters, 0).toFixed(2)}</b></span></div>
           {shipmentRecords.some((record) => record.areaPing <= 0) && <div className="warning">部分戶別坪數仍待補；檔案會清楚標記，不會自行填入未知數字。</div>}
-          <div className="export-preview-table"><table><thead><tr><th>出貨日期</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th></tr></thead><tbody>{shipmentRecords.map((record) => <tr key={record.unitId}><td>{record.exportDate || "待補"}</td><td>{record.projectName}</td><td>{[record.model, record.colorNo].filter(Boolean).join(" ")}</td><td>{record.unitDisplay}</td><td>{record.areaSquareMeters.toFixed(2)}</td><td>{record.areaPing > 0 ? `${record.areaPing.toFixed(2)} 坪` : "待補"}</td><td>{record.unitPrice > 0 ? `${record.unitPrice.toLocaleString()} 元` : "待確認"}</td><td>{record.unitPrice > 0 ? record.amount.toLocaleString() : "待確認"}</td><td>{record.vendor || "—"}</td><td>—</td><td>{record.note || ""}</td></tr>)}</tbody></table></div>
+          <div className="export-preview-table"><table><thead><tr><th>操作</th><th>出貨日期</th><th>序號</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th><th>簽單正</th><th>簽單影</th><th>進VO正</th><th>進VO影</th><th>銷VO正</th><th>銷VO影</th><th>送單</th><th>廠商帳單</th><th>級距</th><th>應付</th><th>利潤%</th><th>利潤</th></tr></thead><tbody>{shipmentRecords.map((record, index) => { const display = shipmentDisplayValues(record, index); return <tr key={record.unitId}><td><button type="button" className="primary" disabled={!!shipmentReportDraft} onClick={() => startShipmentReportEdit(record, index)}>修改</button></td><td>{display.shipmentDateText}</td><td>{display.sequenceText}</td><td>{display.customerNameText}</td><td>{display.productText}</td><td>{display.unitDisplayText}</td><td>{display.squareMetersText}</td><td>{display.pingText}</td><td>{display.unitPriceText}</td><td>{display.amountText}</td><td>{display.vendorText}</td><td>{display.purchasePriceText}</td><td>{display.noteText}</td><td>{display.signedOriginal ? "✓" : ""}</td><td>{display.signedCopy ? "✓" : ""}</td><td>{display.incomingVoOriginal}</td><td>{display.incomingVoCopy}</td><td>{display.outgoingVoOriginal}</td><td>{display.outgoingVoCopy}</td><td>{display.submitted}</td><td>{display.vendorInvoice}</td><td>{display.tier}</td><td>{display.payable}</td><td>{display.profitPercent}</td><td>{display.profit}</td></tr>; })}</tbody></table></div>
           {!shipmentRecords.length && <div className="form-error">目前沒有符合條件的施工或驗收資料。</div>}
-          <div className="form-actions"><button className="ghost" onClick={() => setShipmentPreview(false)}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length} onClick={async () => { setShipmentExporting(true); try { const workbook = createShipmentWorkbook(p, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${p.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : "確認產生 Excel"}</button></div>
+          {shipmentReportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；Excel 仍只會使用正式資料。確認保存後會更新同一戶別及同一筆正式驗收。</div><ReportMetadataEditor draft={shipmentReportDraft} setDraft={setShipmentReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setShipmentReportDraft(null); setShipmentReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveShipmentReportSource}>確認保存正式來源</button></div></section>}
+          {shipmentReportMessage && <div className={shipmentReportMessage.startsWith("✓") ? "save-success" : "form-error"}>{shipmentReportMessage}</div>}
+          <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length || !!shipmentReportDraft} onClick={async () => { setShipmentExporting(true); try { const workbook = createShipmentWorkbook(p, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${p.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
     </div>
@@ -6657,49 +6955,4 @@ function Signed({ s }: { s: any }) {
       </div>
     </div>
   );
-}
-function exportCsv(p: Project, records: ReturnType<typeof buildAcceptanceExportRecords>, month: string) {
-  const esc = (x: any) => `"${String(x ?? "").replaceAll('"', '""')}"`,
-    data = [
-      [
-        "建案",
-        "棟別",
-        "樓層",
-        "戶別",
-        "型號",
-        "色號",
-        "施工坪數",
-        "驗收坪數",
-        "單價",
-        "金額",
-        "狀態",
-      ],
-      ...records.map((record) => {
-        const unit = p.units.find((item) => item.id === record.unitId);
-        return [
-          p.name,
-          unit?.building || "",
-          unit?.floor || "",
-          unit?.number || "",
-          record.model,
-          record.colorNo,
-          unit?.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || 0,
-          record.areaPing,
-          record.unitPrice,
-          record.amount,
-          unit?.status || "",
-        ];
-      }),
-    ]
-      .map((r) => r.map(esc).join(","))
-      .join("\n"),
-    a = document.createElement("a");
-  a.href = URL.createObjectURL(
-    new Blob(["\ufeff" + data], { type: "text/csv" }),
-  );
-  a.download = `${month}-${p.name}-月結.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  revokeObjectUrlLater(a.href);
 }
