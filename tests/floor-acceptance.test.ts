@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   canCompleteFloorAcceptance,
   batchCompletionCopyDescriptors,
+  buildingNavigationUnits,
   buildUnitScopedRecord,
   createFloorReturnContext,
   floorAcceptanceSummary,
@@ -18,6 +20,7 @@ import {
   nextPendingFloorUnitId,
   resolveFloorSignatures,
   resolveUnitSignatures,
+  sortUnitsByNumber,
   updateLatestFormalAcceptanceSignature,
   updateUnitScopedRecord,
   updateFloorSignature,
@@ -27,7 +30,7 @@ import {
 
 const signature = (name: string): FloorSignature => ({ name, data: `data:${name}`, at: "2026-08-28", valid: true });
 const acceptance = (id: string, results: string[], extra = {}) => ({ id, date: "2026-08-28", result: results.every((x) => x === "合格") ? "合格" : "不合格", items: results.map((result) => ({ result })), ...extra });
-const unit = (id: string, building = "A棟", floor = "14F", acceptances: any[] = []): FloorAcceptanceUnit => ({ id, building, floor, acceptances });
+const unit = (id: string, building = "A棟", floor = "14F", acceptances: any[] = [], number = id): FloorAcceptanceUnit => ({ id, building, floor, number, acceptances });
 
 test("floor identity and grouping include building and support arbitrary unit counts", () => {
   assert.notEqual(floorIdentity("A棟", "14F"), floorIdentity("B棟", "14F"));
@@ -35,6 +38,43 @@ test("floor identity and grouping include building and support arbitrary unit co
   assert.equal(floorUnitsFor(units, "A棟", "14F").length, 10);
   assert.equal(floorUnitsFor(units, "B棟", "14F").length, 1);
   assert.deepEqual(floorUnitsFor([...units, { ...unit("deleted"), _deleted: true }], "A棟", "14F").map((item) => item.id), units.filter((item) => item.building === "A棟").map((item) => item.id));
+});
+
+test("floor unit sorting is numeric, stable, non-mutating, and keeps Chinese names last", () => {
+  const source = ["A8", "A1", "A4", "A6", "A7", "A3", "A5", "A2"].map((number) => ({ number }));
+  const snapshot = structuredClone(source);
+  assert.deepEqual(sortUnitsByNumber(source).map((item) => item.number), ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"]);
+  assert.deepEqual(sortUnitsByNumber([{ number: "A10" }, { number: "a2" }]).map((item) => item.number), ["a2", "A10"]);
+  assert.deepEqual(sortUnitsByNumber([{ number: "A2" }, { number: "a1" }, { number: "B3" }]).map((item) => item.number), ["a1", "A2", "B3"]);
+  assert.deepEqual(sortUnitsByNumber([{ number: "公共區" }, { number: "A2" }, { number: "健身房" }, { number: "A1" }]).map((item) => item.number), ["A1", "A2", "公共區", "健身房"]);
+  assert.deepEqual(sortUnitsByNumber([{ number: "公共區" }, { number: "Lobby" }, { number: "A2" }, { number: "健身房" }]).map((item) => item.number), ["A2", "公共區", "Lobby", "健身房"]);
+  assert.deepEqual(sortUnitsByNumber([{ number: "B2" }, { number: "A2" }, { number: "a2" }]).map((item) => item.number), ["B2", "A2", "a2"]);
+  assert.deepEqual(source, snapshot);
+});
+
+test("building navigation stays in one building and orders floors high-to-low then units numerically", () => {
+  const source = [
+    unit("13-a2", "A棟", "13F", [], "A2"),
+    unit("14-a8", "A棟", "14F", [], "A8"),
+    unit("other", "B棟", "15F", [], "B1"),
+    unit("14-a1", "A棟", "14F", [], "A1"),
+    unit("13-a1", "A棟", "13F", [], "A1"),
+    { ...unit("deleted", "A棟", "16F", [], "A1"), _deleted: true },
+  ];
+  const ordered = buildingNavigationUnits(source, "A棟");
+  assert.deepEqual(ordered.map((item) => `${item.floor} ${item.number}`), ["14F A1", "14F A8", "13F A1", "13F A2"]);
+  assert.equal(ordered.findIndex((item) => item.id === "14-a1"), 0);
+  assert.equal(ordered.findIndex((item) => item.id === "13-a2"), ordered.length - 1);
+  assert.deepEqual(source.map((item) => item.id), ["13-a2", "14-a8", "other", "14-a1", "13-a1", "deleted"]);
+});
+
+test("unit manager and UnitDetail navigation use the shared derived ordering without changing tabs", () => {
+  const page = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /const floorUnits = sortUnitsByNumber\(buildingUnits\.filter\(/);
+  assert.match(page, /floorContext \? floorUnits : buildingNavigationUnits\(liveEntities\(project\.units\), unit\.building \|\| ""\)/);
+  assert.match(page, /disabled=\{currentNavigationIndex <= 0\}/);
+  assert.match(page, /currentNavigationIndex >= navigationUnits\.length - 1/);
+  assert.match(page, /const \[tab, setTab\] = useState\(floorContext\?\.tab \|\| "master"\)/);
 });
 
 test("one, eight, and arbitrary-size floors use the same all-qualified rule", () => {

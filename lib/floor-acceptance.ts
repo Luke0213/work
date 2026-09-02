@@ -24,6 +24,7 @@ export type FloorAcceptanceUnit = {
   id: string;
   building?: string;
   floor?: string;
+  number?: string;
   acceptances?: Array<{
     id?: string;
     draft?: boolean;
@@ -40,8 +41,49 @@ export type FloorAcceptanceUnit = {
 
 export const floorIdentity = (building: string, floor: string) => `${building}__${floor}`;
 
-export function floorUnitsFor<T extends { building?: string; floor?: string; _deleted?: boolean }>(units: T[], building: string, floor: string): T[] {
-  return units.filter((unit) => unit._deleted !== true && (unit.building || "") === building && (unit.floor || "") === floor);
+const chineseUnitName = /[\u3400-\u9fff]/;
+
+export function sortUnitsByNumber<T extends { number?: string }>(units: T[]): T[] {
+  return units
+    .map((unit, index) => ({ unit, index, name: unit.number || "" }))
+    .sort((left, right) => {
+      const leftChinese = chineseUnitName.test(left.name);
+      const rightChinese = chineseUnitName.test(right.name);
+      const leftNumber = leftChinese ? undefined : left.name.match(/\d+/)?.[0];
+      const rightNumber = rightChinese ? undefined : right.name.match(/\d+/)?.[0];
+      const leftGroup = leftNumber !== undefined ? 0 : 1;
+      const rightGroup = rightNumber !== undefined ? 0 : 1;
+      if (leftGroup !== rightGroup) return leftGroup - rightGroup;
+      if (leftNumber !== undefined && rightNumber !== undefined) {
+        const numericDifference = Number(leftNumber) - Number(rightNumber);
+        if (numericDifference !== 0) return numericDifference;
+      }
+      return left.index - right.index;
+    })
+    .map(({ unit }) => unit);
+}
+
+const floorNumber = (floor: string | undefined) => {
+  const match = (floor || "").match(/^\s*(\d+)\s*(?:F|樓)?\s*$/i);
+  return match ? Number(match[1]) : null;
+};
+
+export function buildingNavigationUnits<T extends { building?: string; floor?: string; number?: string; _deleted?: boolean }>(units: T[], building: string): T[] {
+  const scoped = units.filter((unit) => unit._deleted !== true && (unit.building || "") === building);
+  const floorOrder = [...new Set(scoped.map((unit) => unit.floor || ""))]
+    .map((floor, index) => ({ floor, index, number: floorNumber(floor) }))
+    .sort((left, right) => {
+      if (left.number !== null && right.number !== null) return right.number - left.number || left.index - right.index;
+      if (left.number !== null) return -1;
+      if (right.number !== null) return 1;
+      return left.index - right.index;
+    })
+    .map(({ floor }) => floor);
+  return floorOrder.flatMap((floor) => sortUnitsByNumber(scoped.filter((unit) => (unit.floor || "") === floor)));
+}
+
+export function floorUnitsFor<T extends { building?: string; floor?: string; number?: string; _deleted?: boolean }>(units: T[], building: string, floor: string): T[] {
+  return sortUnitsByNumber(units.filter((unit) => unit._deleted !== true && (unit.building || "") === building && (unit.floor || "") === floor));
 }
 
 export function floorBatchExportable(unit: FloorAcceptanceUnit): boolean {

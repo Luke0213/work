@@ -1366,3 +1366,153 @@ img,canvas{max-width:100%}
     align-items:center;
   }
 }
+
+/* Keep the floor acceptance entry compact and on the same row as the floor toggle. */
+.unit-manager .floor-head:not(.bulk){
+  grid-template-columns:minmax(0,1fr) auto;
+}
+.unit-manager .floor-head:not(.bulk) .floor-row-main{
+  min-width:0;
+}
+.unit-manager .floor-acceptance-entry{
+  grid-column:auto!important;
+  width:auto!important;
+  min-width:58px;
+  min-height:44px!important;
+  margin:4px 6px 4px 0!important;
+  padding:0 12px!important;
+  display:inline-flex!important;
+  flex-direction:row;
+  align-items:center!important;
+  justify-content:center;
+  justify-self:end;
+  align-self:center;
+  white-space:nowrap;
+}
+.unit-manager .floor-acceptance-entry b{
+  font-size:13px;
+  line-height:1;
+}
+@media(max-width:700px){
+  .unit-manager .floor-head:not(.bulk){
+    grid-template-columns:minmax(0,1fr) auto;
+  }
+  .unit-manager .floor-row-main{
+    gap:4px;
+    padding-right:4px;
+  }
+  .unit-manager .floor-summary{
+    gap:2px 5px;
+  }
+  .unit-manager .floor-acceptance-entry{
+    min-width:52px;
+    min-height:42px!important;
+    margin:2px 4px 2px 0!important;
+    padding:0 9px!important;
+  }
+}
+
+/* Unit master keeps customer contacts visible while engineering fields stay collapsible. */
+.unit-master-panel{
+  gap:14px;
+}
+.unit-master-customer{
+  min-width:0;
+}
+.unit-master-customer>.panel-head{
+  margin-bottom:10px;
+}
+.unit-master-customer h3,
+.unit-details-disclosure h3{
+  margin:0 0 3px;
+}
+.customer-contact-grid{
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:10px 12px;
+}
+.customer-contact-grid>*{
+  min-width:0;
+}
+.customer-contact-grid input,
+.customer-contact-grid select,
+.customer-contact-grid textarea{
+  width:100%;
+  min-width:0;
+  box-sizing:border-box;
+}
+.customer-contact-wide{
+  grid-column:span 2;
+}
+.unit-master-customer .consent-check{
+  margin-top:10px;
+}
+.unit-details-disclosure{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  min-width:0;
+  padding:12px 0 0;
+  border-top:1px solid var(--line);
+}
+.unit-details-disclosure>div{
+  min-width:0;
+}
+.unit-details-disclosure p{
+  margin:0;
+  color:var(--muted);
+  overflow-wrap:anywhere;
+}
+.unit-details-disclosure button{
+  flex:0 0 auto;
+  white-space:nowrap;
+}
+.unit-details-content{
+  display:flex;
+  flex-direction:column;
+  gap:18px;
+  min-width:0;
+  padding-top:4px;
+}
+@media(min-width:701px) and (max-width:1000px){
+  .customer-contact-grid{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+  .customer-contact-wide,
+  .customer-contact-source{
+    grid-column:1/-1;
+  }
+}
+@media(max-width:700px){
+  .unit-master-panel{
+    gap:12px;
+  }
+  .customer-contact-grid{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:9px 8px;
+  }
+  .customer-contact-wide,
+  .customer-contact-source{
+    grid-column:1/-1;
+  }
+  .unit-details-disclosure{
+    align-items:center;
+    flex-wrap:wrap;
+  }
+  .unit-details-disclosure button{
+    margin-left:auto;
+  }
+}
+@media(max-width:340px){
+  .customer-contact-grid{
+    grid-template-columns:1fr;
+  }
+  .customer-contact-wide,
+  .customer-contact-source{
+    grid-column:auto;
+  }
+  .unit-details-disclosure button{
+    width:100%;
+    margin-left:0;
+  }
+}

@@ -18,7 +18,7 @@ import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-
 import { areaInputToPing, areaValueFromPing, convertAreaInput, type AreaUnit } from "../lib/area";
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, importedAreaEntry, importedAreaToCanonicalPing, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated, type ImportAreaDetection } from "../lib/unit-import";
-import { buildUnitScopedRecord, createFloorReturnContext, floorAcceptanceSummary, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
+import { buildUnitScopedRecord, buildingNavigationUnits, createFloorReturnContext, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, sortUnitsByNumber, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 import { canWriteAcceptanceLifecycle, canWriteWorkLifecycle } from "../lib/unit-lifecycle";
 
@@ -2839,9 +2839,9 @@ function Units({
                     <i>{buildingOpen ? "⌃" : "⌄"}</i>
                   </button>
                   {buildingOpen && floors.map((floor) => {
-                    const floorUnits = buildingUnits.filter(
+                    const floorUnits = sortUnitsByNumber(buildingUnits.filter(
                         (u) => (u.floor || "未分類樓層") === floor,
-                      ),
+                      )),
                       groupKey = `${building}__${floor}`,
                       isOpen = expanded.includes(groupKey),
                       floorStates = unitProgressStatuses
@@ -2852,8 +2852,7 @@ function Units({
                               floorUnits.filter((u) => getUnitCurrentStatus(u) === s).length,
                             ] as const,
                         )
-                        .filter((x) => x[1] > 0),
-                      acceptanceSummary = floorAcceptanceSummary(floorUnits);
+                        .filter((x) => x[1] > 0);
                     return (
                       <div className="floor-group" key={groupKey}>
                         <div
@@ -2887,8 +2886,7 @@ function Units({
                             floorUnits[0]?.building || (building === "未分類棟" ? "" : building),
                             floorUnits[0]?.floor || (floor === "未分類樓層" ? "" : floor),
                           )}>
-                            <b>驗收／簽名</b>
-                            <small>{acceptanceSummary.allQualified ? `✓ ${acceptanceSummary.total} / ${acceptanceSummary.total} 全部合格` : `合格 ${acceptanceSummary.qualified} · 待處理 ${acceptanceSummary.needsAction} · 未驗收 ${acceptanceSummary.uninspected}`}</small>
+                            <b>驗收</b>
                           </button>
                         </div>
                         {isOpen && (
@@ -4063,7 +4061,7 @@ function UnitDetail({
   remove: () => void;
 }) {
   const [tab, setTab] = useState(floorContext?.tab || "master");
-  const navigationUnits = floorContext ? floorUnits : liveEntities(project.units);
+  const navigationUnits = floorContext ? floorUnits : buildingNavigationUnits(liveEntities(project.units), unit.building || "");
   const currentNavigationIndex = navigationUnits.findIndex((item) => item.id === unit.id);
   useEffect(() => { if (floorContext?.tab) setTab(floorContext.tab); }, [unit.id, floorContext?.tab]);
   useEffect(() => {
@@ -4090,7 +4088,7 @@ function UnitDetail({
             {unit.building} · {unit.floor} · {unit.number}
           </h1>
           <p className="unit-head-meta">
-            {unit.brand} {unit.model}／{unit.colorNo} · 預估 {unit.estimated} 坪
+            {unit.brand} {unit.model}／{unit.colorNo}
           </p>
           {activity && <small className="muted">最後修改：{activity.updatedByEmail || "未知帳號"} · {new Date(activity.updatedAt).toLocaleString("zh-TW")}</small>}
         </div>
@@ -4198,6 +4196,10 @@ function Master({
   const isCrew = role === "crew";
   const canManage = canManageProjectData(role);
   const [estimatedUnit, setEstimatedUnit] = useState<AreaUnit>("坪");
+  const [unitDetailsOpen, setUnitDetailsOpen] = useState(false);
+  useEffect(() => {
+    setUnitDetailsOpen(false);
+  }, [u.id]);
   const models = [...new Set(p.products.map((x) => x.model).filter(Boolean))],
     colors = [
       ...new Set(
@@ -4218,20 +4220,76 @@ function Master({
     );
   };
   return (
-    <div className="panel form">
-      <div className="panel-head">
-        <div>
-          <h2>戶別主資料</h2>
-          <p>後續場勘、施工、驗收均直接沿用。</p>
+    <div className="panel form unit-master-panel">
+      {!isCrew && <section className="customer-section unit-master-customer">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">選填資料</p>
+            <h3>客戶聯絡資料</h3>
+            <p>供工程聯繫使用；未填寫不影響工程流程。</p>
+          </div>
         </div>
-        {canManage && <button
-          className="danger"
-          onClick={() => confirm("確定刪除此戶及全部工程紀錄？") && remove()}
+        <div className="grid3 customer-contact-grid">
+          <Field label="客戶姓名" value={u.owner} set={(owner: string) => patch({ owner })} />
+          <Field label="聯絡電話" value={u.phone} set={(phone: string) => patch({ phone })} />
+          <Field label="LINE ID" value={u.lineId} set={(lineId: string) => patch({ lineId })} />
+          <Field label="Email" type="email" value={u.email} set={(email: string) => patch({ email })} />
+          <label className="field">
+            <span>身分類型</span>
+            <select value={u.customerRole} onChange={(e) => patch({ customerRole: e.target.value })}>
+              <option value="">未選擇</option>
+              <option>屋主</option><option>家人</option><option>設計師</option><option>其他</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>偏好聯絡方式</span>
+            <select value={u.contactPreference} onChange={(e) => patch({ contactPreference: e.target.value })}>
+              <option value="">未選擇</option>
+              <option>電話</option><option>LINE</option><option>Email</option>
+            </select>
+          </label>
+          <div className="customer-contact-wide"><Field label="客戶需求／備註" value={u.customerNeed} set={(customerNeed: string) => patch({ customerNeed })} /></div>
+          <div className="customer-contact-source"><Field label="資料來源" value={u.customerSource} set={(customerSource: string) => patch({ customerSource })} /></div>
+        </div>
+        <label className="consent-check">
+          <input
+            type="checkbox"
+            checked={u.marketingConsent}
+            onChange={(e) => patch({ marketingConsent: e.target.checked, consentAt: e.target.checked ? stamp() : "" })}
+          />
+          <span><b>同意接收後續服務資訊</b><small>此項與工程聯絡用途分開，可隨時取消。</small></span>
+        </label>
+        {u.marketingConsent && <div className="consent-time">同意時間：{u.consentAt}</div>}
+      </section>}
+      <div className="unit-details-disclosure">
+        <div>
+          <h3>戶別資料</h3>
+          <p>{u.building || "—"} · {u.floor || "—"} · {u.number || "—"}</p>
+        </div>
+        <button
+          type="button"
+          className="ghost"
+          aria-expanded={unitDetailsOpen}
+          aria-controls="unit-master-details"
+          onClick={() => setUnitDetailsOpen((open) => !open)}
         >
-          刪除戶別
-        </button>}
+          {unitDetailsOpen ? "收起戶別資料" : "顯示戶別資料"} {unitDetailsOpen ? "⌃" : "⌄"}
+        </button>
       </div>
-      <div className="grid3">
+      {unitDetailsOpen && <section id="unit-master-details" className="unit-details-content">
+        <div className="panel-head">
+          <div>
+            <h2>戶別主資料</h2>
+            <p>後續場勘、施工、驗收均直接沿用。</p>
+          </div>
+          {canManage && <button
+            className="danger"
+            onClick={() => confirm("確定刪除此戶及全部工程紀錄？") && remove()}
+          >
+            刪除戶別
+          </button>}
+        </div>
+        <div className="grid3">
         <Field
           label="建案名稱（全案共用）"
           value={p.name}
@@ -4304,8 +4362,8 @@ function Master({
           disabled={isCrew}
           set={(note: string) => patch({ note })}
         />
-      </div>
-      <label>
+        </div>
+        <label>
         <input
           type="checkbox"
           disabled={isCrew}
@@ -4313,56 +4371,16 @@ function Master({
           onChange={(e) => patch({ custom: e.target.checked })}
         />{" "}
         客變戶
-      </label>
-      {u.custom && (
-        <Field
-          label="客變說明"
-          value={u.customNote}
-          disabled={isCrew}
-          set={(customNote: string) => patch({ customNote })}
-        />
-      )}
-      {!isCrew && <section className="customer-section">
-        <div className="panel-head">
-          <div>
-            <p className="eyebrow">選填資料</p>
-            <h3>客戶聯絡資料</h3>
-            <p>供工程聯繫使用；未填寫不影響工程流程。</p>
-          </div>
-        </div>
-        <div className="grid3">
-          <Field label="客戶姓名" value={u.owner} set={(owner: string) => patch({ owner })} />
-          <Field label="聯絡電話" value={u.phone} set={(phone: string) => patch({ phone })} />
-          <Field label="LINE ID" value={u.lineId} set={(lineId: string) => patch({ lineId })} />
-          <Field label="Email" type="email" value={u.email} set={(email: string) => patch({ email })} />
-          <label className="field">
-            <span>身分類型</span>
-            <select value={u.customerRole} onChange={(e) => patch({ customerRole: e.target.value })}>
-              <option value="">未選擇</option>
-              <option>屋主</option><option>家人</option><option>設計師</option><option>其他</option>
-            </select>
-          </label>
-          <label className="field">
-            <span>偏好聯絡方式</span>
-            <select value={u.contactPreference} onChange={(e) => patch({ contactPreference: e.target.value })}>
-              <option value="">未選擇</option>
-              <option>電話</option><option>LINE</option><option>Email</option>
-            </select>
-          </label>
-          <Field label="客戶需求／備註" value={u.customerNeed} set={(customerNeed: string) => patch({ customerNeed })} />
-          <Field label="資料來源" value={u.customerSource} set={(customerSource: string) => patch({ customerSource })} />
-        </div>
-        <label className="consent-check">
-          <input
-            type="checkbox"
-            checked={u.marketingConsent}
-            onChange={(e) => patch({ marketingConsent: e.target.checked, consentAt: e.target.checked ? stamp() : "" })}
-          />
-          <span><b>同意接收後續服務資訊</b><small>此項與工程聯絡用途分開，可隨時取消。</small></span>
         </label>
-        {u.marketingConsent && <div className="consent-time">同意時間：{u.consentAt}</div>}
-      </section>}
-      {canManage && (u.status === "待確認" ? (
+        {u.custom && (
+          <Field
+            label="客變說明"
+            value={u.customNote}
+            disabled={isCrew}
+            set={(customNote: string) => patch({ customNote })}
+          />
+        )}
+        {canManage && (u.status === "待確認" ? (
         <button
           className="primary"
           disabled={
@@ -4395,15 +4413,13 @@ function Master({
         <div className="save-success">
           ✓ 戶別主資料已建立，後續工程節點將直接沿用
         </div>
-      ))}
+        ))}
+      </section>}
     </div>
   );
 }
 function AutoRecord({ label, at }: { label: string; at: string }) {
   return <div className="auto-record"><span>●</span><div><b>{label}</b><small>{at || stamp()}｜由系統自動記錄，不需另外填寫</small></div></div>;
-}
-function InspectionGuide() {
-  return <div className="inspection-guide" aria-label="檢查操作順序"><span>① 檢查項目</span><span>② 合格／不合格／待確認</span><span>③ 數值／選項</span><span>④ 📷 照片</span><span>⑤ 📝 備註</span><span>⑥ 💾 暫存／✓ 完成</span></div>;
 }
 function SurveyTab({
   project,
@@ -4604,7 +4620,6 @@ function SurveyTab({
         </div>
       </div>
       {historyMode && <div className="warning history-view-banner"><span>正在查看最新場勘紀錄</span><button className="ghost" type="button" onClick={exitSurveyHistory}>結束查看／建立新場勘</button></div>}
-      <InspectionGuide />
       <AutoRecord label="場勘開始時間" at={s.startedAt || s.date} />
       <section className="survey-area-panel survey-estimated-area">
         <div><h3>預估施工坪數</h3><p>沿用戶別主資料，此處僅供查看。</p></div>
@@ -4888,7 +4903,6 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
         </div>
       </div>
       {historyMode && <div className="warning history-view-banner"><span>正在查看最新施工紀錄</span><button className="ghost" type="button" onClick={exitWorkHistory}>結束查看／建立新施工紀錄</button></div>}
-      <InspectionGuide />
       <AutoRecord label="施工紀錄時間" at={w.startedAt || w.date} />
       {!canWriteWork && (
         <div className="warning">
@@ -5146,7 +5160,6 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         </div>
       </div>
       {historyMode && <div className="warning">正在查看最新正式驗收／複驗紀錄；檢視期間不會寫入或覆蓋未完成草稿。 <button type="button" className="ghost" onClick={exitAcceptanceHistory}>結束查看／建立新驗收</button></div>}
-      <InspectionGuide />
       <AutoRecord label={a.recheck ? "複驗開始時間" : "驗收開始時間"} at={a.startedAt || a.date} />
       {!historyMode && !canWriteAcceptanceLifecycle(u.status, a.recheck) && <div className="warning">目前工程狀態不可建立新的{a.recheck ? "複驗" : "驗收"}；仍可查看既有驗收歷史。</div>}
       <div className="summary">

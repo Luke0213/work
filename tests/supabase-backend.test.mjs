@@ -436,6 +436,23 @@ test("floor progress summaries count one normalized current status per unit", as
   assert.match(page, /tasks = \{[\s\S]*getUnitCurrentStatus\(u\) === "待場勘"[\s\S]*getUnitCurrentStatus\(u\) === "改善中"[\s\S]*getUnitCurrentStatus\(u\) === "待驗收"/);
 });
 
+test("floor acceptance entry stays a compact sibling action on the floor heading row", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const floorList = page.slice(page.indexOf("{buildingOpen && floors.map"), page.indexOf("{!shown.length"));
+  const entryStart = floorList.indexOf('<button className="floor-acceptance-entry"');
+  const entry = floorList.slice(entryStart, floorList.indexOf("</button>", entryStart) + "</button>".length);
+  assert.match(floorList, /className="floor-row-main"[\s\S]*?<\/button>\s*<button className="floor-acceptance-entry"/);
+  assert.match(entry, /<b>驗收<\/b>/);
+  assert.doesNotMatch(entry, /<small>|驗收／簽名/);
+  assert.match(entry, /onClick=\{\(\) => openFloor\(/);
+  const finalOverride = css.slice(css.lastIndexOf("Keep the floor acceptance entry compact"));
+  assert.match(finalOverride, /\.unit-manager \.floor-head:not\(\.bulk\)\{[\s\S]*grid-template-columns:minmax\(0,1fr\) auto/);
+  assert.match(finalOverride, /\.unit-manager \.floor-acceptance-entry\{[\s\S]*grid-column:auto!important;[\s\S]*width:auto!important;[\s\S]*min-height:44px!important/);
+  assert.match(finalOverride, /@media\(max-width:700px\)[\s\S]*min-width:52px;[\s\S]*min-height:42px!important/);
+  assert.doesNotMatch(finalOverride, /width:calc\(100% - 8px\)|grid-column:2/);
+});
+
 test("survey includes silicone, divider, parking, staging area, and two signatures", async () => {
   const page = await read("app/page.tsx");
   for (const value of ["siliconeInspection", "dividerInspection", "parking", "stagingArea", "surveySignatures", "是否跟地板顏色一致", "其他顏色", "是否需要分隔條", "可停車數量", "停車位置說明", "放料區域", "注意事項", "場勘檢查人員簽名", "至少需要 2 位"]) assert.match(page, new RegExp(value));
@@ -497,8 +514,17 @@ test("offline IndexedDB outbox and acceptance exports are wired", async () => {
   const exports = await read("lib/acceptance-exports.ts");
   for (const value of ["indexedDB.open", "drafts", "outbox", "recordId", "baseVersion", "photoCount", "retries", "conflict"]) assert.match(offline, new RegExp(value));
   for (const value of ["應收帳款明細表", "SPC已出貨明細總表", "3.305785", "銷貨小計", "稅金", "應收合計", "發票字軌", "freeze", "autofilter", "printArea"]) assert.match(exports, new RegExp(value));
-  for (const value of ["第一次使用，照這 5 步即可", "InspectionGuide", "應收帳款 Excel", "報表／匯出", "SPC 已出貨明細總表", "shipmentRecords = monthlyBillingRecords", "createReceivableWorkbook", "saveReceivableWorkbook", "確認產生 Excel", "使用 Supabase 最新資料", "保留這台電腦內容並重新同步"]) assert.match(page, new RegExp(value));
+  for (const value of ["第一次使用，照這 5 步即可", "應收帳款 Excel", "報表／匯出", "SPC 已出貨明細總表", "shipmentRecords = monthlyBillingRecords", "createReceivableWorkbook", "saveReceivableWorkbook", "確認產生 Excel", "使用 Supabase 最新資料", "保留這台電腦內容並重新同步"]) assert.match(page, new RegExp(value));
   assert.doesNotMatch(page, /帳單 Word|createReceivableDocx|應收帳款明細表\.docx/);
+});
+
+test("unit header omits estimated area and inspection pages omit the six-step guide only", async () => {
+  const page = await read("app/page.tsx");
+  const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
+  assert.match(unitDetail, /\{unit\.brand\} \{unit\.model\}／\{unit\.colorNo\}/);
+  assert.doesNotMatch(unitDetail, /預估 \{unit\.estimated\} 坪/);
+  assert.doesNotMatch(page, /InspectionGuide|inspection-guide/);
+  for (const value of ["進場條件場勘", "基本資料會沿用至後續所有工程節點。", "施工紀錄", "基本資料會沿用，施工時間由系統自動記錄。", "完工驗收", "基本資料與施工紀錄會自動帶入", "場勘開始時間", "施工紀錄時間", "驗收開始時間"]) assert.match(page, new RegExp(value));
 });
 
 test("billing screen, receivable Excel, totals, and print share the selected month records", async () => {
@@ -1059,13 +1085,38 @@ test("tablet and phone layouts use drawers, stacked forms, and safe scrolling", 
 test("final mobile unit manager override stays full-width with compact shrinkable floor rows", async () => {
   const css = await read("app/globals.css");
   const marker = "Final mobile unit-manager width and compact-floor override (#7/#8).";
-  const mobile = css.slice(css.indexOf(marker));
+  const mobile = css.slice(css.indexOf(marker), css.indexOf("Keep the floor acceptance entry compact", css.indexOf(marker)));
   assert.match(mobile, /@media\(max-width:700px\)/);
   assert.match(mobile, /\.unit-manager[\s\S]*\.unit-manager \.building-groups[\s\S]*\.unit-manager \.building-group[\s\S]*width:100%;[\s\S]*min-width:0;[\s\S]*max-width:100%/);
   assert.match(mobile, /\.unit-manager \.floor-head\{[\s\S]*grid-template-columns:minmax\(0,1fr\);[\s\S]*min-height:46px/);
   assert.match(mobile, /\.unit-manager \.floor-head\.bulk\{[\s\S]*grid-template-columns:28px minmax\(0,1fr\)/);
   assert.match(mobile, /\.unit-manager \.floor-row-main\{[\s\S]*min-height:46px;[\s\S]*grid-template-columns:auto auto minmax\(0,1fr\) 18px/);
   assert.doesNotMatch(mobile, /@media\(min-width:701px\)/);
+});
+
+test("unit master keeps customer contacts visible above collapsible engineering details", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const master = page.slice(page.indexOf("function Master("), page.indexOf("function AutoRecord("));
+  const customerStart = master.indexOf('!isCrew && <section className="customer-section unit-master-customer">');
+  const disclosureStart = master.indexOf('className="unit-details-disclosure"');
+  const detailsStart = master.indexOf('{unitDetailsOpen && <section id="unit-master-details"');
+
+  assert.match(master, /const \[unitDetailsOpen, setUnitDetailsOpen\] = useState\(false\)/);
+  assert.match(master, /useEffect\(\(\) => \{\s*setUnitDetailsOpen\(false\);\s*\}, \[u\.id\]\)/);
+  assert.match(master, /type="button"[\s\S]*aria-expanded=\{unitDetailsOpen\}[\s\S]*aria-controls="unit-master-details"/);
+  assert.ok(customerStart >= 0 && customerStart < disclosureStart && disclosureStart < detailsStart);
+  assert.doesNotMatch(master.slice(customerStart, detailsStart), /\{unitDetailsOpen &&[\s\S]*customer-section/);
+  const details = master.slice(detailsStart);
+  for (const content of ["建案名稱（全案共用）", "客變戶", "刪除戶別", "確認資料無誤 → 安排場勘"])
+    assert.match(details, new RegExp(content));
+  assert.match(master, /confirm\("確定刪除此戶及全部工程紀錄？"\) && remove\(\)/);
+  for (const mapping of ["owner", "phone", "lineId", "email", "customerRole", "contactPreference", "customerNeed", "customerSource", "marketingConsent", "consentAt"])
+    assert.match(master, new RegExp(`patch\\(\\{[^}]*${mapping}`));
+  assert.match(css, /\.customer-contact-grid\{[\s\S]*grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
+  assert.match(css, /@media\(min-width:701px\) and \(max-width:1000px\)\{[\s\S]*\.customer-contact-grid\{[\s\S]*repeat\(2,minmax\(0,1fr\)\)/);
+  assert.match(css, /@media\(max-width:700px\)\{[\s\S]*\.customer-contact-grid\{[\s\S]*repeat\(2,minmax\(0,1fr\)\)/);
+  assert.match(css, /@media\(max-width:340px\)\{[\s\S]*\.customer-contact-grid\{[\s\S]*grid-template-columns:1fr/);
 });
 
 test("every unfinished data-entry flow has durable drafts and notes", async () => {

@@ -90,7 +90,7 @@ test("UnitDetail provides bounded project and floor navigation without resetting
   const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
   const floorView = page.slice(page.indexOf("function FloorAcceptanceView("), page.indexOf("function UnitDetail("));
 
-  assert.match(unitDetail, /const navigationUnits = floorContext \? floorUnits : liveEntities\(project\.units\)/);
+  assert.match(unitDetail, /const navigationUnits = floorContext \? floorUnits : buildingNavigationUnits\(liveEntities\(project\.units\), unit\.building \|\| ""\)/);
   assert.match(unitDetail, /const currentNavigationIndex = navigationUnits\.findIndex\(\(item\) => item\.id === unit\.id\)/);
   assert.doesNotMatch(unitDetail, /\{floorContext && <div className="floor-unit-navigation">/);
   assert.match(unitDetail, /disabled=\{currentNavigationIndex <= 0\}/);
