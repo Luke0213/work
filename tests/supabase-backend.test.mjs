@@ -129,16 +129,19 @@ test("offline drafts are account-scoped and recoverable for every authorized rol
   assert.match(page, /暫存未完成驗收/);
 });
 
-test("admins can create email or Taiwan phone accounts with a forced password change", async () => {
+test("account creation is applicant-owned while admin reset preserves metadata and forces password change", async () => {
   const page = await read("app/page.tsx");
   const api = await read("app/api/admin/users/route.ts");
+  const applicationApi = await read("app/api/account-applications/route.ts");
   const audit = await read("supabase/migrations/202608260005_phone_identity_audit.sql");
   assert.match(page, /電子郵件或手機號碼/);
   assert.match(page, /must_change_password/);
-  assert.match(api, /auth\.admin\.createUser/);
+  assert.doesNotMatch(api, /action: "create"|auth\.admin\.createUser|建立新帳號/);
+  assert.match(applicationApi, /auth\.admin\.createUser/);
   assert.match(api, /1234qwer/);
-  assert.match(api, /@phone\.spc\.internal/);
-  assert.match(api, /local_phone/);
+  assert.match(api, /user_metadata: \{ \.\.\.existing\.user\.user_metadata, must_change_password: true \}/);
+  assert.match(applicationApi, /@phone\.spc\.internal/);
+  assert.match(applicationApi, /local_phone/);
   assert.match(audit, /auth\.jwt\(\)->>'phone'/);
 });
 
@@ -436,13 +439,163 @@ test("floor progress summaries count one normalized current status per unit", as
   assert.match(page, /tasks = \{[\s\S]*getUnitCurrentStatus\(u\) === "待場勘"[\s\S]*getUnitCurrentStatus\(u\) === "改善中"[\s\S]*getUnitCurrentStatus\(u\) === "待驗收"/);
 });
 
+test("account lifecycle is profile-gated, unit-safe, and server-authorized", async () => {
+  const page = await read("app/page.tsx");
+  const auth = await read("lib/auth-session.ts");
+  const applicationApi = await read("app/api/account-applications/route.ts");
+  const adminApi = await read("app/api/admin/users/route.ts");
+  const migration = await read("supabase/migrations/202609030001_role_permissions.sql");
+  assert.match(page, /spc_current_account_profile/);
+  assert.doesNotMatch(page, /spc_current_role/);
+  assert.doesNotMatch(page, /\? data as AppRole : "client"/);
+  assert.match(auth, /role: Role \| null/);
+  assert.match(auth, /applicationStatus: AccountApplicationStatus/);
+  assert.match(page, /applicationStatus === "pending"[\s\S]*AccountStatusScreen/);
+  assert.match(page, /applicationStatus === "rejected"[\s\S]*RejectedAccountScreen/);
+  const gate = page.slice(page.indexOf('if (authSnapshot.applicationStatus === "pending")'), page.indexOf("function AuthLoading"));
+  assert.match(gate, /!authSnapshot\.active \|\| authSnapshot\.applicationStatus !== "approved"/);
+  assert.match(gate, /AuthOwnerContext\.Provider[\s\S]*AdminApp/);
+  assert.doesNotMatch(gate.slice(0, gate.indexOf("return <AuthOwnerContext.Provider")), /AuthOwnerContext|AdminApp|loadWorkspace/);
+  assert.match(adminApi, /select\("user_id, email, display_name, role, active, application_status"\)/);
+  assert.match(page, /const title = user\.displayName \|\| identity/);
+  assert.match(page, /client: "廠商"/);
+  assert.doesNotMatch(page, /客戶端/);
+  assert.match(page, /if \(pending\) \{ setApprovalRoles/);
+  assert.doesNotMatch(page.match(/if \(pending\) \{[^}]+\}/)?.[0] || "", /\bact\(/);
+  assert.match(adminApi, /action: "approve"/);
+  assert.match(adminApi, /action: "reject"/);
+  assert.match(adminApi, /roles\.has\(body\.role\)/);
+  assert.match(adminApi, /LAST_ACTIVE_ADMIN/);
+  assert.match(adminApi, /body\.userId === access\.user\.id/);
+  assert.match(adminApi, /application_status !== "approved"/);
+  assert.match(adminApi, /user_metadata: \{ \.\.\.target\.data\.user\.user_metadata, display_name: displayName \}/);
+  const rejectPath = adminApi.slice(adminApi.indexOf('if (body.action === "reject")'), adminApi.indexOf("if (body.userId === access.user.id"));
+  assert.doesNotMatch(rejectPath, /deleteUser|password|876000h/);
+  assert.match(rejectPath, /ban_duration: "none"/);
+  assert.match(applicationApi, /export async function PATCH/);
+  assert.match(applicationApi, /authorization/);
+  assert.match(applicationApi, /auth\.getUser\(token\)/);
+  assert.doesNotMatch(applicationApi.slice(applicationApi.indexOf("export async function PATCH")), /body\.userId/);
+  assert.match(applicationApi, /application_status !== "rejected"/);
+  assert.match(applicationApi, /applicationRoles/);
+  assert.doesNotMatch(applicationApi, /applicationRoles[^\n]+admin/);
+  assert.match(page, /const canManageAccounts = appRole === "admin"/);
+  assert.match(migration, /spc_current_account_profile\(\)/);
+  assert.match(migration, /where user_role\.user_id = auth\.uid\(\)/);
+  assert.match(migration, /revoke all on function public\.spc_current_account_profile\(\) from public, anon, authenticated/);
+  assert.match(migration, /grant execute on function public\.spc_current_account_profile\(\) to authenticated/);
+  assert.doesNotMatch(migration, /delete\s+from|truncate|storage\.|spc_workspace/);
+});
+
+test("role permission matrix loads and saves only the three configurable roles", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const api = await read("app/api/admin/users/route.ts");
+  const auth = await read("lib/auth-session.ts");
+  const matrix = page.slice(page.indexOf("const permissionLabels"), page.indexOf("function SystemEntry"));
+  for (const label of ["修改戶別資料", "場勘", "施工", "驗收", "驗收日誌", "缺失改善", "應收帳款", "細總表", "全部"]) assert.match(matrix, new RegExp(label));
+  assert.match(matrix, /CONFIGURABLE_ROLES\.map/);
+  assert.match(matrix, /crew: "工班人員", client: "廠商", sales: "代銷"/);
+  assert.doesNotMatch(matrix.match(/configurableRoleLabels[^;]+/)?.[0] || "", /admin|shenyin/);
+  assert.match(matrix, /setAllRolePermissions\(current\[role\], checked\)/);
+  assert.match(matrix, /hasAllRolePermissions\(value\)/);
+  assert.match(matrix, /setPermissionsDraft[\s\S]*有尚未儲存的變更[\s\S]*儲存權限設定/);
+  const checkboxUpdate = matrix.slice(matrix.indexOf("const updatePermission"), matrix.indexOf("const savePermissions"));
+  assert.doesNotMatch(checkboxUpdate, /adminRequest|fetch\(/);
+  assert.match(api, /rolePermissions: rolePermissionMatrixFromDatabaseRows\(permissionRows\)/);
+  assert.match(api, /action: "permissions"/);
+  assert.match(api, /parseRolePermissionMatrix\(body\.permissions\)/);
+  assert.match(api, /Authorization: `Bearer \$\{access\.token\}`/);
+  assert.match(api, /caller\.rpc\("spc_admin_save_role_permissions", \{ p_permissions: permissions \}\)/);
+  assert.doesNotMatch(matrix, /from\("spc_role_permissions"\)|spc_admin_save_role_permissions/);
+  assert.match(page, /supabase\.rpc\("spc_current_permissions"\)/);
+  assert.match(auth, /permissions: RolePermissions/);
+  assert.match(auth, /AUTH_PERMISSIONS_TIMEOUT/);
+  assert.doesNotMatch(matrix, /localStorage|saveWorkspace|loadWorkspace/);
+  assert.match(css, /\.role-permission-scroll\{[^}]*overflow-x:auto/);
+  assert.match(css, /\.role-permission-matrix th:first-child\{[^}]*position:sticky/);
+  assert.match(css, /\.role-permission-matrix label\{[^}]*min-width:44px;min-height:44px/);
+  const accessLogic = page.slice(page.indexOf("const canUseSystem"), page.indexOf("const sideViews"));
+  assert.match(accessLogic, /canUseView = canUsePermissionView/);
+  assert.match(accessLogic, /canUseUnitTab = canUsePermissionUnitTab/);
+});
+
+test("phase four permissions hide restricted UI and guard front-end operations", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const uiPermissions = await read("lib/ui-permissions.ts");
+  const access = page.slice(page.indexOf("const canUseSystem"), page.indexOf("const sideViews"));
+  const admin = page.slice(page.indexOf("function AdminApp("), page.indexOf("type ManagedUser"));
+  const project = page.slice(page.indexOf("function ProjectArea("), page.indexOf("type ReportSourceDraft"));
+  const units = page.slice(page.indexOf("function Units("), page.indexOf("function FloorAcceptanceView"));
+  const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
+  const next = page.slice(page.indexOf("function Next("), page.indexOf("function Master("));
+  const master = page.slice(page.indexOf("function Master("), page.indexOf("function AutoRecord("));
+  const accounts = page.slice(page.indexOf("function AccountManagement("), page.indexOf("function SystemEntry"));
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
+
+  assert.match(access, /canUseView = canUsePermissionView/);
+  assert.match(access, /canUseUnitTab = canUsePermissionUnitTab/);
+  assert.match(uiPermissions, /if \(view === "accounts"\) return role === "admin"/);
+  assert.match(uiPermissions, /if \(hasFullBusinessAccess\(role\)\) return true/);
+  for (const [key, permission] of [["daily-acceptance", "useAcceptance"], ["journal", "useAcceptanceJournal"]])
+    assert.match(uiPermissions, new RegExp(`view === "${key}"[^\n]+permissions\\.${permission}`));
+  assert.match(uiPermissions, /view === "billing"[^\n]+financeUiMode\(role, permissions\)\.canEnter/);
+  for (const [tab, permission] of [["survey", "useSurvey"], ["work", "useWork"], ["journal", "useAcceptanceJournal"], ["defect", "useDefects"]])
+    assert.match(uiPermissions, new RegExp(`tab === "${tab}"[^\n]+permissions\\.${permission}`));
+  assert.match(uiPermissions, /tab === "accept" \|\| tab === "sheet"[^\n]+permissions\.useAcceptance/);
+  assert.match(uiPermissions, /if \(tab === "master"\) return true/);
+
+  assert.match(admin, /sideViews\.filter\(\(\[key\]\) => canUseView\(appRole, permissions, key\)\)/);
+  assert.match(admin, /const canUseAcceptance = canUseUnitTab\(appRole, permissions, "accept"\)/);
+  assert.match(admin, /if \(canUseAcceptance \|\| !floorContext\) return;[\s\S]*setFloorContext\(null\)/);
+  assert.match(admin, /openFloor=\{\(building, floor\) => \{ if \(canUseAcceptance\)/);
+  assert.match(unitDetail, /permissions: RolePermissions/);
+  assert.match(unitDetail, /set=\{\(next\) => \{ if \(canUseUnitTab\(role, permissions, next\)\) setTab\(next\); \}\}/);
+  assert.match(unitDetail, /if \(!canUseUnitTab\(role, permissions, tab\)\) setTab\("master"\)/);
+  assert.match(unitDetail, /\.filter\(\(\[value\]\) => canUseUnitTab\(role, permissions, value\)\)/);
+  assert.match(next, /if \(!canUseUnitTab\(role, permissions, t\)\) return null/);
+  assert.match(units, /\{canAccept && <button className="floor-acceptance-entry"/);
+
+  assert.match(units, /canEditExisting: boolean/);
+  assert.match(units, /canCreate: boolean/);
+  assert.match(units, /const create = \(\) => \{\s+if \(!canCreate\) return/);
+  assert.match(units, /const createBatch = \(\) => \{\s+if \(!canCreate\) return/);
+  assert.match(master, /canEditExisting: boolean/);
+  assert.match(master, /canDelete: boolean/);
+  assert.match(master, /canConfirm: boolean/);
+  assert.match(master, /if \(!canEditExisting\) return/);
+  assert.match(master, /disabled=\{!canEditExisting\}/);
+  assert.match(master, /\{canDelete && <button[\s\S]*className="danger"/);
+  assert.match(master, /\{canConfirm && \(u\.status === "待確認"/);
+  assert.match(unitDetail, /patch=\{\(value\) => \{ if \(canEditExisting\) patch\(value\); \}\}/);
+  assert.match(unitDetail, /remove=\{\(\) => \{ if \(canDelete\) remove\(\); \}\}/);
+
+  assert.match(project, /safeView = canUseView\(role, permissions, view\)/);
+  assert.match(project, /const financeAccess = financeUiMode\(role, permissions\)/);
+  assert.match(billing, /const \{ canExportReceivables, canExportShipment, canManageFinance \} = financeAccess/);
+  assert.match(billing, /if \(!canExportReceivables\) return/);
+  assert.match(billing, /if \(!canExportShipment\) return/);
+  assert.match(billing, /if \(!canManageFinance\) return/);
+  assert.match(billing, /canExportReceivables && <button[\s\S]*應收帳款 Excel/);
+  assert.match(billing, /canExportShipment && <button[\s\S]*SPC 已出貨明細總表/);
+  assert.match(css, /\.shipment-export-preview\.finance-readonly[\s\S]*td:first-child[\s\S]*display:none/);
+  assert.match(master, /const isCrew = role === "crew"/);
+  assert.match(master, /const showCustomerDetails = !isCrew && canViewCustomerDetails\(role\)/);
+  assert.match(master, /\{showCustomerDetails && <section className="customer-section unit-master-customer"/);
+
+  assert.match(accounts, /permissionsDirty && !confirm\("尚未儲存的權限變更將被放棄，確定重新整理嗎？"\)\) return/);
+  assert.match(accounts, /onClick=\{refreshUsers\}/);
+  assert.doesNotMatch(project + unitDetail + master + billing, /delete\s+from|truncate|cleanupRemovedPhotos/);
+});
+
 test("floor acceptance entry stays a compact sibling action on the floor heading row", async () => {
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
   const floorList = page.slice(page.indexOf("{buildingOpen && floors.map"), page.indexOf("{!shown.length"));
   const entryStart = floorList.indexOf('<button className="floor-acceptance-entry"');
   const entry = floorList.slice(entryStart, floorList.indexOf("</button>", entryStart) + "</button>".length);
-  assert.match(floorList, /className="floor-row-main"[\s\S]*?<\/button>\s*<button className="floor-acceptance-entry"/);
+  assert.match(floorList, /className="floor-row-main"[\s\S]*?<\/button>\s*\{canAccept && <button className="floor-acceptance-entry"/);
   assert.match(entry, /<b>驗收<\/b>/);
   assert.doesNotMatch(entry, /<small>|驗收／簽名/);
   assert.match(entry, /onClick=\{\(\) => openFloor\(/);
@@ -783,7 +936,7 @@ test("project daily acceptance view derives final history and reuses shipment wo
   assert.match(page, /\["daily-acceptance", "✓", "今日驗收"\]/);
   assert.match(daily, /buildDailyAcceptanceEntries<Acceptance, Unit>/);
   assert.match(daily, /dailyExportRecords = records\.map\(\(\{ unit, acceptance \}\) => buildAcceptanceExportRecord\(p, unit, acceptance, true\)\)/);
-  assert.match(daily, /onClick=\{\(\) => \{ setShipmentPreview\(true\); setReportMessage\(""\); \}\}/);
+  assert.match(daily, /canExportShipment && <button[\s\S]*setShipmentPreview\(true\)/);
   assert.doesNotMatch(daily, /onClick=\{exportDay\}/);
   assert.match(daily, /title="當日總細表｜匯出預覽"/);
   assert.match(daily, /dailyExportRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
@@ -801,7 +954,7 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   const css = await read("app/globals.css");
   const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
   const receivableFlow = billing.slice(billing.indexOf("openReceivablePreview ="), billing.indexOf("changeBillingPeriod ="));
-  const receivableModal = billing.slice(billing.indexOf("{receivablePreview && receivableDraft"), billing.indexOf("{shipmentPreview &&"));
+  const receivableModal = billing.slice(billing.indexOf("{canExportReceivables && receivablePreview && receivableDraft"), billing.indexOf("{canExportShipment && shipmentPreview &&"));
 
   assert.match(billing, /onClick=\{openReceivablePreview\}[\s\S]*<b>應收帳款 Excel<\/b>[\s\S]*<em>預覽 ›<\/em>/);
   assert.match(receivableFlow, /setReceivableDraft\(buildReceivableExportDraft\(p, billRecords\)\)/);
@@ -1098,7 +1251,7 @@ test("unit master keeps customer contacts visible above collapsible engineering 
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
   const master = page.slice(page.indexOf("function Master("), page.indexOf("function AutoRecord("));
-  const customerStart = master.indexOf('!isCrew && <section className="customer-section unit-master-customer">');
+  const customerStart = master.indexOf('<section className="customer-section unit-master-customer">');
   const disclosureStart = master.indexOf('className="unit-details-disclosure"');
   const detailsStart = master.indexOf('{unitDetailsOpen && <section id="unit-master-details"');
 
