@@ -1050,6 +1050,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
   const baselineRef = useRef<{ projects: Project[]; catalog: Product[] }>({ projects: [], catalog: [] });
   const latestRef = useRef<{ projects: Project[]; catalog: Product[] }>({ projects: [], catalog: [] });
   const remoteConflictRef = useRef<{ projects: Project[]; catalog: Product[] } | null>(null);
+  const hiddenProjectDraftRef = useRef<Project[]>([]);
   const [projects, setProjects] = useState<Project[]>([]),
     [catalog, setCatalog] = useState<Product[]>([]),
     [pid, setPid] = useState(""),
@@ -1111,18 +1112,19 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
         const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
         const snapshot = await loadWorkspace();
-        const legacy = snapshot.projects.length ? null : await loadLegacyWorkspace();
+        const legacy = appRole === "admin" && !snapshot.projects.length ? await loadLegacyWorkspace() : null;
         if (!active) return;
         const localProjects = normalize(JSON.parse(readLocal(scopedKey(key, authUserId)) || "[]"));
         const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
+        hiddenProjectDraftRef.current = appRole === "admin" ? [] : structuredClone(normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]));
         const useDurableDraft = durableDraft?.pending || (!snapshot.projects.length && durableDraft?.projects.length);
-        const loadedProjects = normalize(
+        const loadedProjects = appRole === "admin" ? normalize(
           (useDurableDraft
             ? durableDraft.projects
             : snapshot.projects.length
               ? snapshot.projects
               : legacy?.projects || durableDraft?.projects || localProjects) as Project[],
-        );
+        ) : [];
         const loadedCatalog = (useDurableDraft
           ? durableDraft.catalog
           : snapshot.catalog.length
@@ -1133,30 +1135,32 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         setProjects(loadedProjects);
         setCatalog(loadedCatalog);
         setPid(liveProjectViews(loadedProjects)[0]?.id || "");
-        if (!snapshot.projects.length && loadedProjects.length && !durableDraft?.pending) {
+        if (appRole === "admin" && !snapshot.projects.length && loadedProjects.length && !durableDraft?.pending) {
           versionRef.current = await saveWorkspace(snapshot.version, loadedProjects, loadedCatalog, snapshot.projects, snapshot.catalog);
         }
         baselineRef.current = useDurableDraft
           ? { projects: [], catalog: [] }
           : { projects: structuredClone(loadedProjects), catalog: structuredClone(loadedCatalog) };
         setReady(true);
-        writeWorkspaceDraft(authUserId, loadedProjects, loadedCatalog, versionRef.current, !!useDurableDraft);
+        if (appRole === "admin") writeWorkspaceDraft(authUserId, loadedProjects, loadedCatalog, versionRef.current, !!useDurableDraft);
         setStorageWarning(useDurableDraft ? "尚未同步：已恢復本機暫存" : "已儲存：已與 Supabase 同步");
       } catch (error) {
         const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
         const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
         const localProjects = normalize(JSON.parse(readLocal(scopedKey(key, authUserId)) || "[]"));
         const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
-        const recoveredProjects = normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]);
+        hiddenProjectDraftRef.current = appRole === "admin" ? [] : structuredClone(normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]));
+        const recoveredProjects = appRole === "admin" ? normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]) : [];
         const recoveredCatalog = (durableDraft?.catalog?.length ? durableDraft.catalog : localCatalog) as Product[];
-        if (active && recoveredProjects.length) {
-          setProjects(recoveredProjects);
+        if (active && (appRole !== "admin" || recoveredProjects.length)) {
+          const visibleProjects = appRole === "admin" ? recoveredProjects : [];
+          setProjects(visibleProjects);
           setCatalog(recoveredCatalog);
-          setPid(liveProjectViews(recoveredProjects)[0]?.id || "");
+          setPid(appRole === "admin" ? liveProjectViews(recoveredProjects)[0]?.id || "" : "");
           baselineRef.current = { projects: [], catalog: [] };
           setReady(true);
-          writeWorkspaceDraft(authUserId, recoveredProjects, recoveredCatalog, versionRef.current, true);
-          setStorageWarning("尚未同步：網路或資料庫暫時連不上，已載入本機暫存");
+          if (appRole === "admin") writeWorkspaceDraft(authUserId, recoveredProjects, recoveredCatalog, versionRef.current, true);
+          setStorageWarning(appRole === "admin" ? "尚未同步：網路或資料庫暫時連不上，已載入本機暫存" : "資料初始化失敗：目前無法連線至案場資料");
         } else {
           setStorageWarning(`資料初始化失敗：${error instanceof Error ? error.message : "請執行新版 migration"}`);
         }
@@ -1164,7 +1168,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     };
     void load();
     return () => { active = false; };
-  }, [authUserId]);
+  }, [authUserId, appRole]);
   useEffect(() => {
     if (!ready) return;
     let active = true;
@@ -1173,7 +1177,8 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     const current = { projects, catalog },
       baseline = baselineRef.current,
       changed = JSON.stringify(current) !== JSON.stringify(baseline);
-    const storage = writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, changed || pendingDraft);
+    const durableProjects = appRole === "admin" ? projects : hiddenProjectDraftRef.current;
+    const storage = writeWorkspaceDraft(authUserId, durableProjects, catalog, versionRef.current, changed || pendingDraft);
     void storage.indexedDb.then((indexedDb) => {
       if (!active) return;
       const errors = [storage.localError, indexedDb.error].filter((error): error is StorageErrorDetails => !!error);
@@ -1221,7 +1226,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         const stillCurrent = JSON.stringify(latestRef.current) === saveInput;
         if (stillCurrent && JSON.stringify(uploaded) !== JSON.stringify(projects)) setProjects(uploaded);
         if (stillCurrent) {
-          const committedCache = writeWorkspaceDraft(authUserId, uploaded, catalog, nextVersion, false);
+          const committedCache = writeWorkspaceDraft(authUserId, appRole === "admin" ? uploaded : durableProjects, catalog, nextVersion, false);
           const indexedCache = await committedCache.indexedDb;
           const cacheErrors = [committedCache.localError, indexedCache.error].filter((error): error is StorageErrorDetails => !!error);
           const cacheState = durableStorageState(indexedCache.ok, committedCache.local, cacheErrors);
@@ -1230,7 +1235,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
             ? `已儲存：已與 Supabase 同步 · 版本 ${nextVersion}`
             : "雲端已同步，但本機離線暫存不可用");
         } else {
-          writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, nextVersion, true);
+          writeWorkspaceDraft(authUserId, appRole === "admin" ? latestRef.current.projects : durableProjects, latestRef.current.catalog, nextVersion, true);
           retrySyncRef.current = true;
           setStorageWarning("儲存中：上一筆已同步，正在接續同步最新修改…");
         }
@@ -1250,7 +1255,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
             ? `已合併其他電腦的更新；${merged.conflicts.length} 個同欄位衝突保留這台電腦的內容，正在重新同步…`
             : "已自動合併其他電腦的更新，正在重新同步…");
         } else {
-          const fallback = writeWorkspaceDraft(authUserId, projects, catalog, versionRef.current, true);
+        const fallback = writeWorkspaceDraft(authUserId, durableProjects, catalog, versionRef.current, true);
           const indexedFallback = await fallback.indexedDb;
           const fallbackErrors = [fallback.localError, indexedFallback.error].filter((storageError): storageError is StorageErrorDetails => !!storageError);
           const durable = durableStorageState(indexedFallback.ok, fallback.local, fallbackErrors);

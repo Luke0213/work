@@ -1766,3 +1766,53 @@ test("phase 5C-2 keeps ordinary finance exports on the protected project with no
   assert.match(billing, /financeExportLoading[\s\S]*正在讀取財務匯出資料/);
   assert.match(billing, /financeExportError[\s\S]*className="form-error billing-no-print"/);
 });
+
+test("temporary admin-only project isolation is fail-closed across reads, finance, writes, and local recovery", async () => {
+  const migration = await read("supabase/migrations/202609040004_admin_only_project_visibility.sql");
+  const page = await read("app/page.tsx");
+  const filterStart = migration.indexOf("create or replace function public.spc_filter_permissioned_workspace");
+  const financeStart = migration.indexOf("create or replace function public.spc_load_finance_export_data");
+  const mergeStart = migration.indexOf("create or replace function public.spc_merge_workspace");
+  const filter = migration.slice(filterStart, financeStart);
+  const finance = migration.slice(financeStart, mergeStart);
+  const merge = migration.slice(mergeStart);
+  const workspaceLoad = page.slice(page.indexOf("const load = async () =>"), page.indexOf("useEffect(() => {", page.indexOf("const load = async () =>") + 1));
+  const financePermissionStart = finance.indexOf("if approved_role in ('admin', 'shenyin') then");
+  const financePermissionEnd = finance.indexOf("end if;", financePermissionStart) + "end if;".length;
+  const financeDenyStart = finance.indexOf("if not can_export_receivables and not can_export_shipment_details then");
+  const financeNonAdminStart = finance.indexOf("if approved_role <> 'admin' then");
+  const financeUncheckedLoad = finance.indexOf("snapshot := public.spc_load_workspace_unchecked()");
+
+  assert.ok(filterStart >= 0 && financeStart > filterStart && mergeStart > financeStart);
+  assert.match(filter, /if approved_role = 'admin' then\s*return p_snapshot/);
+  assert.match(filter, /approved_role in \('shenyin', 'crew', 'client', 'sales'\)[\s\S]*jsonb_build_object\('projects', '\[\]'::jsonb\)/);
+  assert.match(filter, /raise exception 'SPC_ACCESS_REQUIRED' using errcode = '42501'/);
+
+  assert.ok(financePermissionStart >= 0);
+  assert.ok(financeDenyStart >= financePermissionEnd);
+  assert.ok(financeNonAdminStart > financeDenyStart);
+  assert.ok(financeUncheckedLoad > financeNonAdminStart);
+  assert.match(finance.slice(financeDenyStart, financeNonAdminStart), /raise exception 'SPC_ACCESS_REQUIRED' using errcode = '42501'/);
+  assert.match(finance.slice(financeNonAdminStart, financeUncheckedLoad), /'projects', '\[\]'::jsonb/);
+  assert.match(finance, /snapshot := public\.spc_load_workspace_unchecked\(\)[\s\S]*finance_projects := finance_projects/);
+
+  assert.match(merge, /if approved_role <> 'admin' then\s*p_projects := current_snapshot->'projects';\s*p_base_projects := current_snapshot->'projects';/);
+  assert.doesNotMatch(merge, /approved_role not in \('admin', 'shenyin'\)/);
+  assert.match(merge, /if approved_role in \('crew', 'client', 'sales'\) then\s*p_catalog := current_snapshot->'catalog';\s*p_base_catalog := current_snapshot->'catalog';/);
+  assert.doesNotMatch(merge.slice(merge.indexOf("if approved_role <> 'admin'"), merge.indexOf("merged_projects :=")), /shenyin[\s\S]*p_catalog := current_snapshot/);
+
+  assert.match(workspaceLoad, /const legacy = appRole === "admin" && !snapshot\.projects\.length \? await loadLegacyWorkspace\(\) : null/);
+  assert.equal((workspaceLoad.match(/const localProjects = normalize\(JSON\.parse\(readLocal/g) || []).length, 2);
+  assert.equal((workspaceLoad.match(/hiddenProjectDraftRef\.current = appRole === "admin" \? \[\] : structuredClone\(normalize\(\(durableDraft\?\.projects\?\.length \? durableDraft\.projects : localProjects\) as Project\[\]\)\)/g) || []).length, 2);
+  assert.match(workspaceLoad, /const loadedProjects = appRole === "admin" \? normalize\([\s\S]*durableDraft\.projects[\s\S]*legacy\?\.projects[\s\S]*localProjects[\s\S]*\) : \[\]/);
+  assert.match(workspaceLoad, /if \(appRole === "admin" && !snapshot\.projects\.length && loadedProjects\.length/);
+  assert.match(workspaceLoad, /const recoveredProjects = appRole === "admin" \? normalize\([\s\S]*\) : \[\]/);
+  assert.match(workspaceLoad, /const visibleProjects = appRole === "admin" \? recoveredProjects : \[\];\s*setProjects\(visibleProjects\)/);
+  assert.doesNotMatch(workspaceLoad, /setProjects\(recoveredProjects\)/);
+  assert.match(page, /const hiddenProjectDraftRef = useRef<Project\[]>\(\[\]\)/);
+  assert.match(page, /const durableProjects = appRole === "admin" \? projects : hiddenProjectDraftRef\.current/);
+  assert.doesNotMatch(page, /const durableProjects =[^;]*readWorkspaceDraft/);
+
+  assert.doesNotMatch(page, /localStorage\.clear\(\)|indexedDB\.deleteDatabase\(/);
+  assert.doesNotMatch(migration, /\b(?:drop|delete|truncate|alter)\b|\bstorage\.|photo|bucket/i);
+});
