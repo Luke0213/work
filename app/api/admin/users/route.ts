@@ -95,7 +95,17 @@ export async function GET(request: NextRequest) {
       }),
     });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "UNKNOWN_ERROR" }, { status: 500 });
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "object" &&
+            error !== null &&
+            "message" in error &&
+            typeof (error as { message?: unknown }).message === "string"
+          ? (error as { message: string }).message
+          : "UNKNOWN_ERROR";
+
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
 
@@ -182,6 +192,16 @@ export async function POST(request: NextRequest) {
     }
     return NextResponse.json({ error: "INVALID_ACTION" }, { status: 400 });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "UNKNOWN_ERROR" }, { status: 500 });
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "object" &&
+            error !== null &&
+            "message" in error &&
+            typeof (error as { message?: unknown }).message === "string"
+          ? (error as { message: string }).message
+          : "UNKNOWN_ERROR";
+
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
