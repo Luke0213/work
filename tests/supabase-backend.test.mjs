@@ -129,16 +129,19 @@ test("offline drafts are account-scoped and recoverable for every authorized rol
   assert.match(page, /暫存未完成驗收/);
 });
 
-test("admins can create email or Taiwan phone accounts with a forced password change", async () => {
+test("account creation is applicant-owned while admin reset preserves metadata and forces password change", async () => {
   const page = await read("app/page.tsx");
   const api = await read("app/api/admin/users/route.ts");
+  const applicationApi = await read("app/api/account-applications/route.ts");
   const audit = await read("supabase/migrations/202608260005_phone_identity_audit.sql");
   assert.match(page, /電子郵件或手機號碼/);
   assert.match(page, /must_change_password/);
-  assert.match(api, /auth\.admin\.createUser/);
+  assert.doesNotMatch(api, /action: "create"|auth\.admin\.createUser|建立新帳號/);
+  assert.match(applicationApi, /auth\.admin\.createUser/);
   assert.match(api, /1234qwer/);
-  assert.match(api, /@phone\.spc\.internal/);
-  assert.match(api, /local_phone/);
+  assert.match(api, /user_metadata: \{ \.\.\.existing\.user\.user_metadata, must_change_password: true \}/);
+  assert.match(applicationApi, /@phone\.spc\.internal/);
+  assert.match(applicationApi, /local_phone/);
   assert.match(audit, /auth\.jwt\(\)->>'phone'/);
 });
 
@@ -436,13 +439,389 @@ test("floor progress summaries count one normalized current status per unit", as
   assert.match(page, /tasks = \{[\s\S]*getUnitCurrentStatus\(u\) === "待場勘"[\s\S]*getUnitCurrentStatus\(u\) === "改善中"[\s\S]*getUnitCurrentStatus\(u\) === "待驗收"/);
 });
 
+test("account lifecycle is profile-gated, unit-safe, and server-authorized", async () => {
+  const page = await read("app/page.tsx");
+  const auth = await read("lib/auth-session.ts");
+  const applicationApi = await read("app/api/account-applications/route.ts");
+  const adminApi = await read("app/api/admin/users/route.ts");
+  const migration = await read("supabase/migrations/202609030001_role_permissions.sql");
+  assert.match(page, /spc_current_account_profile/);
+  assert.doesNotMatch(page, /spc_current_role/);
+  assert.doesNotMatch(page, /\? data as AppRole : "client"/);
+  assert.match(auth, /role: Role \| null/);
+  assert.match(auth, /applicationStatus: AccountApplicationStatus/);
+  assert.match(page, /applicationStatus === "pending"[\s\S]*AccountStatusScreen/);
+  assert.match(page, /applicationStatus === "rejected"[\s\S]*RejectedAccountScreen/);
+  const gate = page.slice(page.indexOf('if (authSnapshot.applicationStatus === "pending")'), page.indexOf("function AuthLoading"));
+  assert.match(gate, /!authSnapshot\.active \|\| authSnapshot\.applicationStatus !== "approved"/);
+  assert.match(gate, /AuthOwnerContext\.Provider[\s\S]*AdminApp/);
+  assert.doesNotMatch(gate.slice(0, gate.indexOf("return <AuthOwnerContext.Provider")), /AuthOwnerContext|AdminApp|loadWorkspace/);
+  assert.match(adminApi, /select\("user_id, email, display_name, role, active, application_status"\)/);
+  assert.match(page, /const title = user\.displayName \|\| identity/);
+  assert.match(page, /client: "廠商"/);
+  assert.doesNotMatch(page, /客戶端/);
+  assert.match(page, /if \(pending\) \{ setApprovalRoles/);
+  assert.doesNotMatch(page.match(/if \(pending\) \{[^}]+\}/)?.[0] || "", /\bact\(/);
+  assert.match(adminApi, /action: "approve"/);
+  assert.match(adminApi, /action: "reject"/);
+  assert.match(adminApi, /roles\.has\(body\.role\)/);
+  assert.match(adminApi, /LAST_ACTIVE_ADMIN/);
+  assert.match(adminApi, /body\.userId === access\.user\.id/);
+  assert.match(adminApi, /application_status !== "approved"/);
+  assert.match(adminApi, /user_metadata: \{ \.\.\.target\.data\.user\.user_metadata, display_name: displayName \}/);
+  const rejectPath = adminApi.slice(adminApi.indexOf('if (body.action === "reject")'), adminApi.indexOf("if (body.userId === access.user.id"));
+  assert.doesNotMatch(rejectPath, /deleteUser|password|876000h/);
+  assert.match(rejectPath, /ban_duration: "none"/);
+  assert.match(applicationApi, /export async function PATCH/);
+  assert.match(applicationApi, /authorization/);
+  assert.match(applicationApi, /auth\.getUser\(token\)/);
+  assert.doesNotMatch(applicationApi.slice(applicationApi.indexOf("export async function PATCH")), /body\.userId/);
+  assert.match(applicationApi, /application_status !== "rejected"/);
+  assert.match(applicationApi, /applicationRoles/);
+  assert.doesNotMatch(applicationApi, /applicationRoles[^\n]+admin/);
+  assert.match(page, /const canManageAccounts = appRole === "admin"/);
+  assert.match(migration, /spc_current_account_profile\(\)/);
+  assert.match(migration, /where user_role\.user_id = auth\.uid\(\)/);
+  assert.match(migration, /revoke all on function public\.spc_current_account_profile\(\) from public, anon, authenticated/);
+  assert.match(migration, /grant execute on function public\.spc_current_account_profile\(\) to authenticated/);
+  assert.doesNotMatch(migration, /delete\s+from|truncate|storage\.|spc_workspace/);
+});
+
+test("role permission matrix loads and saves only the three configurable roles", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const api = await read("app/api/admin/users/route.ts");
+  const auth = await read("lib/auth-session.ts");
+  const matrix = page.slice(page.indexOf("const permissionLabels"), page.indexOf("function SystemEntry"));
+  for (const label of ["修改戶別資料", "場勘", "施工", "驗收", "驗收日誌", "缺失改善", "應收帳款", "細總表", "全部"]) assert.match(matrix, new RegExp(label));
+  assert.match(matrix, /CONFIGURABLE_ROLES\.map/);
+  assert.match(matrix, /crew: "工班人員", client: "廠商", sales: "代銷"/);
+  assert.doesNotMatch(matrix.match(/configurableRoleLabels[^;]+/)?.[0] || "", /admin|shenyin/);
+  assert.match(matrix, /setAllRolePermissions\(current\[role\], checked\)/);
+  assert.match(matrix, /hasAllRolePermissions\(value\)/);
+  assert.match(matrix, /setPermissionsDraft[\s\S]*有尚未儲存的變更[\s\S]*儲存權限設定/);
+  const checkboxUpdate = matrix.slice(matrix.indexOf("const updatePermission"), matrix.indexOf("const savePermissions"));
+  assert.doesNotMatch(checkboxUpdate, /adminRequest|fetch\(/);
+  assert.match(api, /rolePermissions: rolePermissionMatrixFromDatabaseRows\(permissionRows\)/);
+  assert.match(api, /action: "permissions"/);
+  assert.match(api, /parseRolePermissionMatrix\(body\.permissions\)/);
+  assert.match(api, /Authorization: `Bearer \$\{access\.token\}`/);
+  assert.match(api, /caller\.rpc\("spc_admin_save_role_permissions", \{ p_permissions: permissions \}\)/);
+  assert.doesNotMatch(matrix, /from\("spc_role_permissions"\)|spc_admin_save_role_permissions/);
+  assert.match(page, /supabase\.rpc\("spc_current_permissions"\)/);
+  assert.match(auth, /permissions: RolePermissions/);
+  assert.match(auth, /AUTH_PERMISSIONS_TIMEOUT/);
+  assert.doesNotMatch(matrix, /localStorage|saveWorkspace|loadWorkspace/);
+  assert.match(css, /\.role-permission-scroll\{[^}]*overflow-x:auto/);
+  assert.match(css, /\.role-permission-matrix th:first-child\{[^}]*position:sticky/);
+  assert.match(css, /\.role-permission-matrix label\{[^}]*min-width:44px;min-height:44px/);
+  const accessLogic = page.slice(page.indexOf("const canUseSystem"), page.indexOf("const sideViews"));
+  assert.match(accessLogic, /canUseView = canUsePermissionView/);
+  assert.match(accessLogic, /canUseUnitTab = canUsePermissionUnitTab/);
+});
+
+test("phase 5A-1 adds fail-closed internal workspace authorization helpers only", async () => {
+  const sql = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const primitives = sql.slice(0, sql.indexOf("create or replace function public.spc_merge_permissioned_projects"));
+
+  assert.match(sql, /create or replace function public\.spc_current_approved_role\(\)/i);
+  assert.match(sql, /security definer[\s\S]*set search_path = pg_catalog, public/i);
+  assert.match(sql, /user_role\.user_id = auth\.uid\(\)/i);
+  assert.match(sql, /user_role\.active = true/i);
+  assert.match(sql, /user_role\.application_status = 'approved'/i);
+  assert.match(sql, /user_role\.role in \('admin', 'shenyin', 'crew', 'client', 'sales'\)/i);
+
+  assert.match(sql, /create or replace function public\.spc_current_effective_permissions\(\)/i);
+  for (const column of [
+    "edit_unit_master", "use_survey", "use_work", "use_acceptance",
+    "use_acceptance_journal", "use_defects", "export_receivables", "export_shipment_details",
+  ]) assert.match(sql, new RegExp(`${column} boolean`, "i"));
+  assert.match(sql, /approved_role in \('admin', 'shenyin'\)[\s\S]*select true, true, true, true, true, true, true, true/i);
+  assert.match(sql, /from public\.spc_role_permissions as permission[\s\S]*permission\.role = approved_role/i);
+  assert.match(sql, /approved_role = 'crew'[\s\S]*select true, true, true, true, true, true, false, false/i);
+  assert.match(sql, /select true, false, false, false, false, false, false, false/i);
+  assert.match(sql, /else[\s\S]*select false, false, false, false, false, false, false, false/i);
+
+  for (const helper of ["spc_current_approved_role", "spc_current_effective_permissions"]) {
+    assert.match(sql, new RegExp(`revoke all on function public\\.${helper}\\(\\) from public, anon, authenticated`, "i"));
+    assert.doesNotMatch(sql, new RegExp(`grant execute on function public\\.${helper}\\(\\) to authenticated`, "i"));
+  }
+  assert.doesNotMatch(primitives, /create or replace function public\.(?:spc_load_workspace|spc_merge_workspace|spc_merge_restricted_projects)\b/i);
+  assert.doesNotMatch(sql, /create or replace function public\.spc_json_merge_three_way(?:_at)?\s*\(/i);
+  assert.doesNotMatch(sql, /\bstorage\.|delete\s+from|update\s+public\.|truncate\b/i);
+});
+
+test("phase 5A-2 permissioned project merge is current-driven and field-allowlisted", async () => {
+  const sql = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const start = sql.indexOf("create or replace function public.spc_merge_permissioned_projects");
+  const end = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace", start);
+  const merge = sql.slice(start, end);
+
+  assert.ok(start >= 0);
+  assert.match(merge, /spc_merge_permissioned_projects\(\s*p_current jsonb,\s*p_incoming jsonb\s*\)/i);
+  assert.doesNotMatch(merge, /\bp_role\b|\bp_permissions\b/);
+  assert.match(merge, /public\.spc_current_approved_role\(\)/i);
+  assert.match(merge, /public\.spc_current_effective_permissions\(\)/i);
+  assert.match(merge, /security definer[\s\S]*set search_path = pg_catalog, public/i);
+  assert.match(merge, /approved_role in \('admin', 'shenyin'\)[\s\S]*return p_incoming/i);
+  assert.match(merge, /approved_role is null or approved_role not in \('crew', 'client', 'sales'\)[\s\S]*return p_current/i);
+
+  assert.match(merge, /for current_project in[\s\S]*jsonb_array_elements\(coalesce\(p_current/i);
+  assert.match(merge, /for current_unit in[\s\S]*jsonb_array_elements\(coalesce\(current_project->'units'/i);
+  assert.match(merge, /merged_project := current_project/);
+  assert.match(merge, /if permissions\.use_acceptance_journal[\s\S]*incoming_project \? 'journals'[\s\S]*jsonb_build_object\(\s*'journals', coalesce\(incoming_project->'journals', current_project->'journals'\)/i);
+  assert.doesNotMatch(merge, /current_project\s*\|\|\s*incoming_project|merged_project\s*:=\s*current_project\s*\|\|\s*incoming_project/i);
+  assert.doesNotMatch(merge, /merged_projects\s*:=\s*merged_projects\s*\|\|\s*p_incoming/i);
+  assert.doesNotMatch(merge, /merged_units\s*:=\s*merged_units\s*\|\|\s*coalesce\(incoming_project->'units'/i);
+
+  const masterBlock = merge.slice(merge.indexOf("if permissions.edit_unit_master"), merge.indexOf("if permissions.use_survey"));
+  for (const field of [
+    "building", "floor", "number", "owner", "phone", "email", "lineId", "customerRole",
+    "contactPreference", "customerNeed", "marketingConsent", "consentAt", "customerSource", "order",
+    "brand", "model", "colorNo", "spec", "estimated", "custom", "customNote", "note",
+  ]) assert.match(masterBlock, new RegExp(`'${field}'`));
+  assert.doesNotMatch(masterBlock, /'status'/);
+
+  for (const [permission, collection] of [
+    ["use_survey", "surveys"], ["use_work", "works"], ["use_acceptance", "acceptances"],
+    ["use_acceptance_journal", "journals"], ["use_defects", "defects"],
+  ]) assert.match(merge, new RegExp(`if permissions\\.${permission}[\\s\\S]*jsonb_build_object\\('${collection}'`, "i"));
+  assert.doesNotMatch(merge, /permissions\.export_(?:receivables|shipment_details)[\s\S]*jsonb_build_object/i);
+
+  assert.match(merge, /events_writable := permissions\.use_survey[\s\S]*or permissions\.use_work[\s\S]*or permissions\.use_acceptance[\s\S]*or permissions\.use_defects/i);
+  assert.doesNotMatch(merge.slice(merge.indexOf("events_writable :="), merge.indexOf("for current_project")), /edit_unit_master|use_acceptance_journal|export_/i);
+  assert.match(merge, /if events_writable[\s\S]*jsonb_build_object\('events'/i);
+
+  assert.match(merge, /current_status in \('待場勘', '場勘待改善'\)[\s\S]*incoming_status in \('待場勘', '場勘待改善', '可進場'\)/);
+  assert.match(merge, /current_status in \('可進場', '施工中'\)[\s\S]*incoming_status in \('施工中', '待驗收'\)/);
+  assert.match(merge, /current_status in \('待驗收', '待複驗'\)[\s\S]*incoming_status in \('驗收缺失', '已驗收'\)/);
+  assert.match(merge, /current_status in \('場勘待改善', '驗收缺失', '改善中'\)[\s\S]*incoming_status in \('驗收缺失', '改善中', '待複驗', '可進場'\)/);
+  assert.doesNotMatch(merge, /current_status in \([^)]*'待確認'/);
+  for (const [evidence, collection] of [
+    ["survey_changed", "surveys"], ["work_changed", "works"],
+    ["acceptance_changed", "acceptances"], ["defects_changed", "defects"],
+  ]) {
+    assert.match(merge, new RegExp(`${evidence} := incoming_unit \\? '${collection}'[\\s\\S]*incoming_unit->'${collection}' is distinct from current_unit->'${collection}'`, "i"));
+    assert.match(merge, new RegExp(`permissions\\.[a-z_]+ and ${evidence}[\\s\\S]*current_status in`, "i"));
+  }
+  const statusGuard = merge.slice(merge.indexOf("if incoming_status is not null"), merge.indexOf("merged_units :=", merge.indexOf("if incoming_status is not null")));
+  assert.doesNotMatch(statusGuard, /events_writable|'events'/i);
+  assert.match(merge, /if permissions\.use_survey then[\s\S]*jsonb_build_object\('surveys'/i);
+
+  assert.match(sql, /revoke all on function public\.spc_merge_permissioned_projects\(jsonb, jsonb\) from public, anon, authenticated/i);
+  assert.doesNotMatch(sql, /grant execute on function public\.spc_merge_permissioned_projects\(jsonb, jsonb\) to authenticated/i);
+  assert.doesNotMatch(sql, /create or replace function public\.spc_json_merge_three_way(?:_at)?\b/i);
+  assert.doesNotMatch(sql, /\bstorage\.|create\s+policy/i);
+});
+
+test("phase 5A-3 filters workspace reads and keeps crew customer fields read/write private", async () => {
+  const sql = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const loadStart = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace");
+  const loadEnd = sql.indexOf("create or replace function public.spc_load_workspace()", loadStart);
+  const load = sql.slice(loadStart, loadEnd);
+  const writeStart = sql.indexOf("create or replace function public.spc_merge_permissioned_projects");
+  const writeEnd = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace", writeStart);
+  const write = sql.slice(writeStart, writeEnd);
+
+  assert.ok(loadStart >= 0);
+  assert.match(load, /spc_filter_permissioned_workspace\(\s*p_snapshot jsonb\s*\)/i);
+  assert.doesNotMatch(load, /\bp_role\b|\bp_permissions\b|spc_current_role\(\)/i);
+  assert.match(load, /public\.spc_current_approved_role\(\)/i);
+  assert.match(load, /public\.spc_current_effective_permissions\(\)/i);
+  assert.match(load, /security definer[\s\S]*set search_path = pg_catalog, public/i);
+  assert.match(load, /approved_role in \('admin', 'shenyin'\)[\s\S]*return p_snapshot/i);
+  assert.match(load, /approved_role is null or approved_role not in \('crew', 'client', 'sales'\)[\s\S]*raise exception 'SPC_ACCESS_REQUIRED'[\s\S]*42501/i);
+
+  for (const [permission, collection] of [
+    ["use_survey", "surveys"], ["use_work", "works"], ["use_acceptance", "acceptances"],
+    ["use_acceptance_journal", "journals"], ["use_defects", "defects"],
+  ]) assert.match(load, new RegExp(`'${collection}', case when permissions\\.${permission}[\\s\\S]*else '\\[\\]'::jsonb`, "i"));
+  assert.match(load, /filtered_project := source_project \|\| jsonb_build_object\(\s*'journals', case[\s\S]*permissions\.use_acceptance_journal[\s\S]*else '\[\]'::jsonb/i);
+  assert.match(load, /'events', '\[\]'::jsonb/i);
+  assert.doesNotMatch(load, /permissions\.[a-z_]+[\s\S]*'events', case/i);
+
+  assert.match(load, /approved_role = 'crew'[\s\S]*jsonb_build_object\('contact', '', 'phone', ''\)/i);
+  const sensitive = ["owner", "phone", "email", "lineId", "customerRole", "contactPreference", "customerNeed", "marketingConsent", "consentAt", "customerSource"];
+  for (const field of sensitive) assert.match(load, new RegExp(`'${field}'`));
+  assert.match(load, /if approved_role = 'crew'[\s\S]*filtered_unit := filtered_unit - array/i);
+  assert.doesNotMatch(load, /approved_role in \('client', 'sales'\)[\s\S]*filtered_unit := filtered_unit - array/i);
+  assert.doesNotMatch(load, /export_receivables|export_shipment_details/i);
+
+  const masterStart = write.indexOf("if permissions.edit_unit_master");
+  const workflowStart = write.indexOf("if permissions.use_survey", masterStart);
+  const master = write.slice(masterStart, workflowStart);
+  assert.match(master, /approved_role in \('client', 'sales'\)[\s\S]*'owner'[\s\S]*'customerSource'/i);
+  for (const field of ["building", "floor", "number", "order", "brand", "model", "colorNo", "spec", "estimated", "custom", "customNote", "note"])
+    assert.match(master.slice(0, master.indexOf("if approved_role in")), new RegExp(`'${field}'`));
+  assert.doesNotMatch(master.slice(0, master.indexOf("if approved_role in")), /'owner'|'customerNeed'|'customerSource'/i);
+  assert.match(write, /approved_role in \('admin', 'shenyin'\)[\s\S]*return p_incoming/i);
+
+  assert.match(sql, /revoke all on function public\.spc_filter_permissioned_workspace\(jsonb\) from public, anon, authenticated/i);
+  assert.doesNotMatch(sql, /grant execute on function public\.spc_filter_permissioned_workspace\(jsonb\) to authenticated/i);
+  assert.doesNotMatch(sql, /create or replace function public\.spc_merge_restricted_projects\b/i);
+  assert.doesNotMatch(sql, /create or replace function public\.spc_json_merge_three_way(?:_at)?\b/i);
+  assert.doesNotMatch(sql, /\bstorage\.|create\s+policy|delete\s+from|update\s+public\.|truncate\b/i);
+});
+
+test("phase 5A-4 integrates approved permission helpers into workspace load and collaborative merge", async () => {
+  const sql = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const loadStart = sql.indexOf("create or replace function public.spc_load_workspace()");
+  const mergeStart = sql.indexOf("create or replace function public.spc_merge_workspace(", loadStart);
+  const grantsStart = sql.indexOf("-- Internal helpers", mergeStart);
+  const load = sql.slice(loadStart, mergeStart);
+  const merge = sql.slice(mergeStart, grantsStart);
+
+  assert.ok(loadStart >= 0 && mergeStart > loadStart);
+  assert.match(load, /public\.spc_current_approved_role\(\)/i);
+  assert.doesNotMatch(load, /spc_current_role\(\)/i);
+  assert.match(load, /approved_role is null or approved_role not in \('admin', 'shenyin', 'crew', 'client', 'sales'\)[\s\S]*raise exception 'SPC_ACCESS_REQUIRED'[\s\S]*42501/i);
+  assert.match(load, /snapshot := public\.spc_load_workspace_unchecked\(\)/i);
+  assert.match(load, /return public\.spc_filter_permissioned_workspace\(snapshot\)/i);
+  assert.match(sql, /revoke all on function public\.spc_load_workspace\(\) from public, anon/i);
+  assert.match(sql, /grant execute on function public\.spc_load_workspace\(\) to authenticated/i);
+
+  assert.match(merge, /spc_merge_workspace\(\s*p_base_version bigint,\s*p_base_projects jsonb,\s*p_projects jsonb,\s*p_base_catalog jsonb,\s*p_catalog jsonb\s*\)[\s\S]*returns jsonb/i);
+  assert.match(merge, /approved_role text := public\.spc_current_approved_role\(\)/i);
+  assert.doesNotMatch(merge, /spc_current_role\(\)/i);
+  assert.match(merge, /auth\.uid\(\) is null[\s\S]*approved_role is null[\s\S]*approved_role not in \('admin', 'shenyin', 'crew', 'client', 'sales'\)[\s\S]*42501/i);
+  assert.match(merge, /perform 1\s*from public\.spc_workspaces\s*where id = 'main'\s*for update/i);
+  assert.match(merge, /current_snapshot := public\.spc_load_workspace_unchecked\(\)/i);
+  assert.match(merge, /if approved_role not in \('admin', 'shenyin'\) then/i);
+  assert.match(merge, /p_projects := public\.spc_merge_permissioned_projects\(\s*current_snapshot->'projects',\s*p_projects\s*\)/i);
+  assert.match(merge, /p_base_projects := public\.spc_merge_permissioned_projects\(\s*current_snapshot->'projects',\s*p_base_projects\s*\)/i);
+  assert.equal((merge.match(/public\.spc_merge_permissioned_projects\(/g) || []).length, 2);
+  assert.match(merge, /p_catalog := current_snapshot->'catalog';\s*p_base_catalog := current_snapshot->'catalog'/i);
+  assert.doesNotMatch(merge.slice(0, merge.indexOf("if approved_role not in")), /spc_merge_permissioned_projects/i);
+
+  assert.equal((merge.match(/public\.spc_json_merge_three_way\(/g) || []).length, 2);
+  assert.match(merge, /coalesce\(p_base_projects, '\[\]'::jsonb\)[\s\S]*coalesce\(p_projects, '\[\]'::jsonb\)[\s\S]*current_snapshot->'projects'/i);
+  assert.match(merge, /public\.spc_save_workspace_unchecked\(/i);
+  assert.match(merge, /perform public\.spc_log_workspace_changes\(/i);
+  assert.match(merge, /return jsonb_build_object\(\s*'version', new_version,\s*'merged', p_base_version <> \(current_snapshot->>'version'\)::bigint/i);
+  assert.match(sql, /revoke all on function public\.spc_merge_workspace\(bigint, jsonb, jsonb, jsonb, jsonb\) from public, anon/i);
+  assert.match(sql, /grant execute on function public\.spc_merge_workspace\(bigint, jsonb, jsonb, jsonb, jsonb\) to authenticated/i);
+
+  assert.doesNotMatch(sql, /create or replace function public\.(?:spc_save_workspace|spc_merge_restricted_projects|spc_json_merge_three_way|spc_json_merge_three_way_at)\b/i);
+  assert.doesNotMatch(sql, /\bstorage\.|create\s+policy|delete\s+from|truncate\b|update\s+public\.spc_workspaces/i);
+});
+
+test("phase 5A-5 atomically appends only new workflow-created defects without granting defect management", async () => {
+  const sql = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const mergeStart = sql.indexOf("create or replace function public.spc_merge_permissioned_projects");
+  const mergeEnd = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace", mergeStart);
+  const merge = sql.slice(mergeStart, mergeEnd);
+  const atomicStart = merge.indexOf("if permissions.use_defects then");
+  const atomicEnd = merge.indexOf("if events_writable then", atomicStart);
+  const defects = merge.slice(atomicStart, atomicEnd);
+  const loadStart = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace");
+  const loadEnd = sql.indexOf("create or replace function public.spc_load_workspace()", loadStart);
+  const load = sql.slice(loadStart, loadEnd);
+
+  assert.match(defects, /if permissions\.use_defects then[\s\S]*jsonb_build_object\('defects', coalesce\(incoming_unit->'defects', current_unit->'defects'\)\)/i);
+  assert.match(defects, /elsif \(permissions\.use_survey and survey_changed\)\s*or \(permissions\.use_acceptance and acceptance_changed\) then/i);
+  assert.match(defects, /atomic_defects := coalesce\(current_unit->'defects', '\[\]'::jsonb\)/i);
+  assert.match(defects, /jsonb_array_elements\(coalesce\(incoming_unit->'defects', '\[\]'::jsonb\)\)/i);
+  assert.match(defects, /incoming_defect->>'id'[\s\S]*not exists \([\s\S]*jsonb_array_elements\(atomic_defects\) as existing_defect\(value\)[\s\S]*existing_defect\.value->>'id' = incoming_defect->>'id'/i);
+  assert.match(defects, /permissions\.use_survey and survey_changed and incoming_defect->>'source' = '場勘'/i);
+  assert.match(defects, /permissions\.use_acceptance and acceptance_changed and incoming_defect->>'source' = '驗收'/i);
+  assert.match(defects, /atomic_defects := atomic_defects \|\| jsonb_build_array\(incoming_defect\)/i);
+  assert.match(defects, /merged_unit := merged_unit \|\| jsonb_build_object\('defects', atomic_defects\)/i);
+  assert.equal((defects.match(/jsonb_build_array\(incoming_defect\)/g) || []).length, 1);
+  assert.doesNotMatch(defects, /permissions\.use_survey\s+or\s+permissions\.use_acceptance\s+or\s+permissions\.use_defects/i);
+
+  const statusStart = merge.indexOf("if incoming_status is not null");
+  const statusEnd = merge.indexOf("merged_units :=", statusStart);
+  const status = merge.slice(statusStart, statusEnd);
+  assert.match(status, /permissions\.use_survey and survey_changed/i);
+  assert.match(status, /permissions\.use_acceptance and acceptance_changed/i);
+  assert.match(status, /permissions\.use_defects and defects_changed/i);
+  assert.doesNotMatch(status, /atomic_defects|incoming_defect/i);
+  assert.match(load, /'defects', case when permissions\.use_defects then[\s\S]*else '\[\]'::jsonb end/i);
+
+  const workspaceIntegration = sql.slice(sql.indexOf("create or replace function public.spc_load_workspace()"));
+  assert.match(workspaceIntegration, /spc_merge_permissioned_projects\(\s*current_snapshot->'projects',\s*p_projects/i);
+  assert.match(workspaceIntegration, /spc_merge_permissioned_projects\(\s*current_snapshot->'projects',\s*p_base_projects/i);
+  assert.match(merge, /approved_role in \('admin', 'shenyin'\)[\s\S]*return p_incoming/i);
+  assert.doesNotMatch(sql, /create or replace function public\.spc_json_merge_three_way(?:_at)?\b/i);
+  assert.doesNotMatch(sql, /\bstorage\.|create\s+policy|photo cleanup/i);
+});
+
+test("phase four permissions hide restricted UI and guard front-end operations", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const uiPermissions = await read("lib/ui-permissions.ts");
+  const access = page.slice(page.indexOf("const canUseSystem"), page.indexOf("const sideViews"));
+  const admin = page.slice(page.indexOf("function AdminApp("), page.indexOf("type ManagedUser"));
+  const project = page.slice(page.indexOf("function ProjectArea("), page.indexOf("type ReportSourceDraft"));
+  const units = page.slice(page.indexOf("function Units("), page.indexOf("function FloorAcceptanceView"));
+  const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
+  const next = page.slice(page.indexOf("function Next("), page.indexOf("function Master("));
+  const master = page.slice(page.indexOf("function Master("), page.indexOf("function AutoRecord("));
+  const accounts = page.slice(page.indexOf("function AccountManagement("), page.indexOf("function SystemEntry"));
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
+
+  assert.match(access, /canUseView = canUsePermissionView/);
+  assert.match(access, /canUseUnitTab = canUsePermissionUnitTab/);
+  assert.match(uiPermissions, /if \(view === "accounts"\) return role === "admin"/);
+  assert.match(uiPermissions, /if \(hasFullBusinessAccess\(role\)\) return true/);
+  for (const [key, permission] of [["daily-acceptance", "useAcceptance"], ["journal", "useAcceptanceJournal"]])
+    assert.match(uiPermissions, new RegExp(`view === "${key}"[^\n]+permissions\\.${permission}`));
+  assert.match(uiPermissions, /view === "billing"[^\n]+financeUiMode\(role, permissions\)\.canEnter/);
+  for (const [tab, permission] of [["survey", "useSurvey"], ["work", "useWork"], ["journal", "useAcceptanceJournal"], ["defect", "useDefects"]])
+    assert.match(uiPermissions, new RegExp(`tab === "${tab}"[^\n]+permissions\\.${permission}`));
+  assert.match(uiPermissions, /tab === "accept" \|\| tab === "sheet"[^\n]+permissions\.useAcceptance/);
+  assert.match(uiPermissions, /if \(tab === "master"\) return true/);
+
+  assert.match(admin, /sideViews\.filter\(\(\[key\]\) => canUseView\(appRole, permissions, key\)\)/);
+  assert.match(admin, /const canUseAcceptance = canUseUnitTab\(appRole, permissions, "accept"\)/);
+  assert.match(admin, /if \(canUseAcceptance \|\| !floorContext\) return;[\s\S]*setFloorContext\(null\)/);
+  assert.match(admin, /openFloor=\{\(building, floor\) => \{ if \(canUseAcceptance\)/);
+  assert.match(unitDetail, /permissions: RolePermissions/);
+  assert.match(unitDetail, /set=\{\(next\) => \{ if \(canUseUnitTab\(role, permissions, next\)\) setTab\(next\); \}\}/);
+  assert.match(unitDetail, /if \(!canUseUnitTab\(role, permissions, tab\)\) setTab\("master"\)/);
+  assert.match(unitDetail, /\.filter\(\(\[value\]\) => canUseUnitTab\(role, permissions, value\)\)/);
+  assert.match(next, /if \(!canUseUnitTab\(role, permissions, t\)\) return null/);
+  assert.match(units, /\{canAccept && <button className="floor-acceptance-entry"/);
+
+  assert.match(units, /canEditExisting: boolean/);
+  assert.match(units, /canCreate: boolean/);
+  assert.match(units, /const create = \(\) => \{\s+if \(!canCreate\) return/);
+  assert.match(units, /const createBatch = \(\) => \{\s+if \(!canCreate\) return/);
+  assert.match(master, /canEditExisting: boolean/);
+  assert.match(master, /canDelete: boolean/);
+  assert.match(master, /canConfirm: boolean/);
+  assert.match(master, /if \(!canEditExisting\) return/);
+  assert.match(master, /disabled=\{!canEditExisting\}/);
+  assert.match(master, /\{canDelete && <button[\s\S]*className="danger"/);
+  assert.match(master, /\{canConfirm && \(u\.status === "待確認"/);
+  assert.match(unitDetail, /patch=\{\(value\) => \{ if \(canEditExisting\) patch\(value\); \}\}/);
+  assert.match(unitDetail, /remove=\{\(\) => \{ if \(canDelete\) remove\(\); \}\}/);
+
+  assert.match(project, /safeView = canUseView\(role, permissions, view\)/);
+  assert.match(project, /const financeAccess = financeUiMode\(role, permissions\)/);
+  assert.match(billing, /const \{ canExportReceivables, canExportShipment, canManageFinance \} = financeAccess/);
+  assert.match(billing, /if \(!receivableExportReady \|\| !financeExportProject\) return/);
+  assert.match(billing, /if \(!shipmentExportReady \|\| !financeExportProject\) return/);
+  assert.match(billing, /if \(!canManageFinance\) return/);
+  assert.match(billing, /canExportReceivables && <button[\s\S]*應收帳款 Excel/);
+  assert.match(billing, /canExportShipment && <button[\s\S]*SPC 已出貨明細總表/);
+  assert.match(css, /\.shipment-export-preview\.finance-readonly[\s\S]*td:first-child[\s\S]*display:none/);
+  assert.match(master, /const isCrew = role === "crew"/);
+  assert.match(master, /const showCustomerDetails = !isCrew && canViewCustomerDetails\(role\)/);
+  assert.match(master, /\{showCustomerDetails && <section className="customer-section unit-master-customer"/);
+
+  assert.match(accounts, /permissionsDirty && !confirm\("尚未儲存的權限變更將被放棄，確定重新整理嗎？"\)\) return/);
+  assert.match(accounts, /onClick=\{refreshUsers\}/);
+  assert.doesNotMatch(project + unitDetail + master + billing, /delete\s+from|truncate|cleanupRemovedPhotos/);
+});
+
 test("floor acceptance entry stays a compact sibling action on the floor heading row", async () => {
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
   const floorList = page.slice(page.indexOf("{buildingOpen && floors.map"), page.indexOf("{!shown.length"));
   const entryStart = floorList.indexOf('<button className="floor-acceptance-entry"');
   const entry = floorList.slice(entryStart, floorList.indexOf("</button>", entryStart) + "</button>".length);
-  assert.match(floorList, /className="floor-row-main"[\s\S]*?<\/button>\s*<button className="floor-acceptance-entry"/);
+  assert.match(floorList, /className="floor-row-main"[\s\S]*?<\/button>\s*\{canAccept && <button className="floor-acceptance-entry"/);
   assert.match(entry, /<b>驗收<\/b>/);
   assert.doesNotMatch(entry, /<small>|驗收／簽名/);
   assert.match(entry, /onClick=\{\(\) => openFloor\(/);
@@ -530,7 +909,7 @@ test("unit header omits estimated area and inspection pages omit the six-step gu
 test("billing screen, receivable Excel, totals, and print share the selected month records", async () => {
   const page = await read("app/page.tsx");
   for (const value of [
-    "monthlyBillingRecords = buildAcceptanceExportRecords(p).filter",
+    "monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter",
     "record.exportDate.startsWith(ym)",
     "shipmentRecords = monthlyBillingRecords",
     "billSubtotal = billRecords.reduce",
@@ -637,7 +1016,7 @@ test("billing edits stay local until one confirmed project patch", async () => {
   assert.match(billing, /unit\.status === "已驗收" \|\| unit\.status === "已計價"/);
   assert.match(billing, /if \(editing && billingChanges\.length\)/);
   assert.match(billing, /匯出內容仍以已保存資料為準/);
-  assert.match(billing, /createReceivableWorkbook\(p, billRecords, ym, receivableDraft\)/);
+  assert.match(billing, /createReceivableWorkbook\(financeExportProject, billRecords, ym, receivableDraft\)/);
   assert.doesNotMatch(billing, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV/);
   assert.match(billing, /shipmentRecords = monthlyBillingRecords/);
   assert.match(billing, /savedRecord: record/);
@@ -783,7 +1162,7 @@ test("project daily acceptance view derives final history and reuses shipment wo
   assert.match(page, /\["daily-acceptance", "✓", "今日驗收"\]/);
   assert.match(daily, /buildDailyAcceptanceEntries<Acceptance, Unit>/);
   assert.match(daily, /dailyExportRecords = records\.map\(\(\{ unit, acceptance \}\) => buildAcceptanceExportRecord\(p, unit, acceptance, true\)\)/);
-  assert.match(daily, /onClick=\{\(\) => \{ setShipmentPreview\(true\); setReportMessage\(""\); \}\}/);
+  assert.match(daily, /canExportShipment && <button[\s\S]*setShipmentPreview\(true\)/);
   assert.doesNotMatch(daily, /onClick=\{exportDay\}/);
   assert.match(daily, /title="當日總細表｜匯出預覽"/);
   assert.match(daily, /dailyExportRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
@@ -801,10 +1180,10 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   const css = await read("app/globals.css");
   const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
   const receivableFlow = billing.slice(billing.indexOf("openReceivablePreview ="), billing.indexOf("changeBillingPeriod ="));
-  const receivableModal = billing.slice(billing.indexOf("{receivablePreview && receivableDraft"), billing.indexOf("{shipmentPreview &&"));
+  const receivableModal = billing.slice(billing.indexOf("{canExportReceivables && receivablePreview && receivableDraft"), billing.indexOf("{canExportShipment && shipmentPreview &&"));
 
   assert.match(billing, /onClick=\{openReceivablePreview\}[\s\S]*<b>應收帳款 Excel<\/b>[\s\S]*<em>預覽 ›<\/em>/);
-  assert.match(receivableFlow, /setReceivableDraft\(buildReceivableExportDraft\(p, billRecords\)\)/);
+  assert.match(receivableFlow, /setReceivableDraft\(buildReceivableExportDraft\(financeExportProject, billRecords\)\)/);
   assert.match(receivableModal, /title="應收帳款 Excel｜匯出預覽"/);
   assert.match(receivableModal, /billRecords\.map\(\(record, index\)/);
   assert.match(receivableModal, /className="export-preview-table receivable-preview-table"/);
@@ -812,7 +1191,7 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   assert.match(receivableModal, /type="number" min="0" step="0\.01" value=\{detail\.quantity\}/);
   assert.match(receivableModal, /label="送貨聯絡人"/);
   assert.match(receivableModal, /實際戶別筆數<b>\{billRecords\.length\}<\/b>/);
-  assert.match(receivableModal, /createReceivableWorkbook\(p, billRecords, ym, receivableDraft\)/);
+  assert.match(receivableModal, /createReceivableWorkbook\(financeExportProject, billRecords, ym, receivableDraft\)/);
   assert.match(billing, /receivableTotals = receivableDraft \? receivableDraftTotals\(receivableDraft\) : null/);
   assert.match(receivableModal, /saveReceivableWorkbook\(workbook/);
   assert.match(receivableModal, /receivableExporting \? "產生中…" : "確認產生 Excel"/);
@@ -884,14 +1263,14 @@ test("daily and monthly shipment report edits persist only approved formal sourc
   }
 
   assert.match(daily, /buildAcceptanceExportRecord\(p, unit, acceptance, true\)/);
-  assert.match(billing, /monthlyBillingRecords = buildAcceptanceExportRecords\(p\)/);
+  assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(financeExportProject\)/);
   assert.equal((page.match(/<ReportMetadataEditor draft=/g) || []).length, 3);
   assert.doesNotMatch(shipmentOpen, /\bpatch\(|queueRecordChange|updateReportSource/);
   assert.match(daily, /onClick=\{\(\) => \{ setSelected\(entry\); setReportDraft\(null\); setReportMessage\(""\); \}\}/);
   assert.match(daily, /onClick=\{\(\) => \{ setReportDraft\(null\); setReportMessage\(""\); \}\}>取消修改/);
   assert.match(billing, /onClick=\{\(\) => \{ setShipmentReportDraft\(null\); setShipmentReportMessage\(""\); \}\}>取消修改/);
-  assert.match(billing, /createShipmentWorkbook\(p, shipmentRecords, ym\)/);
-  assert.match(billing, /disabled=\{shipmentExporting \|\| !shipmentRecords\.length \|\| !!shipmentReportDraft\}/);
+  assert.match(billing, /createShipmentWorkbook\(financeExportProject, shipmentRecords, ym\)/);
+  assert.match(billing, /disabled=\{shipmentExporting \|\| !shipmentRecords\.length \|\| !!shipmentReportDraft \|\| !shipmentExportReady\}/);
   assert.doesNotMatch(billing, /createShipmentWorkbook\(p, shipmentReportDraft/);
   assert.doesNotMatch(exports, /Array\(12\)\.fill/);
   assert.match(exports, /record\.shipmentDateText !== undefined \? display\.shipmentDateText : excelDate\(record\.exportDate\)/);
@@ -1098,7 +1477,7 @@ test("unit master keeps customer contacts visible above collapsible engineering 
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
   const master = page.slice(page.indexOf("function Master("), page.indexOf("function AutoRecord("));
-  const customerStart = master.indexOf('!isCrew && <section className="customer-section unit-master-customer">');
+  const customerStart = master.indexOf('<section className="customer-section unit-master-customer">');
   const disclosureStart = master.indexOf('className="unit-details-disclosure"');
   const detailsStart = master.indexOf('{unitDetailsOpen && <section id="unit-master-details"');
 
@@ -1124,4 +1503,123 @@ test("every unfinished data-entry flow has durable drafts and notes", async () =
   for (const value of ["project-onboarding", "unit-create", "global-product", "project-product", "riskDraftKey", "logStorageException", "停車備註", "改善備註"]) assert.match(page, new RegExp(value));
   assert.match(page, /readWorkspaceDraft\(authUserId\) \|\| indexedWorkspace\?\.payload/);
   assert.match(page, /saveOfflineDraft\(\{ key: scopedKey\(workspaceDraftKey, owner\)/);
+});
+
+test("phase 5C-1 exposes a permission-minimized read-only finance export RPC", async () => {
+  const sql = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const start = sql.indexOf("create or replace function public.spc_load_finance_export_data()");
+  const end = sql.indexOf("create or replace function public.spc_merge_workspace(", start);
+  const rpc = sql.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(rpc, /spc_load_finance_export_data\(\)\s*returns jsonb/i);
+  assert.match(rpc, /language plpgsql[\s\S]*stable[\s\S]*security definer[\s\S]*set search_path = pg_catalog, public/i);
+  assert.match(rpc, /approved_role text := public\.spc_current_approved_role\(\)/i);
+  assert.match(rpc, /from public\.spc_current_effective_permissions\(\)/i);
+  assert.match(rpc, /approved_role is null[\s\S]*approved_role not in \('admin', 'shenyin', 'crew', 'client', 'sales'\)[\s\S]*SPC_ACCESS_REQUIRED[\s\S]*42501/i);
+  assert.match(rpc, /approved_role in \('admin', 'shenyin'\)[\s\S]*can_export_receivables := true[\s\S]*can_export_shipment_details := true/i);
+  assert.match(rpc, /can_export_receivables := coalesce\(permissions\.export_receivables, false\)/i);
+  assert.match(rpc, /can_export_shipment_details := coalesce\(permissions\.export_shipment_details, false\)/i);
+  assert.match(rpc, /if not can_export_receivables and not can_export_shipment_details then[\s\S]*SPC_ACCESS_REQUIRED[\s\S]*42501/i);
+  assert.match(rpc, /snapshot := public\.spc_load_workspace_unchecked\(\)/i);
+  assert.doesNotMatch(rpc, /public\.spc_load_workspace\(\)/i);
+  assert.match(rpc, /'canExportReceivables', can_export_receivables[\s\S]*'canExportShipmentDetails', can_export_shipment_details[\s\S]*'projects', finance_projects/i);
+
+  const projectDto = rpc.slice(rpc.indexOf("finance_projects := finance_projects"), rpc.indexOf("return jsonb_build_object"));
+  for (const field of ["id", "name", "address", "contact", "units"])
+    assert.match(projectDto, new RegExp(`'${field}'`));
+  for (const field of ["journals", "surveys", "defects", "events", "photos", "catalog", "version"])
+    assert.doesNotMatch(projectDto, new RegExp(`'${field}'`));
+
+  const unitDto = rpc.slice(rpc.indexOf("finance_units := finance_units ||"), rpc.indexOf("finance_projects := finance_projects"));
+  for (const field of ["id", "building", "floor", "number", "model", "colorNo", "brand", "estimated", "rate", "note", "status", "works", "acceptances"])
+    assert.match(unitDto, new RegExp(`'${field}'`));
+  assert.match(rpc, /where value->'_deleted' is distinct from 'true'::jsonb/i);
+
+  const workDto = rpc.slice(rpc.indexOf("finance_works := finance_works ||"), rpc.indexOf("finance_acceptances := '[]'"));
+  assert.match(workDto, /jsonb_build_object\(\s*'date', source_work->'date',\s*'area', source_work->'area'\s*\)/i);
+  assert.equal((workDto.match(/source_work->/g) || []).length, 2);
+
+  const acceptanceDto = rpc.slice(rpc.indexOf("finance_acceptances := finance_acceptances ||"), rpc.indexOf("finance_units := finance_units ||"));
+  for (const field of ["id", "date", "startedAt", "area", "note", "draft", "report"])
+    assert.match(acceptanceDto, new RegExp(`'${field}'`));
+  assert.equal((acceptanceDto.match(/source_acceptance->/g) || []).length, 6);
+
+  const reportStart = rpc.indexOf("if can_export_shipment_details then");
+  const reportEnd = rpc.indexOf("finance_acceptances := finance_acceptances ||", reportStart);
+  const report = rpc.slice(reportStart, reportEnd);
+  const shipment = report.slice(0, report.indexOf("else"));
+  const receivablesOnly = report.slice(report.indexOf("else"));
+  const shipmentFields = [
+    "shipmentDateText", "sequenceText", "customerNameText", "productText", "unitDisplayText",
+    "squareMetersText", "pingText", "unitPriceText", "amountText", "vendorText",
+    "purchasePriceText", "noteText", "signedOriginal", "signedCopy", "incomingVoOriginal",
+    "incomingVoCopy", "outgoingVoOriginal", "outgoingVoCopy", "submitted", "vendorInvoice",
+    "tier", "payable", "profitPercent", "profit",
+  ];
+  for (const field of shipmentFields) assert.match(shipment, new RegExp(`'${field}'`));
+  assert.match(receivablesOnly, /jsonb_build_object\(\s*'noteText', source_acceptance->'report'->'noteText'\s*\)/i);
+  for (const field of shipmentFields.filter((field) => field !== "noteText"))
+    assert.doesNotMatch(receivablesOnly, new RegExp(`'${field}'`));
+  for (const field of ["photos", "signatures", "items", "completion"])
+    assert.doesNotMatch(report, new RegExp(`'${field}'`));
+
+  assert.doesNotMatch(rpc, /\b(?:insert|update|delete|truncate)\b|spc_save_workspace_unchecked|spc_merge_workspace|spc_log_workspace_changes/i);
+  assert.doesNotMatch(rpc, /spc_json_merge_three_way|\bstorage\./i);
+  assert.match(sql, /revoke all on function public\.spc_load_finance_export_data\(\) from public, anon/i);
+  assert.match(sql, /grant execute on function public\.spc_load_finance_export_data\(\) to authenticated/i);
+  assert.doesNotMatch(sql, /grant execute on function public\.spc_(?:current_approved_role|current_effective_permissions)\(\) to authenticated/i);
+
+  const workspaceIntegration = sql.slice(sql.indexOf("create or replace function public.spc_load_workspace()"), start);
+  assert.match(workspaceIntegration, /snapshot := public\.spc_load_workspace_unchecked\(\)[\s\S]*return public\.spc_filter_permissioned_workspace\(snapshot\)/i);
+  assert.doesNotMatch(sql, /create or replace function public\.spc_json_merge_three_way(?:_at)?\s*\(/i);
+  assert.doesNotMatch(sql, /\bstorage\.|create\s+policy/i);
+});
+
+test("phase 5C-2 loads the protected finance DTO without hydration or write behavior", async () => {
+  const backend = await read("lib/spc-backend.ts");
+  const start = backend.indexOf("export async function loadFinanceExportData");
+  const end = backend.indexOf("export async function loadLegacyWorkspace", start);
+  const wrapper = backend.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(backend, /export type FinanceExportProject = ExportProject & \{ id: string \}/);
+  assert.match(backend, /export type FinanceExportData = \{[\s\S]*canExportReceivables: boolean[\s\S]*canExportShipmentDetails: boolean[\s\S]*projects: FinanceExportProject\[\]/);
+  assert.match(wrapper, /supabase\.rpc\("spc_load_finance_export_data"\)/);
+  assert.match(wrapper, /if \(error\) throw error/);
+  assert.doesNotMatch(wrapper, /hydratePrivatePhotos|serializePrivatePhotos|\.storage\.|spc_(?:merge|save)_workspace|uploadEmbeddedPhotos/);
+});
+
+test("phase 5C-2 keeps ordinary finance exports on the protected project with no workspace fallback", async () => {
+  const page = await read("app/page.tsx");
+  const start = page.indexOf("function Billing(");
+  const end = page.indexOf("type CompletionExportDraft", start);
+  const billing = page.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(page, /import \{[^}]*loadFinanceExportData[^}]*type FinanceExportData[^}]*type FinanceExportProject[^}]*\} from "\.\.\/lib\/spc-backend"/);
+  assert.match(billing, /needsProtectedFinanceData = !canManageFinance && \(canExportReceivables \|\| canExportShipment\)/);
+  assert.match(billing, /if \(!needsProtectedFinanceData\)[\s\S]*loadFinanceExportData\(\)\.then/);
+  assert.match(billing, /let active = true[\s\S]*if \(!active\) return[\s\S]*return \(\) => \{ active = false; \}/);
+  assert.match(billing, /data\.projects\.find\(\(candidate\) => candidate\.id === p\.id\)/);
+  assert.match(billing, /if \(!project\)[\s\S]*setFinanceExportError/);
+  assert.doesNotMatch(billing, /data\.projects\[0\]|protectedFinanceProject\s*\|\|\s*p|protectedFinanceProject\s*\?\?\s*p/);
+
+  assert.match(billing, /serverCanExportReceivables = canManageFinance \|\| protectedFinanceData\?\.canExportReceivables === true/);
+  assert.match(billing, /serverCanExportShipment = canManageFinance \|\| protectedFinanceData\?\.canExportShipmentDetails === true/);
+  assert.match(billing, /financeExportProject = canManageFinance \? p : protectedFinanceProject/);
+  assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(financeExportProject\)/);
+  assert.match(billing, /const unit = financeExportProject\?\.units\?\.find\(\(item\) => item\.id === record\.unitId\)/);
+  assert.match(billing, /buildReceivableExportDraft\(financeExportProject, billRecords\)/);
+  assert.match(billing, /createReceivableWorkbook\(financeExportProject, billRecords, ym, receivableDraft\)/);
+  assert.match(billing, /createShipmentWorkbook\(financeExportProject, shipmentRecords, ym\)/);
+
+  assert.match(billing, /confirmSave = \(\) => \{[\s\S]*patch\(\{\s*units: p\.units\.map/);
+  assert.match(billing, /startShipmentReportEdit = [\s\S]*if \(!canManageFinance\) return[\s\S]*const unit = p\.units\.find/);
+  assert.match(billing, /saveShipmentReportSource = [\s\S]*if \(!canManageFinance\) return[\s\S]*const currentUnit = p\.units\.find[\s\S]*patch\(\{ units: p\.units\.map/);
+  assert.doesNotMatch(billing.slice(billing.indexOf("loadFinanceExportData().then"), billing.indexOf("const financeExportProject")), /\bpatch\(|saveWorkspace|spc_merge_workspace|uploadEmbeddedPhotos/);
+  assert.doesNotMatch(billing, /financeExportError[\s\S]*(?:signOut|localStorage\.(?:clear|removeItem)|indexedDB\.deleteDatabase)/i);
+  assert.doesNotMatch(billing, /cleanupRemovedPhotos|supabase\.storage|spc-photos/);
+  assert.match(billing, /financeExportLoading[\s\S]*正在讀取財務匯出資料/);
+  assert.match(billing, /financeExportError[\s\S]*className="form-error billing-no-print"/);
 });

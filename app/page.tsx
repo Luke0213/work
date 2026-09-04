@@ -2,7 +2,7 @@
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { AlignmentType, BorderStyle, Document, ImageRun, Packer, PageOrientation, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
-import { loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
+import { loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
 import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
@@ -12,7 +12,8 @@ import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, buildReceiva
 import { companyReportConfig } from "../lib/company-report-config";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
-import { AUTH_TIMEOUT_MS, AuthResolveGuard, resolveAuthIdentity, withAuthTimeout, type AuthIdentity } from "../lib/auth-session";
+import { AUTH_TIMEOUT_MS, AuthResolveGuard, normalizeAccountProfile, resolveAuthIdentity, withAuthTimeout, type AuthIdentity } from "../lib/auth-session";
+import { CONFIGURABLE_ROLES, ROLE_PERMISSION_KEYS, hasAllRolePermissions, setAllRolePermissions, type ConfigurableRole, type RolePermissionKey, type RolePermissionMatrix, type RolePermissions } from "../lib/role-permissions";
 import { migrateLegacyStorageValue, scopedDraftKey, scopedStorageKey } from "../lib/auth-storage";
 import { printWithLifecycleCleanup, revokeObjectUrlLater } from "../lib/browser-lifecycle";
 import { areaInputToPing, areaValueFromPing, convertAreaInput, type AreaUnit } from "../lib/area";
@@ -21,6 +22,7 @@ import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, import
 import { buildUnitScopedRecord, buildingNavigationUnits, createFloorReturnContext, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, sortUnitsByNumber, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
 import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 import { canWriteAcceptanceLifecycle, canWriteWorkLifecycle } from "../lib/unit-lifecycle";
+import { canConfirmUnit, canCreateUnit, canDeleteUnit, canEditUnitMaster, canUsePermissionUnitTab, canUsePermissionView, canViewCustomerDetails, financeUiMode } from "../lib/ui-permissions";
 
 type Status =
   | "待確認"
@@ -317,32 +319,22 @@ function authDebug(detail: Record<string, unknown>) {
 const roleLabels: Record<AppRole, string> = {
   admin: "管理員",
   shenyin: "神銀窗口",
-  client: "客戶端",
+  client: "廠商",
   crew: "工班人員",
   sales: "代銷",
 };
 const roleOptions: { value: AppRole; label: string }[] = [
   { value: "admin", label: "管理員" },
   { value: "shenyin", label: "神銀窗口" },
-  { value: "client", label: "客戶端" },
+  { value: "client", label: "廠商" },
   { value: "crew", label: "工班人員" },
   { value: "sales", label: "代銷" },
 ];
 const applicationRoleOptions = roleOptions.filter((option) => option.value !== "admin");
-const canUseSystem = (role: AppRole | null) => !!role,
+const canUseSystem = (role: AppRole | null): role is AppRole => role !== null,
   canManageProjectData = (role: AppRole) => role === "admin" || role === "shenyin",
-  canUseView = (role: AppRole, view: string) => {
-    if (canManageProjectData(role)) return true;
-    if (role === "crew") return ["dashboard", "units"].includes(view);
-    if (role === "client" || role === "sales") return view === "units";
-    return false;
-  },
-  canUseUnitTab = (role: AppRole, tab: string) => {
-    if (canManageProjectData(role)) return true;
-    if (role === "crew") return ["master", "survey", "work", "accept", "journal", "defect", "sheet", "timeline"].includes(tab);
-    if (role === "client" || role === "sales") return tab === "master";
-    return false;
-  };
+  canUseView = canUsePermissionView,
+  canUseUnitTab = canUsePermissionUnitTab;
 const sideViews: [string, string, string][] = [
   ["dashboard", "⌂", "Dashboard"],
   ["units", "▦", "戶別管理"],
@@ -725,10 +717,15 @@ export default function App() {
           if (error || !data.user) throw error || new Error("AUTH_VALIDATION_EMPTY");
           return data.user;
         },
-        loadRole: async () => {
-          const { data, error } = await supabase.rpc("spc_current_role");
+        loadProfile: async () => {
+          const { data, error } = await supabase.rpc("spc_current_account_profile");
           if (error) throw error;
-          return ["admin", "shenyin", "client", "crew", "sales"].includes(String(data)) ? data as AppRole : "client";
+          return normalizeAccountProfile<AppRole>(data, ["admin", "shenyin", "client", "crew", "sales"]);
+        },
+        loadPermissions: async () => {
+          const { data, error } = await supabase.rpc("spc_current_permissions");
+          if (error) throw error;
+          return data;
         },
         currentSessionUserId: async () => {
           const { data, error } = await supabase.auth.getSession();
@@ -786,8 +783,10 @@ export default function App() {
   if (recoveryMode || mustChangePassword) return <PasswordRecoveryScreen forced={mustChangePassword} onDone={() => { setRecoveryMode(false); setMustChangePassword(false); }} />;
   if (guestMode) return <GuestPreview onExit={() => setGuestMode(false)} />;
   if (!authSnapshot) return <LoginScreen initialError={authError} onGuest={() => setGuestMode(true)} />;
-  if (!canUseSystem(authSnapshot.role)) return <VisitorScreen email={authSnapshot.email} error={authError} />;
-  return <AuthOwnerContext.Provider value={authSnapshot.userId}><AdminApp key={authSnapshot.userId} authUserId={authSnapshot.userId} email={authSnapshot.email} role={roleLabels[authSnapshot.role]} appRole={authSnapshot.role} /></AuthOwnerContext.Provider>;
+  if (authSnapshot.applicationStatus === "pending") return <AccountStatusScreen kind="pending" identity={authSnapshot} />;
+  if (authSnapshot.applicationStatus === "rejected") return <RejectedAccountScreen identity={authSnapshot} />;
+  if (!authSnapshot.active || authSnapshot.applicationStatus !== "approved" || !canUseSystem(authSnapshot.role)) return <AccountStatusScreen kind="inactive" identity={authSnapshot} error={authError} />;
+  return <AuthOwnerContext.Provider value={authSnapshot.userId}><AdminApp key={authSnapshot.userId} authUserId={authSnapshot.userId} email={authSnapshot.email} displayName={authSnapshot.displayName} role={roleLabels[authSnapshot.role]} appRole={authSnapshot.role} permissions={authSnapshot.permissions} /></AuthOwnerContext.Provider>;
 }
 
 function AuthLoading({ message = "" }: { message?: string }) {
@@ -980,35 +979,72 @@ function GuestPreview({ onExit }: { onExit: () => void }) {
   );
 }
 
-function VisitorScreen({ email, error }: { email: string; error?: string }) {
+function AccountStatusScreen({ kind, identity, error }: { kind: "pending" | "inactive"; identity: AuthSnapshot; error?: string }) {
+  const pending = kind === "pending";
   return (
     <main className="login-screen">
       <section className="login-card visitor-card">
         <CompanyLogo className="login-mark" />
-        <p className="eyebrow">訪客帳號</p>
-        <h1>您目前沒有案場存取權限</h1>
-        <p>為保護案場、住戶、照片與工程紀錄，訪客帳號無法查看或修改任何工程資料。</p>
-        <div className="visitor-account">目前登入：<b>{email}</b></div>
+        <p className="eyebrow">帳號狀態</p>
+        <h1>{pending ? "等待管理員核准" : "帳號已停用"}</h1>
+        <p>{pending ? "申請已送出；核准前不會載入任何案場資料。" : "此帳號目前無法使用系統，請聯絡管理員。"}</p>
+        <div className="visitor-account">目前登入：<b>{identity.displayName || identity.email}</b><small>{identity.email}</small></div>
         {error && <div className="login-error" role="alert">{error}</div>}
         <button className="ghost" onClick={() => void supabase.auth.signOut()}>登出</button>
-        <small className="login-help">如需系統管理員權限，請聯絡帳號管理人員。</small>
       </section>
     </main>
   );
 }
 
-function SessionChip({ email, role }: { email: string; role: string }) {
+function RejectedAccountScreen({ identity }: { identity: AuthSnapshot }) {
+  const [displayName, setDisplayName] = useState(identity.displayName);
+  const [role, setRole] = useState<Exclude<AppRole, "admin">>(identity.role === "admin" || !identity.role ? "client" : identity.role);
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const reapply = async (event: React.FormEvent) => {
+    event.preventDefault(); setError(""); setSubmitting(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("登入已逾時，請重新登入。");
+      const response = await fetch("/api/account-applications", {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ displayName, role }),
+      });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error === "INVALID_NAME" ? "請填寫姓名。" : result.error === "INVALID_ROLE" ? "請選擇有效的申請身份。" : "無法重新送出申請，請聯絡管理員。");
+      setSubmitted(true);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "無法重新送出申請"); }
+    finally { setSubmitting(false); }
+  };
+  if (submitted) return <AccountStatusScreen kind="pending" identity={{ ...identity, displayName, role, applicationStatus: "pending", active: false }} />;
+  return <main className="login-screen"><section className="login-card application-card">
+    <CompanyLogo className="login-mark" /><p className="eyebrow">帳號申請</p><h1>申請未通過</h1>
+    <p>你可以使用原帳號重新送出姓名與申請身份；不需要變更密碼。</p>
+    <form className="login-form" onSubmit={reapply}>
+      <label><span>姓名</span><input required maxLength={80} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
+      <label><span>申請身份</span><select value={role} onChange={(event) => setRole(event.target.value as Exclude<AppRole, "admin">)}>{applicationRoleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+      {error && <div className="login-error" role="alert">{error}</div>}
+      <button className="primary" disabled={submitting}>{submitting ? "送出中…" : "重新申請"}</button>
+      <button className="ghost" type="button" onClick={() => void supabase.auth.signOut()}>登出</button>
+    </form>
+  </section></main>;
+}
+
+function SessionChip({ displayName, email, role }: { displayName: string; email: string; role: string }) {
   const signOut = async () => {
     localStorage.removeItem("spc-current-user-id");
     await supabase.auth.signOut();
   };
-  return <div className="session-chip"><span><b>{role}</b><small>{email}</small></span><button onClick={() => void signOut()}>登出</button></div>;
+  return <div className="session-chip" title={email}><span><b>{displayName || email}</b><small>{role}</small></span><button onClick={() => void signOut()}>登出</button></div>;
 }
 
-function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; email: string; role: string; appRole: AppRole }) {
+function AdminApp({ authUserId, email, displayName, role, appRole, permissions }: { authUserId: string; email: string; displayName: string; role: string; appRole: AppRole; permissions: RolePermissions }) {
   const mountIdRef = useRef(`${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
   const canManageProjects = canManageProjectData(appRole);
   const canManageAccounts = appRole === "admin";
+  const canUseAcceptance = canUseUnitTab(appRole, permissions, "accept");
   const versionRef = useRef(0);
   const savingRef = useRef(false);
   const retrySyncRef = useRef(false);
@@ -1058,11 +1094,15 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
       setView("units");
       return;
     }
-    if (!canUseView(appRole, view)) {
+    if (!canUseView(appRole, permissions, view)) {
       setUid("");
       setView(appRole === "client" || appRole === "sales" ? "units" : "dashboard");
     }
-  }, [appRole, view]);
+  }, [appRole, permissions, view]);
+  useEffect(() => {
+    if (canUseAcceptance || !floorContext) return;
+    setFloorContext(null);
+  }, [floorContext, canUseAcceptance]);
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -1467,7 +1507,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
           <label className="ghost" style={{ cursor: "pointer" }}>還原備份
             <input type="file" accept="application/json" hidden onChange={(e) => e.target.files?.[0] && void importBackup(e.target.files[0])} />
           </label></>}
-          <SessionChip email={email} role={role} />
+          <SessionChip displayName={displayName} email={email} role={role} />
         </div>
       </header>
           {showQuickStart && <div className="quick-start"><div><b>第一次使用，照這 5 步即可</b><span>① 選案場　→　② 選戶別　→　③ 開始檢查　→　④ 📷 拍照　→　⑤ 💾 暫存／✓ 完成</span></div><button onClick={() => { localStorage.setItem(scopedKey("spc-quick-start-seen", authUserId), "1"); setShowQuickStart(false); }}>知道了</button></div>}
@@ -1490,7 +1530,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
           </div>
           <div className="global-database">
             <p className="side-title">共用資料庫</p>
-            <button
+            {canManageProjects && <button
               className={
                 view === "products"
                   ? "global-products active"
@@ -1504,7 +1544,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
               <span>◇</span>
               <b>SPC 產品管理</b>
               <small>全案場共用</small>
-            </button>
+            </button>}
             {canManageAccounts && (
               <button
                 className={view === "accounts" ? "global-products active" : "global-products"}
@@ -1517,7 +1557,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             )}
           </div>
           <p className="side-title project-section-title">專案／建案</p>
-          <button
+          {canManageProjects && <button
             className="primary wide"
             onClick={() => {
               setMenuOpen(false);
@@ -1525,7 +1565,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
             }}
           >
             ＋ 新增專案
-          </button>
+          </button>}
           <div className="project-list">
             {liveProjects.map((p) => (
               <div className="project-group" key={p.id}>
@@ -1550,11 +1590,12 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
                   <>
                     <p className="project-subtitle">案場功能</p>
                     <nav className="project-subnav">
-                      {sideViews.map(([key, icon, label]) => (
+                      {sideViews.filter(([key]) => canUseView(appRole, permissions, key)).map(([key, icon, label]) => (
                         <button
                           key={key}
                           className={view === key && !uid ? "active" : ""}
                           onClick={() => {
+                            if (!canUseView(appRole, permissions, key)) return;
                             setUid("");
                             setFloorContext(null);
                             setView(key);
@@ -1586,7 +1627,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
         <section className="content">
           {view === "accounts" && canManageAccounts ? (
             <AccountManagement />
-          ) : view === "products" ? (
+          ) : view === "products" && canManageProjects ? (
             <GlobalProducts products={catalog} setProducts={updateCatalog} />
           ) : !project ? (
             <Empty />
@@ -1595,6 +1636,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
               project={project}
               unit={unit}
               role={appRole}
+              permissions={permissions}
               activity={activity.find((item) => item.entityType === "unit" && item.entityId === unit.id)}
               patch={patchUnit}
               addEvent={addEvent}
@@ -1610,7 +1652,7 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
                 setUid("");
               }}
             />
-          ) : floorContext ? (
+          ) : floorContext && canUseAcceptance ? (
             <FloorAcceptanceView
               project={project}
               context={floorContext}
@@ -1623,9 +1665,11 @@ function AdminApp({ authUserId, email, role, appRole }: { authUserId: string; em
               project={project}
               view={view}
               setView={setView}
+              role={appRole}
+              permissions={permissions}
               patch={patchProject}
               open={(unitId) => { setFloorContext(null); setUid(unitId); }}
-              openFloor={(building, floor) => setFloorContext(createFloorReturnContext(building, floor))}
+              openFloor={(building, floor) => { if (canUseAcceptance) setFloorContext(createFloorReturnContext(building, floor)); }}
               remove={removeProject}
             />
           )}
@@ -1639,6 +1683,7 @@ type ManagedUser = {
   id: string;
   email: string;
   phone: string;
+  displayName: string;
   role: AppRole;
   active: boolean;
   createdAt: string;
@@ -1650,15 +1695,38 @@ type ManagedUser = {
 const displayIdentity = (email: string, phone: string) =>
   email || phone.replace(/^\+?8869/, "09");
 
+const permissionLabels: Record<RolePermissionKey, string> = {
+  editUnitMaster: "修改戶別資料",
+  useSurvey: "場勘",
+  useWork: "施工",
+  useAcceptance: "驗收",
+  useAcceptanceJournal: "驗收日誌",
+  useDefects: "缺失改善",
+  exportReceivables: "應收帳款",
+  exportShipmentDetails: "細總表",
+};
+const configurableRoleLabels: Record<ConfigurableRole, string> = { crew: "工班人員", client: "廠商", sales: "代銷" };
+const clonePermissionMatrix = (value: RolePermissionMatrix): RolePermissionMatrix => Object.fromEntries(
+  CONFIGURABLE_ROLES.map((role) => [role, { ...value[role] }]),
+) as RolePermissionMatrix;
+
+function PermissionMatrixAll({ value, onChange }: { value: RolePermissions; onChange: (checked: boolean) => void }) {
+  const all = hasAllRolePermissions(value);
+  const some = ROLE_PERMISSION_KEYS.some((key) => value[key]);
+  return <input type="checkbox" aria-label="全部權限" aria-checked={all ? true : some ? "mixed" : false} checked={all} ref={(node) => { if (node) node.indeterminate = some && !all; }} onChange={(event) => onChange(event.target.checked)} />;
+}
+
 function AccountManagement() {
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [currentUserId, setCurrentUserId] = useState("");
-  const [newIdentity, setNewIdentity] = useState("");
-  const [newRole, setNewRole] = useState<AppRole>("client");
+  const [approvalRoles, setApprovalRoles] = useState<Record<string, AppRole>>({});
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [permissionsDraft, setPermissionsDraft] = useState<RolePermissionMatrix | null>(null);
+  const [permissionsBaseline, setPermissionsBaseline] = useState<RolePermissionMatrix | null>(null);
+  const [permissionsSaving, setPermissionsSaving] = useState(false);
 
   const adminRequest = async (body?: object) => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -1668,13 +1736,19 @@ function AccountManagement() {
       headers: { Authorization: `Bearer ${session.access_token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
-    const result = await response.json() as { error?: string; users?: ManagedUser[]; currentUserId?: string };
+    const result = await response.json() as { error?: string; users?: ManagedUser[]; currentUserId?: string; rolePermissions?: RolePermissionMatrix };
     if (!response.ok) {
       const labels: Record<string, string> = {
         ADMIN_REQUIRED: "只有啟用中的系統管理員可以管理帳號。",
         CANNOT_LOCK_SELF: "為避免鎖住系統，不能停用自己或變更自己的身份。",
+        LAST_ACTIVE_ADMIN: "系統至少必須保留一名啟用且已核准的管理員。",
         INVALID_ROLE: "請選擇有效的帳號身份。",
-        INVALID_IDENTITY: "請輸入正確的電子郵件或台灣手機號碼。",
+        INVALID_NAME: "姓名不可空白且不得超過 80 字。",
+        INVALID_PERMISSIONS: "權限設定格式不正確，請重新整理後再試。",
+        APPROVE_NOT_ALLOWED: "只有待審核或已拒絕且未啟用的申請可以核准。",
+        REJECT_NOT_ALLOWED: "只有待審核且未啟用的申請可以拒絕。",
+        ACTIVE_CHANGE_NOT_ALLOWED: "待審核或已拒絕的帳號不能使用啟用切換。",
+        ROLE_CHANGE_NOT_ALLOWED: "只有啟用且已核准的帳號可以變更身份。",
         SERVER_AUTH_NOT_CONFIGURED: "帳號管理服務尚未完成安全設定。",
       };
       throw new Error(labels[result.error || ""] || result.error || "操作失敗，請稍後再試。");
@@ -1682,12 +1756,17 @@ function AccountManagement() {
     return result;
   };
 
-  const loadUsers = async () => {
+  const loadUsers = async (refreshPermissions = true) => {
     setLoading(true); setError("");
     try {
       const result = await adminRequest();
       setUsers(result.users || []);
       setCurrentUserId(result.currentUserId || "");
+      if (refreshPermissions && result.rolePermissions) {
+        const loaded = clonePermissionMatrix(result.rolePermissions);
+        setPermissionsDraft(loaded);
+        setPermissionsBaseline(clonePermissionMatrix(loaded));
+      }
     } catch (err) { setError(err instanceof Error ? err.message : "無法載入帳號"); }
     finally { setLoading(false); }
   };
@@ -1696,51 +1775,84 @@ function AccountManagement() {
 
   const act = async (key: string, body: object, success: string) => {
     setBusy(key); setError(""); setMessage("");
-    try { await adminRequest(body); setMessage(success); await loadUsers(); }
+    try { await adminRequest(body); setMessage(success); await loadUsers(false); }
     catch (err) { setError(err instanceof Error ? err.message : "操作失敗"); }
     finally { setBusy(""); }
   };
 
-  const createAccount = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const identity = newIdentity.trim();
-    if (!identity) return;
-    await act("create", { action: "create", identity, role: newRole }, `已建立 ${identity}，首次登入請使用預設密碼 1234qwer`);
-    setNewIdentity("");
-  };
-
   const formatTime = (value: string | null) => value ? new Date(value).toLocaleString("zh-TW") : "尚未登入";
+  const permissionsDirty = !!permissionsDraft && !!permissionsBaseline && JSON.stringify(permissionsDraft) !== JSON.stringify(permissionsBaseline);
+  const updatePermission = (role: ConfigurableRole, key: RolePermissionKey, checked: boolean) => setPermissionsDraft((current) => current ? {
+    ...current,
+    [role]: { ...current[role], [key]: checked },
+  } : current);
+  const savePermissions = async () => {
+    if (!permissionsDraft || !permissionsDirty) return;
+    setPermissionsSaving(true); setError(""); setMessage("");
+    try {
+      const result = await adminRequest({ action: "permissions", permissions: permissionsDraft });
+      const saved = result.rolePermissions ? clonePermissionMatrix(result.rolePermissions) : clonePermissionMatrix(permissionsDraft);
+      setPermissionsDraft(saved); setPermissionsBaseline(clonePermissionMatrix(saved)); setMessage("權限設定已儲存");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "無法儲存權限設定"); }
+    finally { setPermissionsSaving(false); }
+  };
+  const refreshUsers = () => {
+    if (permissionsDirty && !confirm("尚未儲存的權限變更將被放棄，確定重新整理嗎？")) return;
+    void loadUsers();
+  };
 
   return (
     <div className="account-page">
       <div className="page-head account-head">
-        <div><p className="eyebrow">系統管理</p><h1>帳號管理</h1><p>以電子郵件或手機號碼建立帳號、指定身份與查看最近登入狀態。</p></div>
-        <button className="ghost" onClick={() => void loadUsers()} disabled={loading}>重新整理</button>
+        <div><p className="eyebrow">系統管理</p><h1>帳號管理</h1><p>審核帳號申請、維護姓名與查看最近登入狀態。</p></div>
+        <button className="ghost" onClick={refreshUsers} disabled={loading}>重新整理</button>
       </div>
-      <section className="panel invite-panel">
-        <div><h2>建立新帳號</h2><p className="muted">可使用電子郵件或台灣手機號碼；預設密碼為 1234qwer，首次登入會強制更換。</p></div>
-        <form onSubmit={createAccount}>
-          <input type="text" required value={newIdentity} onChange={(event) => setNewIdentity(event.target.value)} placeholder="name@company.com 或 0912345678" aria-label="電子郵件或手機號碼" />
-          <select value={newRole} onChange={(event) => setNewRole(event.target.value as AppRole)} aria-label="新帳號身份">{roleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-          <button className="primary" disabled={busy === "create"}>{busy === "create" ? "建立中…" : "建立帳號"}</button>
-        </form>
-      </section>
       {message && <div className="save-success">{message}</div>}
       {error && <div className="login-error" role="alert">{error}</div>}
+      <section className="panel role-permission-panel">
+        <div className="panel-head"><div><h2>角色權限設定</h2><p>勾選只會修改畫面草稿，按下儲存後才會永久套用。</p></div>
+          <div className="role-permission-save">{permissionsDirty && <span>有尚未儲存的變更</span>}<button className="primary" disabled={!permissionsDirty || permissionsSaving || !permissionsDraft} onClick={() => void savePermissions()}>{permissionsSaving ? "儲存中…" : "儲存權限設定"}</button></div>
+        </div>
+        {!permissionsDraft ? <div className="empty">正在載入權限設定…</div> : <div className="role-permission-scroll">
+          <table className="role-permission-matrix"><thead><tr><th>角色</th>{ROLE_PERMISSION_KEYS.map((key) => <th key={key}>{permissionLabels[key]}</th>)}<th>全部</th></tr></thead>
+            <tbody>{CONFIGURABLE_ROLES.map((role) => <tr key={role}><th scope="row">{configurableRoleLabels[role]}</th>
+              {ROLE_PERMISSION_KEYS.map((key) => <td key={key}><label aria-label={`${configurableRoleLabels[role]}：${permissionLabels[key]}`}><input type="checkbox" checked={permissionsDraft[role][key]} onChange={(event) => updatePermission(role, key, event.target.checked)} /></label></td>)}
+              <td><label aria-label={`${configurableRoleLabels[role]}：全部`}><PermissionMatrixAll value={permissionsDraft[role]} onChange={(checked) => setPermissionsDraft((current) => current ? { ...current, [role]: setAllRolePermissions(current[role], checked) } : current)} /></label></td>
+            </tr>)}</tbody></table>
+        </div>}
+      </section>
       <section className="panel account-list-panel">
         <div className="panel-head"><div><h2>所有帳號</h2><p>{loading ? "正在讀取…" : `共 ${users.length} 個帳號`}</p></div></div>
         <div className="account-list">
           {users.map((user) => {
             const isSelf = user.id === currentUserId;
             const identity = displayIdentity(user.email, user.phone);
+            const title = user.displayName || identity;
+            const pending = user.applicationStatus === "pending" && !user.active;
+            const rejected = user.applicationStatus === "rejected" && !user.active;
+            const approvalRole = approvalRoles[user.id] || user.role;
             return (
               <article className={`account-row ${user.active ? "" : "disabled"}`} key={user.id}>
-                <div className="account-identity"><span>{identity.slice(0, 1).toUpperCase()}</span><div><b>{identity}</b><small>{isSelf ? "目前登入帳號" : user.applicationStatus === "pending" ? "待審核申請" : user.confirmedAt ? "已確認" : "尚未確認"}</small></div></div>
+                <div className="account-identity"><span>{title.slice(0, 1).toUpperCase()}</span><div><b>{title}</b><small>{identity}{isSelf ? " · 目前登入帳號" : pending ? " · 待審核申請" : rejected ? " · 申請未通過" : user.confirmedAt ? " · 已確認" : " · 尚未確認"}</small></div></div>
                 <div className="account-last"><small>最後登入</small><b>{formatTime(user.lastSignInAt)}</b></div>
-                <label className="account-role"><small>身份</small><select value={user.role} disabled={isSelf || !!busy} onChange={(event) => void act(`role-${user.id}`, { action: "role", userId: user.id, role: event.target.value }, `已更新 ${identity} 的身份`)}>{roleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                <label className="account-role"><small>{pending ? "核准身份" : "身份"}</small><select value={pending ? approvalRole : user.role} disabled={isSelf || rejected || !!busy} onChange={(event) => {
+                  const nextRole = event.target.value as AppRole;
+                  if (pending) { setApprovalRoles((current) => ({ ...current, [user.id]: nextRole })); return; }
+                  if ((user.role === "admin" || nextRole === "admin") && !confirm(`確定要將 ${title} 的身份從「${roleLabels[user.role]}」改為「${roleLabels[nextRole]}」？`)) return;
+                  void act(`role-${user.id}`, { action: "role", userId: user.id, role: nextRole }, `已更新 ${title} 的身份`);
+                }}>{roleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                 <div className="account-actions">
-                  <button className="ghost" disabled={!!busy} onClick={() => { if (confirm(`確定將 ${identity} 的密碼重設為 1234qwer？`)) void act(`reset-${user.id}`, { action: "reset", userId: user.id }, `已重設 ${identity}，下次登入會強制更換密碼`); }}>重設密碼</button>
-                  <button className={user.active ? "danger" : "primary"} disabled={isSelf || !!busy} onClick={() => { if (!user.active || confirm(`確定要停用 ${identity}？停用後將立即無法登入。`)) void act(`active-${user.id}`, { action: "active", userId: user.id, active: !user.active }, user.active ? `已停用 ${identity}` : user.applicationStatus === "pending" ? `已核准 ${identity} 的帳號申請` : `已啟用 ${identity}`); }}>{user.active ? "停用" : user.applicationStatus === "pending" ? "核准申請" : "啟用"}</button>
+                  <button className="ghost" disabled={!!busy} onClick={() => {
+                    const nextName = prompt("請輸入真實姓名", user.displayName || "")?.trim();
+                    if (nextName) void act(`name-${user.id}`, { action: "displayName", userId: user.id, displayName: nextName }, `已更新 ${title} 的姓名`);
+                  }}>修改姓名</button>
+                  <button className="ghost" disabled={!!busy} onClick={() => { if (confirm(`確定將 ${title} 的密碼重設為 1234qwer？`)) void act(`reset-${user.id}`, { action: "reset", userId: user.id }, `已重設 ${title}，下次登入會強制更換密碼`); }}>重設密碼</button>
+                  {pending && <button className="primary" disabled={!!busy} onClick={() => {
+                    if (approvalRole === "admin" && !confirm(`確定要將 ${title} 核准為管理員？管理員可管理所有帳號。`)) return;
+                    void act(`approve-${user.id}`, { action: "approve", userId: user.id, role: approvalRole }, `已核准 ${title}`);
+                  }}>核准</button>}
+                  {pending && <button className="danger" disabled={!!busy} onClick={() => { if (confirm(`確定拒絕 ${title} 的帳號申請？`)) void act(`reject-${user.id}`, { action: "reject", userId: user.id }, `已拒絕 ${title} 的申請`); }}>拒絕</button>}
+                  {!pending && !rejected && <button className={user.active ? "danger" : "primary"} disabled={isSelf || !!busy} onClick={() => { if (!user.active || confirm(`確定要停用 ${title}？停用後將立即無法登入。`)) void act(`active-${user.id}`, { action: "active", userId: user.id, active: !user.active }, user.active ? `已停用 ${title}` : `已啟用 ${title}`); }}>{user.active ? "停用" : "啟用"}</button>}
                 </div>
               </article>
             );
@@ -1870,6 +1982,8 @@ function ProjectArea({
   project,
   view,
   setView,
+  role,
+  permissions,
   patch,
   open,
   openFloor,
@@ -1878,11 +1992,18 @@ function ProjectArea({
   project: Project;
   view: string;
   setView: (x: string) => void;
+  role: AppRole;
+  permissions: RolePermissions;
   patch: (x: Partial<Project>) => void;
   open: (x: string) => void;
   openFloor: (building: string, floor: string) => void;
   remove: () => void;
 }) {
+  const safeView = canUseView(role, permissions, view)
+    ? view
+    : role === "client" || role === "sales" ? "units" : "dashboard";
+  const fullBusinessAccess = canManageProjectData(role);
+  const financeAccess = financeUiMode(role, permissions);
   return (
     <>
       <div className="page-head">
@@ -1891,7 +2012,7 @@ function ProjectArea({
           <h1>{project.name}</h1>
           <p>📍 {project.address || "尚未填寫案場地址"}</p>
         </div>
-        <div className="actions">
+        {canManageProjectData(role) && <div className="actions">
           <button
             className="danger"
             onClick={() =>
@@ -1905,11 +2026,11 @@ function ProjectArea({
           <button className="primary" onClick={() => setView("units")}>
             ＋ 新增戶別
           </button>
-        </div>
+        </div>}
       </div>
       <Tabs
-        value={view}
-        set={setView}
+        value={safeView}
+        set={(next) => { if (canUseView(role, permissions, next)) setView(next); }}
         items={[
           ["dashboard", "Dashboard"],
           ["units", "戶別管理"],
@@ -1917,17 +2038,17 @@ function ProjectArea({
           ["journal", "今日日誌"],
           ["billing", "月結／計價"],
           ["project", "專案資料"],
-        ]}
+        ].filter(([value]) => canUseView(role, permissions, value))}
       />
-      {view === "dashboard" && (
-        <Dashboard p={project} setView={setView} />
+      {safeView === "dashboard" && (
+        <Dashboard p={project} setView={setView} permissions={permissions} />
       )}{" "}
-      {view === "units" && <Units p={project} patch={patch} open={open} openFloor={openFloor} />}{" "}
-      {view === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} />}{" "}
-      {view === "products" && <Products p={project} patch={patch} />}{" "}
-      {view === "journal" && <Journal p={project} patch={patch} />}{" "}
-      {view === "billing" && <Billing p={project} patch={patch} />}{" "}
-      {view === "project" && <ProjectForm p={project} patch={patch} />}
+      {safeView === "units" && <Units p={project} patch={patch} open={open} openFloor={openFloor} canEditExisting={canEditUnitMaster(role, permissions)} canCreate={canCreateUnit(role)} canAccept={canUseUnitTab(role, permissions, "accept")} />}{" "}
+      {safeView === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} canExportShipment={financeAccess.canExportShipment} canManageFinance={financeAccess.canManageFinance} />}{" "}
+      {safeView === "products" && <Products p={project} patch={patch} />}{" "}
+      {safeView === "journal" && <Journal p={project} patch={patch} />}{" "}
+      {safeView === "billing" && <Billing p={project} patch={patch} financeAccess={financeAccess} />}{" "}
+      {safeView === "project" && <ProjectForm p={project} patch={patch} />}
     </>
   );
 }
@@ -2018,7 +2139,7 @@ function ReportMetadataEditor({ draft, setDraft }: { draft: ReportSourceDraft; s
   </div></>;
 }
 
-function DailyAcceptanceView({ p, patch }: { p: Project; patch: (x: Partial<Project>) => void }) {
+function DailyAcceptanceView({ p, patch, canExportShipment, canManageFinance }: { p: Project; patch: (x: Partial<Project>) => void; canExportShipment: boolean; canManageFinance: boolean }) {
   const authUserId = useAuthOwner();
   const entries = useMemo(() => buildDailyAcceptanceEntries<Acceptance, Unit>(p.units), [p.units]);
   const dates = [...new Set(entries.map((entry) => entry.date))];
@@ -2034,16 +2155,19 @@ function DailyAcceptanceView({ p, patch }: { p: Project; patch: (x: Partial<Proj
   const records = entries.filter((entry) => entry.date === selectedDate);
   const dailyExportRecords = records.map(({ unit, acceptance }) => buildAcceptanceExportRecord(p, unit, acceptance, true));
   const exportDay = () => {
+    if (!canExportShipment) return;
     const workbook = createShipmentWorkbook(p, dailyExportRecords, selectedDate.slice(0, 7));
     saveShipmentWorkbook(workbook, `${selectedDate}_${p.name}_SPC已出貨明細總表.xlsx`);
   };
   const startDailyReportEdit = (record: AcceptanceExportRecord, index: number) => {
+    if (!canManageFinance) return;
     const entry = records[index];
     if (!entry || entry.unit.id !== record.unitId) return setReportMessage("找不到原正式驗收紀錄，未開啟修改");
     setReportDraft(reportSourceDraftFor(record, index, entry.unit, entry.acceptance));
     setReportMessage("");
   };
   const saveReportSource = () => {
+    if (!canManageFinance) return;
     if (!reportDraft) return;
     const currentUnit = p.units.find((unit) => unit.id === reportDraft.unitId);
     const currentAcceptance = currentUnit?.acceptances.find((acceptance) => acceptance.id === reportDraft.acceptanceId && acceptance.draft !== true);
@@ -2061,7 +2185,7 @@ function DailyAcceptanceView({ p, patch }: { p: Project; patch: (x: Partial<Proj
       <section className="panel">
         <div className="panel-head">
           <div><p className="eyebrow">案場正式驗收紀錄</p><h2>今日驗收</h2><p>依驗收／複驗紀錄本身的日期顯示，不含草稿。</p></div>
-          <button className="primary" disabled={!records.length || !!reportDraft} onClick={() => { setShipmentPreview(true); setReportMessage(""); }}>{reportDraft ? "請先保存或取消修改" : "當日總細表"}</button>
+          {canExportShipment && <button className="primary" disabled={!records.length || !!reportDraft} onClick={() => { if (!canExportShipment) return; setShipmentPreview(true); setReportMessage(""); }}>{reportDraft ? "請先保存或取消修改" : "當日總細表"}</button>}
         </div>
         <div className="daily-acceptance-summary">
           <label className="field"><span>日期</span><input type="date" value={selectedDate} onChange={(event) => reportDraft ? setReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換日期。") : setSelectedDate(event.target.value)} /></label>
@@ -2098,18 +2222,18 @@ function DailyAcceptanceView({ p, patch }: { p: Project; patch: (x: Partial<Proj
           ["檢查項目", selected.acceptance.items.map((item) => `${item.label}：${item.result || "未填"}`).join("；")],
         ]} />
         <PhotoGrid photos={selected.acceptance.photos || []} />
-        <div className="form-actions"><button type="button" className="primary" onClick={() => { setReportDraft(reportSourceDraftFor(buildAcceptanceExportRecord(p, selected.unit, selected.acceptance, true), records.findIndex((entry) => entry.acceptance.id === selected.acceptance.id), selected.unit, selected.acceptance)); setReportMessage(""); }}>修改報表資料</button></div></> : <div className="form">
+        {canManageFinance && <div className="form-actions"><button type="button" className="primary" onClick={() => { if (!canManageFinance) return; setReportDraft(reportSourceDraftFor(buildAcceptanceExportRecord(p, selected.unit, selected.acceptance, true), records.findIndex((entry) => entry.acceptance.id === selected.acceptance.id), selected.unit, selected.acceptance)); setReportMessage(""); }}>修改報表資料</button></div>}</> : <div className="form">
           <div className="warning">確認保存後會更新此戶別及同一筆正式驗收的報表來源資料；不會重新完成驗收或改變工程狀態。</div>
           <ReportMetadataEditor draft={reportDraft} setDraft={setReportDraft} />
           {reportMessage && <div className="form-error">{reportMessage}</div>}
           <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div>
         </div>}
       </Modal>}
-      {shipmentPreview && <Modal close={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }} title="當日總細表｜匯出預覽">
-        <div className="form export-preview">
+      {canExportShipment && shipmentPreview && <Modal close={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }} title="當日總細表｜匯出預覽">
+        <div className={`form export-preview shipment-export-preview ${canManageFinance ? "" : "finance-readonly"}`}>
           <div className="export-summary"><span>日期<b>{selectedDate}</b></span><span>案場<b>{p.name}</b></span><span>正式驗收筆數<b>{dailyExportRecords.length}</b></span></div>
           <div className="export-preview-table"><table><thead><tr><th>操作</th><th>出貨日期</th><th>序號</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th><th>簽單正</th><th>簽單影</th><th>進VO正</th><th>進VO影</th><th>銷VO正</th><th>銷VO影</th><th>送單</th><th>廠商帳單</th><th>級距</th><th>應付</th><th>利潤%</th><th>利潤</th></tr></thead><tbody>{dailyExportRecords.map((record, index) => { const display = shipmentDisplayValues(record, index); return <tr key={`${record.unitId}-${index}`}><td><button type="button" className="primary" disabled={!!reportDraft} onClick={() => startDailyReportEdit(record, index)}>修改</button></td><td>{display.shipmentDateText}</td><td>{display.sequenceText}</td><td>{display.customerNameText}</td><td>{display.productText}</td><td>{display.unitDisplayText}</td><td>{display.squareMetersText}</td><td>{display.pingText}</td><td>{display.unitPriceText}</td><td>{display.amountText}</td><td>{display.vendorText}</td><td>{display.purchasePriceText}</td><td>{display.noteText}</td><td>{display.signedOriginal ? "✓" : ""}</td><td>{display.signedCopy ? "✓" : ""}</td><td>{display.incomingVoOriginal}</td><td>{display.incomingVoCopy}</td><td>{display.outgoingVoOriginal}</td><td>{display.outgoingVoCopy}</td><td>{display.submitted}</td><td>{display.vendorInvoice}</td><td>{display.tier}</td><td>{display.payable}</td><td>{display.profitPercent}</td><td>{display.profit}</td></tr>; })}</tbody></table></div>
-          {reportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；請先保存或取消後再產生 Excel。</div><ReportMetadataEditor draft={reportDraft} setDraft={setReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div></section>}
+          {canManageFinance && reportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；請先保存或取消後再產生 Excel。</div><ReportMetadataEditor draft={reportDraft} setDraft={setReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div></section>}
           {reportMessage && <div className={reportMessage.startsWith("✓") ? "save-success" : "form-error"}>{reportMessage}</div>}
           <div className="form-actions"><button type="button" className="ghost" onClick={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }}>返回</button><button type="button" className="primary" disabled={shipmentExporting || !dailyExportRecords.length || !!reportDraft} onClick={async () => { setShipmentExporting(true); try { exportDay(); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : reportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
         </div>
@@ -2120,9 +2244,11 @@ function DailyAcceptanceView({ p, patch }: { p: Project; patch: (x: Partial<Proj
 function Dashboard({
   p,
   setView,
+  permissions,
 }: {
   p: Project;
   setView: (x: string) => void;
+  permissions: RolePermissions;
 }) {
   const authUserId = useAuthOwner();
   const overdueIds = new Set(
@@ -2135,6 +2261,12 @@ function Dashboard({
         .map((u) => u.id),
     );
   const go = (target: string) => {
+    const allowed = target === "__survey" ? permissions.useSurvey
+      : target === "__work" ? permissions.useWork
+      : target === "__accept" ? permissions.useAcceptance
+      : target === "__fix" || target === "__overdue" ? permissions.useDefects
+      : true;
+    if (!allowed) return;
     sessionStorage.setItem(scopedKey("spc-dashboard-unit-filter", authUserId), target);
     setView("units");
   };
@@ -2172,9 +2304,9 @@ function Dashboard({
             <div className="progress-donut" style={{ background: donut }}><span><b>{percent}%</b><small>完成</small></span></div>
           </div>
           <div className="progress-options">
-            <DashStage icon="♙" label="待場勘" count={groups.survey.length} tone="brown" active={false} click={() => go("__survey")} />
-            <DashStage icon="⌘" label="施工中" count={groups.work.length} tone="amber" active={false} click={() => go("__work")} />
-            <DashStage icon="▣" label="待驗收" count={groups.accept.length} tone="blue" active={false} click={() => go("__accept")} />
+            {permissions.useSurvey && <DashStage icon="♙" label="待場勘" count={groups.survey.length} tone="brown" active={false} click={() => go("__survey")} />}
+            {permissions.useWork && <DashStage icon="⌘" label="施工中" count={groups.work.length} tone="amber" active={false} click={() => go("__work")} />}
+            {permissions.useAcceptance && <DashStage icon="▣" label="待驗收" count={groups.accept.length} tone="blue" active={false} click={() => go("__accept")} />}
             <DashStage icon="✓" label="已完成" count={groups.done.length} tone="green" active={false} click={() => go("__done")} />
           </div>
         </div>
@@ -2182,8 +2314,8 @@ function Dashboard({
       <section className="dash-card alert-card">
         <div className="dash-card-head"><div><h2>異常提醒</h2><small>點擊直接查看問題戶別</small></div></div>
         <div className="alert-options">
-          <DashAlert icon="!" label="待改善" count={tasks.fix.length} tone="amber" active={false} click={() => go("__fix")} />
-          <DashAlert icon="◷" label="逾期戶" count={tasks.overdue.length} tone="red" active={false} click={() => go("__overdue")} />
+          {permissions.useDefects && <DashAlert icon="!" label="待改善" count={tasks.fix.length} tone="amber" active={false} click={() => go("__fix")} />}
+          {permissions.useDefects && <DashAlert icon="◷" label="逾期戶" count={tasks.overdue.length} tone="red" active={false} click={() => go("__overdue")} />}
         </div>
       </section>
       <section className="dash-card task-card dashboard-project-data">
@@ -2286,11 +2418,17 @@ function Units({
   patch,
   open,
   openFloor,
+  canEditExisting,
+  canCreate,
+  canAccept,
 }: {
   p: Project;
   patch: (x: Partial<Project>) => void;
   open: (x: string) => void;
   openFloor: (building: string, floor: string) => void;
+  canEditExisting: boolean;
+  canCreate: boolean;
+  canAccept: boolean;
 }) {
   const authUserId = useAuthOwner();
   const empty = {
@@ -2327,19 +2465,21 @@ function Units({
     [creating, setCreating] = useState(false),
     [creationDraftReady, setCreationDraftReady] = useState(() => !!readLocal(draftKey(authUserId, "unit-create", p.id)));
   useEffect(() => {
+    if (!canCreate) return;
     if (!creationDraftReady) return;
     const hasContent = Object.values(draft).some(Boolean) || rows.some((row) => Object.values(row).some(Boolean));
     const storageKey = draftKey(authUserId, "unit-create", p.id);
     if (hasContent) writeLocalDraft(storageKey, { id: `unit-create-${p.id}`, draft, rows, batch }, authUserId);
-  }, [draft, rows, batch, p.id, creationDraftReady]);
+  }, [draft, rows, batch, p.id, creationDraftReady, canCreate]);
   useEffect(() => {
+    if (!canCreate) return;
     const storageKey = draftKey(authUserId, "unit-create", p.id);
     if (readLocal(storageKey)) { setCreationDraftReady(true); return; }
     void loadOfflineDraft<{ draft: typeof empty; rows: typeof rows; batch: boolean }>(storageKey).then((saved) => {
       if (saved) { setDraft(saved.payload.draft); setRows(saved.payload.rows); setBatch(saved.payload.batch); }
       setCreationDraftReady(true);
     }).catch(() => setCreationDraftReady(true));
-  }, [p.id]);
+  }, [p.id, canCreate]);
   useEffect(() => {
     if (status.startsWith("__"))
       setTimeout(
@@ -2414,6 +2554,7 @@ function Units({
     });
   }, [buildingNames.join("|")]);
   const create = () => {
+    if (!canCreate) return;
     const product = p.products.find(
       (x) => x.model === draft.model && x.colorNo === draft.colorNo,
     );
@@ -2454,6 +2595,7 @@ function Units({
       ),
     );
   const createBatch = () => {
+    if (!canCreate) return;
     const bad: string[] = [],
       add: Unit[] = [];
     rows.forEach((r, i) => {
@@ -2498,7 +2640,7 @@ function Units({
   };
   return (
     <div className="form">
-      {creating ? (
+      {creating && canCreate ? (
         <section className="panel form unit-create">
           <div className="panel-head">
             <div>
@@ -2702,13 +2844,13 @@ function Units({
               >
                 ＋ 新增下一戶
               </button>
-              <button
+              {canCreate && <button
                 className="primary"
                 disabled={!rows.length || !p.products.length}
                 onClick={createBatch}
               >
                 檢查並批量建立 {rows.length} 戶
-              </button>
+              </button>}
             </div>
           )}
           {error && <div className="form-error">{error}</div>}
@@ -2721,7 +2863,7 @@ function Units({
               <p>依棟別與樓層快速瀏覽戶別進度。</p>
             </div>
             <div className="actions">
-              <button
+              {canCreate && <button
                 className="primary"
                 onClick={() => {
                   setCreating(true);
@@ -2730,7 +2872,7 @@ function Units({
                 }}
               >
                 ＋ 新增戶別
-              </button>
+              </button>}
             </div>
           </div>
           <div className="unit-search-row">
@@ -2882,12 +3024,12 @@ function Units({
                               {isOpen ? "⌃" : "›"}
                             </span>
                           </button>
-                          <button className="floor-acceptance-entry" type="button" onClick={() => openFloor(
+                          {canAccept && <button className="floor-acceptance-entry" type="button" onClick={() => openFloor(
                             floorUnits[0]?.building || (building === "未分類棟" ? "" : building),
                             floorUnits[0]?.floor || (floor === "未分類樓層" ? "" : floor),
                           )}>
                             <b>驗收</b>
-                          </button>
+                          </button>}
                         </div>
                         {isOpen && (
                           <div className="unit-cards">
@@ -4039,6 +4181,7 @@ function UnitDetail({
   project,
   unit,
   role,
+  permissions,
   activity,
   patch,
   addEvent,
@@ -4051,6 +4194,7 @@ function UnitDetail({
   project: Project;
   unit: Unit;
   role: AppRole;
+  permissions: RolePermissions;
   activity?: EntityActivity;
   patch: (x: Partial<Unit>) => void;
   addEvent: (a: string, b: string, p?: Photo[]) => void;
@@ -4060,13 +4204,16 @@ function UnitDetail({
   openUnit: (unitId: string) => void;
   remove: () => void;
 }) {
+  const canEditExisting = canEditUnitMaster(role, permissions);
+  const canDelete = canDeleteUnit(role);
+  const canConfirm = canConfirmUnit(role);
   const [tab, setTab] = useState(floorContext?.tab || "master");
   const navigationUnits = floorContext ? floorUnits : buildingNavigationUnits(liveEntities(project.units), unit.building || "");
   const currentNavigationIndex = navigationUnits.findIndex((item) => item.id === unit.id);
   useEffect(() => { if (floorContext?.tab) setTab(floorContext.tab); }, [unit.id, floorContext?.tab]);
   useEffect(() => {
-    if (!canUseUnitTab(role, tab)) setTab("master");
-  }, [role, tab]);
+    if (!canUseUnitTab(role, permissions, tab)) setTab("master");
+  }, [role, permissions, tab]);
   return (
     <>
       <button className="back" onClick={back}>
@@ -4097,11 +4244,11 @@ function UnitDetail({
           <Pill s={unit.status} />
         </div>
       </div>
-      <Next unit={unit} setTab={setTab} />
+      <Next unit={unit} setTab={setTab} role={role} permissions={permissions} />
       <div id="unit-action-area" style={{ scrollMarginTop: 80 }}>
         <Tabs
           value={tab}
-          set={setTab}
+          set={(next) => { if (canUseUnitTab(role, permissions, next)) setTab(next); }}
           items={[
             ["master", "戶別主資料"],
             ["survey", "場勘"],
@@ -4111,35 +4258,38 @@ function UnitDetail({
             ["defect", "缺失改善"],
             ["timeline", "Timeline"],
             ["sheet", "電子驗收單"],
-          ].filter(([value]) => canUseUnitTab(role, value))}
+          ].filter(([value]) => canUseUnitTab(role, permissions, value))}
         />
         {tab === "master" && (
           <Master
             p={project}
             u={unit}
             role={role}
-            patch={patch}
-            remove={remove}
+            canEditExisting={canEditExisting}
+            canDelete={canDelete}
+            canConfirm={canConfirm}
+            patch={(value) => { if (canEditExisting) patch(value); }}
+            remove={() => { if (canDelete) remove(); }}
           />
         )}{" "}
-        {tab === "survey" && (
+        {tab === "survey" && canUseUnitTab(role, permissions, "survey") && (
           <SurveyTab key={unit.id} project={project} u={unit} patch={patch} add={addEvent} />
         )}{" "}
-        {tab === "work" && <WorkTab key={unit.id} u={unit} patch={patch} add={addEvent} />}{" "}
-        {tab === "accept" && (
+        {tab === "work" && canUseUnitTab(role, permissions, "work") && <WorkTab key={unit.id} u={unit} patch={patch} add={addEvent} />}{" "}
+        {tab === "accept" && canUseUnitTab(role, permissions, "accept") && (
           <AcceptTab key={unit.id} project={project} u={unit} patch={patch} add={addEvent} />
         )}{" "}
-        {tab === "journal" && <UnitJournalTab project={project} u={unit} patch={patch} />}{" "}
-        {tab === "defect" && (
+        {tab === "journal" && canUseUnitTab(role, permissions, "journal") && <UnitJournalTab project={project} u={unit} patch={patch} />}{" "}
+        {tab === "defect" && canUseUnitTab(role, permissions, "defect") && (
           <DefectsTab u={unit} patch={patch} add={addEvent} />
         )}{" "}
         {tab === "timeline" && <Timeline u={unit} />}{" "}
-        {tab === "sheet" && <Sheet project={project} u={unit} />}
+        {tab === "sheet" && canUseUnitTab(role, permissions, "sheet") && <Sheet project={project} u={unit} />}
       </div>
     </>
   );
 }
-function Next({ unit, setTab }: { unit: Unit; setTab: (x: string) => void }) {
+function Next({ unit, setTab, role, permissions }: { unit: Unit; setTab: (x: string) => void; role: AppRole; permissions: RolePermissions }) {
   const map: Record<string, [string, string, string]> = {
     待確認: [
       "確認戶別資料",
@@ -4158,6 +4308,8 @@ function Next({ unit, setTab }: { unit: Unit; setTab: (x: string) => void }) {
     已計價: ["查看完整工程歷程", "此戶已完成計價，可查詢所有紀錄", "timeline"],
   };
   const [x, , t] = map[unit.status];
+  if (unit.status === "待確認" && !canConfirmUnit(role)) return null;
+  if (!canUseUnitTab(role, permissions, t)) return null;
   return (
     <div className="next-card">
       <div>
@@ -4165,6 +4317,7 @@ function Next({ unit, setTab }: { unit: Unit; setTab: (x: string) => void }) {
       </div>
       <button
         onClick={() => {
+          if (!canUseUnitTab(role, permissions, t)) return;
           setTab(t);
           setTimeout(
             () =>
@@ -4184,17 +4337,23 @@ function Master({
   p,
   u,
   role,
+  canEditExisting,
+  canDelete,
+  canConfirm,
   patch,
   remove,
 }: {
   p: Project;
   u: Unit;
   role: AppRole;
+  canEditExisting: boolean;
+  canDelete: boolean;
+  canConfirm: boolean;
   patch: (x: Partial<Unit>) => void;
   remove: () => void;
 }) {
   const isCrew = role === "crew";
-  const canManage = canManageProjectData(role);
+  const showCustomerDetails = !isCrew && canViewCustomerDetails(role);
   const [estimatedUnit, setEstimatedUnit] = useState<AreaUnit>("坪");
   const [unitDetailsOpen, setUnitDetailsOpen] = useState(false);
   useEffect(() => {
@@ -4210,6 +4369,7 @@ function Master({
       ),
     ];
   const choose = (model: string, colorNo: string) => {
+    if (!canEditExisting) return;
     const product = p.products.find(
       (x) => x.model === model && x.colorNo === colorNo,
     );
@@ -4221,7 +4381,7 @@ function Master({
   };
   return (
     <div className="panel form unit-master-panel">
-      {!isCrew && <section className="customer-section unit-master-customer">
+      {showCustomerDetails && <section className="customer-section unit-master-customer">
         <div className="panel-head">
           <div>
             <p className="eyebrow">選填資料</p>
@@ -4230,30 +4390,30 @@ function Master({
           </div>
         </div>
         <div className="grid3 customer-contact-grid">
-          <Field label="客戶姓名" value={u.owner} set={(owner: string) => patch({ owner })} />
-          <Field label="聯絡電話" value={u.phone} set={(phone: string) => patch({ phone })} />
-          <Field label="LINE ID" value={u.lineId} set={(lineId: string) => patch({ lineId })} />
-          <Field label="Email" type="email" value={u.email} set={(email: string) => patch({ email })} />
+          <Field label="客戶姓名" value={u.owner} disabled={!canEditExisting} set={(owner: string) => patch({ owner })} />
+          <Field label="聯絡電話" value={u.phone} disabled={!canEditExisting} set={(phone: string) => patch({ phone })} />
+          <Field label="LINE ID" value={u.lineId} disabled={!canEditExisting} set={(lineId: string) => patch({ lineId })} />
+          <Field label="Email" type="email" value={u.email} disabled={!canEditExisting} set={(email: string) => patch({ email })} />
           <label className="field">
             <span>身分類型</span>
-            <select value={u.customerRole} onChange={(e) => patch({ customerRole: e.target.value })}>
+            <select disabled={!canEditExisting} value={u.customerRole} onChange={(e) => patch({ customerRole: e.target.value })}>
               <option value="">未選擇</option>
               <option>屋主</option><option>家人</option><option>設計師</option><option>其他</option>
             </select>
           </label>
           <label className="field">
             <span>偏好聯絡方式</span>
-            <select value={u.contactPreference} onChange={(e) => patch({ contactPreference: e.target.value })}>
+            <select disabled={!canEditExisting} value={u.contactPreference} onChange={(e) => patch({ contactPreference: e.target.value })}>
               <option value="">未選擇</option>
               <option>電話</option><option>LINE</option><option>Email</option>
             </select>
           </label>
-          <div className="customer-contact-wide"><Field label="客戶需求／備註" value={u.customerNeed} set={(customerNeed: string) => patch({ customerNeed })} /></div>
-          <div className="customer-contact-source"><Field label="資料來源" value={u.customerSource} set={(customerSource: string) => patch({ customerSource })} /></div>
+          <div className="customer-contact-wide"><Field label="客戶需求／備註" value={u.customerNeed} disabled={!canEditExisting} set={(customerNeed: string) => patch({ customerNeed })} /></div>
+          <div className="customer-contact-source"><Field label="資料來源" value={u.customerSource} disabled={!canEditExisting} set={(customerSource: string) => patch({ customerSource })} /></div>
         </div>
         <label className="consent-check">
           <input
-            type="checkbox"
+            type="checkbox" disabled={!canEditExisting}
             checked={u.marketingConsent}
             onChange={(e) => patch({ marketingConsent: e.target.checked, consentAt: e.target.checked ? stamp() : "" })}
           />
@@ -4282,7 +4442,7 @@ function Master({
             <h2>戶別主資料</h2>
             <p>後續場勘、施工、驗收均直接沿用。</p>
           </div>
-          {canManage && <button
+          {canDelete && <button
             className="danger"
             onClick={() => confirm("確定刪除此戶及全部工程紀錄？") && remove()}
           >
@@ -4300,24 +4460,24 @@ function Master({
         <Field
           label="棟別"
           value={u.building}
-          disabled={isCrew}
+          disabled={!canEditExisting}
           set={(building: string) => patch({ building })}
         />
         <Field
           label="樓層"
           value={u.floor}
-          disabled={isCrew}
+          disabled={!canEditExisting}
           set={(floor: string) => patch({ floor })}
         />
         <Field
           label="戶別"
           value={u.number}
-          disabled={isCrew}
+          disabled={!canEditExisting}
           set={(number: string) => patch({ number })}
         />
         <label className="field">
           <span>SPC 編號</span>
-          <select disabled={isCrew} value={u.model} onChange={(e) => choose(e.target.value, "")}>
+          <select disabled={!canEditExisting} value={u.model} onChange={(e) => choose(e.target.value, "")}>
             <option value="">請選擇產品編號</option>
             {models.map((x) => (
               <option key={x}>{x}</option>
@@ -4327,7 +4487,7 @@ function Master({
         <label className="field">
           <span>色號</span>
           <select
-            disabled={isCrew || !u.model}
+          disabled={!canEditExisting || !u.model}
             value={u.colorNo}
             onChange={(e) => choose(u.model, e.target.value)}
           >
@@ -4347,10 +4507,10 @@ function Master({
               min="0"
               step="0.01"
               value={areaValueFromPing(u.estimated, estimatedUnit)}
-              disabled={isCrew}
+              disabled={!canEditExisting}
               onChange={(event) => patch({ estimated: areaInputToPing(event.target.value, estimatedUnit) })}
             />
-            <select disabled={isCrew} value={estimatedUnit} onChange={(event) => setEstimatedUnit(event.target.value as AreaUnit)}>
+            <select disabled={!canEditExisting} value={estimatedUnit} onChange={(event) => setEstimatedUnit(event.target.value as AreaUnit)}>
               <option value="坪">坪</option>
               <option value="m²">m²</option>
             </select>
@@ -4359,14 +4519,14 @@ function Master({
         <Field
           label="備註"
           value={u.note}
-          disabled={isCrew}
+          disabled={!canEditExisting}
           set={(note: string) => patch({ note })}
         />
         </div>
         <label>
         <input
           type="checkbox"
-          disabled={isCrew}
+          disabled={!canEditExisting}
           checked={u.custom}
           onChange={(e) => patch({ custom: e.target.checked })}
         />{" "}
@@ -4376,11 +4536,11 @@ function Master({
           <Field
             label="客變說明"
             value={u.customNote}
-            disabled={isCrew}
+            disabled={!canEditExisting}
             set={(customNote: string) => patch({ customNote })}
           />
         )}
-        {canManage && (u.status === "待確認" ? (
+        {canConfirm && (u.status === "待確認" ? (
         <button
           className="primary"
           disabled={
@@ -4391,7 +4551,8 @@ function Master({
             !u.model ||
             !u.colorNo
           }
-          onClick={() =>
+          onClick={() => {
+            if (!canConfirm) return;
             patch({
               status: "待場勘",
               events: [
@@ -4404,8 +4565,8 @@ function Master({
                 },
                 ...u.events,
               ],
-            })
-          }
+            });
+          }}
         >
           確認資料無誤 → 安排場勘
         </button>
@@ -5818,8 +5979,55 @@ function Journal({
 }
 type BillingUnitDraft = { rate: string; priced: boolean };
 
-function Billing({ p, patch }: { p: Project; patch: any }) {
+function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeAccess: ReturnType<typeof financeUiMode> }) {
   const authUserId = useAuthOwner();
+  const { canExportReceivables, canExportShipment, canManageFinance } = financeAccess;
+  const needsProtectedFinanceData = !canManageFinance && (canExportReceivables || canExportShipment);
+  const [protectedFinanceData, setProtectedFinanceData] = useState<FinanceExportData | null>(null);
+  const [protectedFinanceProject, setProtectedFinanceProject] = useState<FinanceExportProject | null>(null);
+  const [financeExportLoading, setFinanceExportLoading] = useState(false);
+  const [financeExportError, setFinanceExportError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    if (!needsProtectedFinanceData) {
+      setProtectedFinanceData(null);
+      setProtectedFinanceProject(null);
+      setFinanceExportLoading(false);
+      setFinanceExportError("");
+      return () => { active = false; };
+    }
+    setProtectedFinanceData(null);
+    setProtectedFinanceProject(null);
+    setFinanceExportLoading(true);
+    setFinanceExportError("");
+    loadFinanceExportData().then((data) => {
+      if (!active) return;
+      const project = data.projects.find((candidate) => candidate.id === p.id);
+      setProtectedFinanceData(data);
+      if (!project) {
+        setFinanceExportError("無法取得此案場的財務匯出資料，請重新整理或洽管理員。");
+        return;
+      }
+      setProtectedFinanceProject(project);
+      if ((canExportReceivables && !data.canExportReceivables)
+        || (canExportShipment && !data.canExportShipmentDetails)) {
+        setFinanceExportError("財務匯出權限已更新，請重新整理後再試。");
+      }
+    }).catch(() => {
+      if (!active) return;
+      setFinanceExportError("財務匯出資料讀取失敗，請稍後再試。");
+    }).finally(() => {
+      if (active) setFinanceExportLoading(false);
+    });
+    return () => { active = false; };
+  }, [needsProtectedFinanceData, p.id, canExportReceivables, canExportShipment]);
+
+  const financeExportProject = canManageFinance ? p : protectedFinanceProject;
+  const serverCanExportReceivables = canManageFinance || protectedFinanceData?.canExportReceivables === true;
+  const serverCanExportShipment = canManageFinance || protectedFinanceData?.canExportShipmentDetails === true;
+  const receivableExportReady = canExportReceivables && serverCanExportReceivables && !!financeExportProject && !financeExportLoading;
+  const shipmentExportReady = canExportShipment && serverCanExportShipment && !!financeExportProject && !financeExportLoading;
   const [y, setY] = useState(String(new Date().getFullYear())),
     [m, setM] = useState(String(new Date().getMonth() + 1).padStart(2, "0")),
     [receivablePreview, setReceivablePreview] = useState(false),
@@ -5834,11 +6042,11 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
     [shipmentReportDraft, setShipmentReportDraft] = useState<ReportSourceDraft | null>(null),
     [shipmentReportMessage, setShipmentReportMessage] = useState(""),
     ym = `${y}-${m}`,
-    monthlyBillingRecords = buildAcceptanceExportRecords(p).filter((record) => record.exportDate.startsWith(ym)),
+    monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter((record) => record.exportDate.startsWith(ym)) : [],
     monthlyUnitIds = new Set(monthlyBillingRecords.map((record) => record.unitId)),
     monthlyUnits = p.units.filter((unit) => monthlyUnitIds.has(unit.id)),
     billRecords = monthlyBillingRecords.filter((record) => {
-      const unit = p.units.find((item) => item.id === record.unitId);
+      const unit = financeExportProject?.units?.find((item) => item.id === record.unitId);
       return unit ? unit.status === "已驗收" || unit.status === "已計價" : false;
     }),
     billRows = billRecords.flatMap((record) => {
@@ -5866,6 +6074,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       safeDraftRate(draft.rate) !== Number(unit.rate || 0) || draft.priced !== (unit.status === "已計價"),
     ),
     startEditing = () => {
+      if (!canManageFinance) return;
       setBillingDrafts(Object.fromEntries(billRows.map(({ unit }) => [unit.id, {
         rate: String(unit.rate ?? ""),
         priced: unit.status === "已計價",
@@ -5885,6 +6094,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       setSaveConfirmation(true);
     },
     confirmSave = () => {
+      if (!canManageFinance) return;
       const changes = new Map(billingChanges.map((row) => [row.unit.id, row]));
       patch({
         units: p.units.map((unit) => {
@@ -5915,6 +6125,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       setEditing(false);
     },
     startShipmentReportEdit = (record: AcceptanceExportRecord, index: number) => {
+      if (!canManageFinance) return;
       if (editing) return setShipmentReportMessage("請先保存或取消目前的月結修改，再修改報表來源資料");
       const unit = p.units.find((candidate) => candidate.id === record.unitId);
       const acceptance = unit ? getLatestFinalAcceptance(unit) : undefined;
@@ -5923,6 +6134,7 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       setShipmentReportMessage("");
     },
     saveShipmentReportSource = () => {
+      if (!canManageFinance) return;
       if (!shipmentReportDraft) return;
       const currentUnit = p.units.find((unit) => unit.id === shipmentReportDraft.unitId);
       const currentAcceptance = currentUnit?.acceptances.find((acceptance) => acceptance.id === shipmentReportDraft.acceptanceId && acceptance.draft !== true);
@@ -5935,8 +6147,13 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       setShipmentReportMessage("✓ 正式報表來源資料已保存");
     },
     openReceivablePreview = () => {
-      setReceivableDraft(buildReceivableExportDraft(p, billRecords));
+      if (!receivableExportReady || !financeExportProject) return;
+      setReceivableDraft(buildReceivableExportDraft(financeExportProject, billRecords));
       setReceivablePreview(true);
+    },
+    openShipmentPreview = () => {
+      if (!shipmentExportReady || !financeExportProject) return;
+      setShipmentPreview(true); setShipmentReportDraft(null); setShipmentReportMessage("");
     },
     changeBillingPeriod = (kind: "year" | "month", value: string) => {
       if (editing && billingChanges.length) {
@@ -5951,13 +6168,13 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
       <div className="panel-head">
         <div>
           <h2>月結／計價總表</h2>
-          <p>已驗收戶別自動進入，可人工確認單價與金額。</p>
+          <p>{canManageFinance ? "已驗收戶別自動進入，可人工確認單價與金額。" : "依目前月份匯出已授權的報表。"}</p>
         </div>
         <div className="form-actions billing-no-print">
-          {!editing ? <button type="button" className="primary" onClick={startEditing}>編輯月結</button> : <>
+          {canManageFinance && (!editing ? <button type="button" className="primary" onClick={startEditing}>編輯月結</button> : <>
             <button type="button" className="ghost" onClick={cancelEditing}>取消修改</button>
             <button type="button" className="primary" onClick={requestSave}>保存修改</button>
-          </>}
+          </>)}
         </div>
       </div>
       <div className="filters billing-no-print">
@@ -5973,18 +6190,20 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
           ))}
         </select>
       </div>
-      {billingMessage && <div className="warning billing-no-print">{billingMessage}</div>}
-      {editing && billingChanges.length > 0 && <div className="warning billing-no-print">目前有尚未保存的月結修改；匯出內容仍以已保存資料為準。</div>}
-      <div className="billing-print-month">計價月份：{ym}</div>
+      {canManageFinance && billingMessage && <div className="warning billing-no-print">{billingMessage}</div>}
+      {!canManageFinance && financeExportLoading && <div className="muted billing-no-print">正在讀取財務匯出資料…</div>}
+      {!canManageFinance && financeExportError && <div className="form-error billing-no-print">{financeExportError}</div>}
+      {canManageFinance && editing && billingChanges.length > 0 && <div className="warning billing-no-print">目前有尚未保存的月結修改；匯出內容仍以已保存資料為準。</div>}
+      {canManageFinance && <div className="billing-print-month">計價月份：{ym}</div>}
       <section className="acceptance-exports billing-no-print">
         <div className="checklist-head"><div><h3>報表／匯出</h3><small>依目前月份與案場資料預覽、下載或列印報表。</small></div></div>
         <div className="export-cards">
-          <button type="button" disabled={!billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>
-          <button type="button" onClick={printBilling}><i>PDF</i><span><b>PDF／列印</b><small>列印目前月結頁面</small></span><em>列印 ›</em></button>
-          <button type="button" onClick={() => { setShipmentPreview(true); setShipmentReportDraft(null); setShipmentReportMessage(""); }}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>
+          {canExportReceivables && <button type="button" disabled={!receivableExportReady || !billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>}
+          {canManageFinance && <button type="button" onClick={printBilling}><i>PDF</i><span><b>PDF／列印</b><small>列印目前月結頁面</small></span><em>列印 ›</em></button>}
+          {canExportShipment && <button type="button" disabled={!shipmentExportReady} onClick={openShipmentPreview}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>}
         </div>
       </section>
-      <div className="summary">
+      {canManageFinance && <><div className="summary">
         <span>
           施工戶數
           <b>
@@ -6064,15 +6283,15 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
             ))}
           </tbody>
         </table>
-      </div>
-      {saveConfirmation && <Modal close={() => setSaveConfirmation(false)} title="確認保存月結修改">
+      </div></>}
+      {canManageFinance && saveConfirmation && <Modal close={() => setSaveConfirmation(false)} title="確認保存月結修改">
         <div className="form">
           <div className="export-summary"><span>案場名稱<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>修改戶別數<b>{billingChanges.length}</b></span><span>保存後總額<b>NT$ {previewSubtotal.toLocaleString()}</b></span></div>
           <div className="table-wrap"><table><thead><tr><th>戶別</th><th>單價變更</th><th>狀態變更</th></tr></thead><tbody>{billingChanges.map(({ unit, draft }) => <tr key={unit.id}><td>{unit.building} {unit.floor} {unit.number}</td><td>{safeDraftRate(draft.rate) !== Number(unit.rate || 0) ? `${Number(unit.rate || 0).toLocaleString()} → ${safeDraftRate(draft.rate).toLocaleString()}` : "—"}</td><td>{draft.priced !== (unit.status === "已計價") ? `${unit.status} → ${draft.priced ? "已計價" : "已驗收"}` : "—"}</td></tr>)}</tbody></table></div>
           <div className="form-actions"><button type="button" className="ghost" onClick={() => setSaveConfirmation(false)}>返回修改</button><button type="button" className="primary" onClick={confirmSave}>確認保存</button></div>
         </div>
       </Modal>}
-      {receivablePreview && receivableDraft && <Modal close={() => { setReceivablePreview(false); setReceivableDraft(null); }} title="應收帳款 Excel｜匯出預覽">
+      {canExportReceivables && receivablePreview && receivableDraft && <Modal close={() => { setReceivablePreview(false); setReceivableDraft(null); }} title="應收帳款 Excel｜匯出預覽">
         <div className="form export-preview">
           <div className="export-summary"><span>案場<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>實際戶別筆數<b>{billRecords.length}</b></span><span>資料來源<b>目前月結戶別</b></span></div>
           <section className="panel form">
@@ -6121,19 +6340,19 @@ function Billing({ p, patch }: { p: Project; patch: any }) {
             ["傳真", companyReportConfig.fax],
             ["地址", companyReportConfig.address],
           ]} />
-          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReceivablePreview(false); setReceivableDraft(null); }}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !billRecords.length} onClick={async () => { setReceivableExporting(true); try { const workbook = createReceivableWorkbook(p, billRecords, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${p.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReceivablePreview(false); setReceivableDraft(null); }}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !billRecords.length || !receivableExportReady} onClick={async () => { if (!receivableExportReady || !financeExportProject) return; setReceivableExporting(true); try { const workbook = createReceivableWorkbook(financeExportProject, billRecords, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${financeExportProject.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
-      {shipmentPreview && <Modal close={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }} title="SPC 已出貨明細總表｜匯出預覽">
-        <div className="form export-preview">
+      {canExportShipment && shipmentPreview && <Modal close={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }} title="SPC 已出貨明細總表｜匯出預覽">
+        <div className={`form export-preview shipment-export-preview ${canManageFinance ? "" : "finance-readonly"}`}>
           <Field label="匯出月份" type="month" value={ym} set={(value) => { if (shipmentReportDraft) return setShipmentReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換月份。"); const [year, month] = value.split("-"); if (year && month) { if (editing && billingChanges.length) setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。"); else { if (editing) cancelEditing(); setY(year); setM(month); } } }} />
           <div className="export-summary"><span>案場<b>{p.name}</b></span><span>戶別筆數<b>{shipmentRecords.length}</b></span><span>總坪數<b>{shipmentRecords.reduce((sum, record) => sum + record.areaPing, 0).toFixed(2)}</b></span><span>總 m²<b>{shipmentRecords.reduce((sum, record) => sum + record.areaSquareMeters, 0).toFixed(2)}</b></span></div>
           {shipmentRecords.some((record) => record.areaPing <= 0) && <div className="warning">部分戶別坪數仍待補；檔案會清楚標記，不會自行填入未知數字。</div>}
           <div className="export-preview-table"><table><thead><tr><th>操作</th><th>出貨日期</th><th>序號</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th><th>簽單正</th><th>簽單影</th><th>進VO正</th><th>進VO影</th><th>銷VO正</th><th>銷VO影</th><th>送單</th><th>廠商帳單</th><th>級距</th><th>應付</th><th>利潤%</th><th>利潤</th></tr></thead><tbody>{shipmentRecords.map((record, index) => { const display = shipmentDisplayValues(record, index); return <tr key={record.unitId}><td><button type="button" className="primary" disabled={!!shipmentReportDraft} onClick={() => startShipmentReportEdit(record, index)}>修改</button></td><td>{display.shipmentDateText}</td><td>{display.sequenceText}</td><td>{display.customerNameText}</td><td>{display.productText}</td><td>{display.unitDisplayText}</td><td>{display.squareMetersText}</td><td>{display.pingText}</td><td>{display.unitPriceText}</td><td>{display.amountText}</td><td>{display.vendorText}</td><td>{display.purchasePriceText}</td><td>{display.noteText}</td><td>{display.signedOriginal ? "✓" : ""}</td><td>{display.signedCopy ? "✓" : ""}</td><td>{display.incomingVoOriginal}</td><td>{display.incomingVoCopy}</td><td>{display.outgoingVoOriginal}</td><td>{display.outgoingVoCopy}</td><td>{display.submitted}</td><td>{display.vendorInvoice}</td><td>{display.tier}</td><td>{display.payable}</td><td>{display.profitPercent}</td><td>{display.profit}</td></tr>; })}</tbody></table></div>
           {!shipmentRecords.length && <div className="form-error">目前沒有符合條件的施工或驗收資料。</div>}
-          {shipmentReportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；Excel 仍只會使用正式資料。確認保存後會更新同一戶別及同一筆正式驗收。</div><ReportMetadataEditor draft={shipmentReportDraft} setDraft={setShipmentReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setShipmentReportDraft(null); setShipmentReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveShipmentReportSource}>確認保存正式來源</button></div></section>}
+          {canManageFinance && shipmentReportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；Excel 仍只會使用正式資料。確認保存後會更新同一戶別及同一筆正式驗收。</div><ReportMetadataEditor draft={shipmentReportDraft} setDraft={setShipmentReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setShipmentReportDraft(null); setShipmentReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveShipmentReportSource}>確認保存正式來源</button></div></section>}
           {shipmentReportMessage && <div className={shipmentReportMessage.startsWith("✓") ? "save-success" : "form-error"}>{shipmentReportMessage}</div>}
-          <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length || !!shipmentReportDraft} onClick={async () => { setShipmentExporting(true); try { const workbook = createShipmentWorkbook(p, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${p.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
+          <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length || !!shipmentReportDraft || !shipmentExportReady} onClick={async () => { if (!shipmentExportReady || !financeExportProject) return; setShipmentExporting(true); try { const workbook = createShipmentWorkbook(financeExportProject, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${financeExportProject.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
     </div>
