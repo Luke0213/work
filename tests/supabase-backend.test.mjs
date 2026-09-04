@@ -1804,7 +1804,7 @@ test("temporary admin-only project isolation is fail-closed across reads, financ
   assert.match(workspaceLoad, /const legacy = appRole === "admin" && !snapshot\.projects\.length \? await loadLegacyWorkspace\(\) : null/);
   assert.equal((workspaceLoad.match(/const localProjects = normalize\(JSON\.parse\(readLocal/g) || []).length, 2);
   assert.equal((workspaceLoad.match(/hiddenProjectDraftRef\.current = appRole === "admin" \? \[\] : structuredClone\(normalize\(\(durableDraft\?\.projects\?\.length \? durableDraft\.projects : localProjects\) as Project\[\]\)\)/g) || []).length, 2);
-  assert.match(workspaceLoad, /const loadedProjects = appRole === "admin" \? normalize\([\s\S]*durableDraft\.projects[\s\S]*legacy\?\.projects[\s\S]*localProjects[\s\S]*\) : \[\]/);
+  assert.match(workspaceLoad, /const loadedProjects = normalize\(appRole === "admin"[\s\S]*durableDraft\.projects[\s\S]*legacy\?\.projects[\s\S]*localProjects[\s\S]*: snapshot\.projects as Project\[\]\)/);
   assert.match(workspaceLoad, /if \(appRole === "admin" && !snapshot\.projects\.length && loadedProjects\.length/);
   assert.match(workspaceLoad, /const recoveredProjects = appRole === "admin" \? normalize\([\s\S]*\) : \[\]/);
   assert.match(workspaceLoad, /const visibleProjects = appRole === "admin" \? recoveredProjects : \[\];\s*setProjects\(visibleProjects\)/);
@@ -1815,4 +1815,128 @@ test("temporary admin-only project isolation is fail-closed across reads, financ
 
   assert.doesNotMatch(page, /localStorage\.clear\(\)|indexedDB\.deleteDatabase\(/);
   assert.doesNotMatch(migration, /\b(?:drop|delete|truncate|alter)\b|\bstorage\.|photo|bucket/i);
+});
+
+test("project ownership migration creates server-owned projects without mutating existing data", async () => {
+  const sql = await read("supabase/migrations/202609040005_project_ownership.sql");
+  const prior = await read("supabase/migrations/202609040004_admin_only_project_visibility.sql");
+  const createStart = sql.indexOf("create or replace function public.spc_create_project");
+  const filterStart = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace");
+  const create = sql.slice(createStart, filterStart);
+
+  assert.ok(createStart >= 0 && filterStart > createStart);
+  assert.match(create, /spc_create_project\(p_project jsonb\)/);
+  assert.match(create, /auth\.uid\(\) is null[\s\S]*approved_role not in \('admin', 'shenyin', 'crew', 'client', 'sales'\)[\s\S]*SPC_ACCESS_REQUIRED/);
+  assert.match(create, /jsonb_typeof\(p_project\) is distinct from 'object'[\s\S]*SPC_PROJECT_INVALID/);
+  assert.match(create, /project_id := btrim\(coalesce\(p_project->>'id', ''\)\)[\s\S]*SPC_PROJECT_ID_REQUIRED/);
+  assert.match(create, /where existing_project\.value->>'id' = project_id[\s\S]*SPC_PROJECT_ID_EXISTS/);
+  assert.match(create, /created_project := \(p_project - 'ownerUserId'\) \|\| jsonb_build_object\('ownerUserId', owner_id\)/);
+  assert.match(create, /perform 1 from public\.spc_workspaces where id = 'main' for update/);
+  assert.match(create, /current_projects \|\| jsonb_build_array\(created_project\)/);
+  assert.match(create, /current_snapshot->'catalog'/);
+  assert.doesNotMatch(create, /p_catalog|spc_json_merge_three_way|spc_merge_permissioned_projects/);
+  assert.match(create, /return jsonb_build_object\('version', new_version, 'project', created_project\)/);
+  assert.match(sql, /grant execute on function public\.spc_create_project\(jsonb\) to authenticated/);
+  assert.match(prior, /if approved_role <> 'admin' then[\s\S]*'projects', '\[\]'::jsonb/);
+  assert.doesNotMatch(sql, /\b(?:drop|delete|truncate|alter)\b|\bupdate\s+(?:public\.|spc_)|\bstorage\.|bucket|photo/i);
+});
+
+test("owned workspace reads hide legacy and foreign projects before applying role permissions", async () => {
+  const sql = await read("supabase/migrations/202609040005_project_ownership.sql");
+  const filterStart = sql.indexOf("create or replace function public.spc_filter_permissioned_workspace");
+  const financeStart = sql.indexOf("create or replace function public.spc_load_finance_export_data");
+  const filter = sql.slice(filterStart, financeStart);
+
+  assert.match(filter, /if approved_role = 'admin' then\s*return p_snapshot/);
+  assert.match(filter, /auth\.uid\(\) is null[\s\S]*approved_role not in \('shenyin', 'crew', 'client', 'sales'\)[\s\S]*SPC_ACCESS_REQUIRED/);
+  assert.match(filter, /if approved_role = 'shenyin' then[\s\S]*where value->>'ownerUserId' = owner_id[\s\S]*return p_snapshot \|\| jsonb_build_object\('projects', filtered_projects\)/);
+  assert.match(filter, /from jsonb_array_elements\(coalesce\(p_snapshot->'projects', '\[\]'::jsonb\)\)\s*where value->>'ownerUserId' = owner_id/);
+  assert.doesNotMatch(filter, /coalesce\(value->>'ownerUserId'/);
+  for (const field of ["use_survey", "use_work", "use_acceptance", "use_acceptance_journal", "use_defects"])
+    assert.match(filter, new RegExp(`permissions\\.${field}`));
+  assert.match(filter, /if approved_role = 'crew' then[\s\S]*jsonb_build_object\('contact', '', 'phone', ''\)/);
+  for (const field of ["owner", "phone", "email", "lineId", "customerRole", "contactPreference", "customerNeed", "marketingConsent", "consentAt", "customerSource"])
+    assert.match(filter, new RegExp(`'${field}'`));
+});
+
+test("non-admin workspace merges are current-driven, ownership-safe, and permissioned", async () => {
+  const sql = await read("supabase/migrations/202609040005_project_ownership.sql");
+  const priorPermissions = await read("supabase/migrations/202609040001_workspace_permission_enforcement.sql");
+  const mergeStart = sql.indexOf("create or replace function public.spc_merge_workspace");
+  const merge = sql.slice(mergeStart);
+  const permissionMergeStart = priorPermissions.indexOf("create or replace function public.spc_merge_permissioned_projects");
+  const permissionMergeEnd = priorPermissions.indexOf("create or replace function public.spc_filter_permissioned_workspace", permissionMergeStart);
+  const permissionMerge = priorPermissions.slice(permissionMergeStart, permissionMergeEnd);
+
+  assert.match(merge, /if approved_role = 'admin' then[\s\S]*spc_json_merge_three_way/);
+  assert.match(merge, /for current_project in select value from jsonb_array_elements\(current_projects\)/);
+  assert.match(merge, /if current_project->>'ownerUserId' = owner_id then[\s\S]*where value->>'id' = current_project->>'id'/);
+  assert.match(merge, /incoming_project - 'ownerUserId'[\s\S]*jsonb_build_object\('ownerUserId', current_project->'ownerUserId'\)/);
+  assert.match(merge, /base_project - 'ownerUserId'[\s\S]*jsonb_build_object\('ownerUserId', current_project->'ownerUserId'\)/);
+  assert.match(merge, /candidate_owned := public\.spc_json_merge_three_way\(base_owned, incoming_owned, current_owned\)/);
+  assert.match(merge, /merged_owned := public\.spc_merge_permissioned_projects\(current_owned, candidate_owned\)/);
+  assert.match(merge, /merged_projects := merged_projects \|\| jsonb_build_array\(coalesce\(merged_project, current_project\)\)/);
+  assert.doesNotMatch(merge, /p_projects[^;]*\|\|/);
+  assert.match(merge, /if approved_role in \('crew', 'client', 'sales'\) then[\s\S]*p_catalog := current_snapshot->'catalog'/);
+  assert.match(permissionMerge, /approved_role in \('admin', 'shenyin'\)[\s\S]*return p_incoming/);
+  assert.match(permissionMerge, /if permissions\.edit_unit_master then/);
+  for (const field of ["use_survey", "use_work", "use_acceptance", "use_acceptance_journal", "use_defects"])
+    assert.match(permissionMerge, new RegExp(`permissions\\.${field}`));
+  assert.match(permissionMerge, /Deliberately driven by current projects and current units/);
+});
+
+test("finance exports remain permission-gated and server-filtered to owned projects", async () => {
+  const sql = await read("supabase/migrations/202609040005_project_ownership.sql");
+  const financeStart = sql.indexOf("create or replace function public.spc_load_finance_export_data");
+  const mergeStart = sql.indexOf("create or replace function public.spc_merge_workspace", financeStart);
+  const finance = sql.slice(financeStart, mergeStart);
+  const deny = finance.indexOf("if not can_export_receivables and not can_export_shipment_details then");
+  const load = finance.indexOf("snapshot := public.spc_load_workspace_unchecked()");
+  const ownedFilter = finance.indexOf("where approved_role = 'admin' or value->>'ownerUserId' = owner_id");
+
+  assert.ok(deny >= 0 && load > deny && ownedFilter > load);
+  assert.match(finance.slice(deny, load), /raise exception 'SPC_ACCESS_REQUIRED' using errcode = '42501'/);
+  assert.match(finance, /approved_role in \('admin', 'shenyin'\)[\s\S]*can_export_receivables := true;[\s\S]*can_export_shipment_details := true/);
+  assert.match(finance, /where approved_role = 'admin' or value->>'ownerUserId' = owner_id/);
+  assert.doesNotMatch(finance, /p_snapshot|source_project->>'ownerUserId'/i);
+});
+
+test("all approved frontend roles create through the authenticated RPC and wait before clearing onboarding", async () => {
+  const page = await read("app/page.tsx");
+  const backend = await read("lib/spc-backend.ts");
+  const admin = page.slice(page.indexOf("function AdminApp"), page.indexOf("function SystemEntry"));
+  const onboarding = page.slice(page.indexOf("function ProjectOnboarding"), page.indexOf("function Empty"));
+
+  assert.match(page, /ownerUserId\?: string/);
+  assert.match(admin, /const canManageProjects = canManageProjectData\(appRole\)/);
+  assert.match(admin, /const canCreateProject = canUseSystem\(appRole\)/);
+  assert.doesNotMatch(admin, /const canManageProjects = canUseSystem/);
+  assert.match(admin, /<ProjectOnboarding[\s\S]*complete=\{async \(project, products\) => \{[\s\S]*await createProject<Project>\(project\)/);
+  const createCompletion = admin.slice(admin.indexOf("complete={async (project, products)"), admin.indexOf("/>\n    );", admin.indexOf("complete={async (project, products)")));
+  assert.match(createCompletion, /await createProject<Project>\(project\)/);
+  assert.match(createCompletion, /versionRef\.current = created\.version/);
+  assert.match(createCompletion, /baselineRef\.current = \{ projects: structuredClone\(nextProjects\), catalog: structuredClone\(catalog\) \}/);
+  assert.match(createCompletion, /latestRef\.current = \{ projects: structuredClone\(nextProjects\), catalog: structuredClone\(catalog\) \}/);
+  assert.doesNotMatch(createCompletion, /setCatalog\(products\)|canManageProjects \? products : catalog/);
+  assert.match(admin, /\{canCreateProject && <button[\s\S]*＋ 新增專案/);
+  assert.match(backend, /export async function createProject<T>\(project: T\)[\s\S]*supabase\.rpc\("spc_create_project"[\s\S]*serializePrivatePhotos\(project\)[\s\S]*hydratePrivatePhotos/);
+  assert.match(backend, /if \(error\.code !== "42883" && error\.code !== "PGRST202"\) throw error/);
+  assert.match(onboarding, /complete: \(project: Project, products: Product\[\]\) => Promise<void>/);
+  const finish = onboarding.slice(onboarding.indexOf("const finish = async"), onboarding.indexOf("return ("));
+  assert.match(finish, /try \{[\s\S]*await complete\([\s\S]*removeDurableDraft\(onboardingKey\)[\s\S]*await removeOfflineDraft\(onboardingKey\)[\s\S]*\} catch \(error\) \{[\s\S]*setError/);
+  assert.ok(finish.indexOf("await complete(") < finish.indexOf("removeDurableDraft(onboardingKey)"));
+  assert.doesNotMatch(finish.slice(finish.indexOf("catch (error)")), /removeDurableDraft|removeOfflineDraft/);
+});
+
+test("owned-project frontend state trusts server visibility and never resurrects local projects", async () => {
+  const page = await read("app/page.tsx");
+  const admin = page.slice(page.indexOf("function AdminApp"), page.indexOf("function SystemEntry"));
+  const load = admin.slice(admin.indexOf("const load = async () =>"), admin.indexOf("useEffect(() => {", admin.indexOf("const load = async () =>") + 1));
+
+  assert.match(load, /const loadedProjects = normalize\(appRole === "admin"[\s\S]*: snapshot\.projects as Project\[\]\)/);
+  assert.match(load, /const recoveredProjects = appRole === "admin" \? normalize\([\s\S]*\) : \[\]/);
+  assert.match(load, /const visibleProjects = appRole === "admin" \? recoveredProjects : \[\]/);
+  assert.match(admin, /const hiddenProjectDraftRef = useRef<Project\[]>\(\[\]\)/);
+  assert.match(admin, /const durableProjects = appRole === "admin" \? projects : hiddenProjectDraftRef\.current/);
+  assert.doesNotMatch(page, /localStorage\.clear\(\)|indexedDB\.deleteDatabase\(/);
 });

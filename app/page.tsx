@@ -2,7 +2,7 @@
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { AlignmentType, BorderStyle, Document, ImageRun, Packer, PageOrientation, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
-import { loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
+import { createProject, loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
 import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
@@ -236,6 +236,7 @@ type DailyNote = {
 };
 type Project = {
   id: string;
+  ownerUserId?: string;
   name: string;
   address: string;
   builder: string;
@@ -1042,6 +1043,7 @@ function SessionChip({ displayName, email, role }: { displayName: string; email:
 function AdminApp({ authUserId, email, displayName, role, appRole, permissions }: { authUserId: string; email: string; displayName: string; role: string; appRole: AppRole; permissions: RolePermissions }) {
   const mountIdRef = useRef(`${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
   const canManageProjects = canManageProjectData(appRole);
+  const canCreateProject = canUseSystem(appRole);
   const canManageAccounts = appRole === "admin";
   const canUseAcceptance = canUseUnitTab(appRole, permissions, "accept");
   const versionRef = useRef(0);
@@ -1118,13 +1120,13 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
         hiddenProjectDraftRef.current = appRole === "admin" ? [] : structuredClone(normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]));
         const useDurableDraft = durableDraft?.pending || (!snapshot.projects.length && durableDraft?.projects.length);
-        const loadedProjects = appRole === "admin" ? normalize(
-          (useDurableDraft
+        const loadedProjects = normalize(appRole === "admin"
+          ? (useDurableDraft
             ? durableDraft.projects
             : snapshot.projects.length
               ? snapshot.projects
-              : legacy?.projects || durableDraft?.projects || localProjects) as Project[],
-        ) : [];
+              : legacy?.projects || durableDraft?.projects || localProjects) as Project[]
+          : snapshot.projects as Project[]);
         const loadedCatalog = (useDurableDraft
           ? durableDraft.catalog
           : snapshot.catalog.length
@@ -1454,13 +1456,19 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     );
   if (mode === "new")
     return (
-      <ProjectOnboarding
-        catalog={catalog}
+        <ProjectOnboarding
+          catalog={catalog}
         cancel={() => setMode("entry")}
-        complete={(project, products) => {
-          setCatalog(products);
-          setProjects([...projects, project]);
-          setPid(project.id);
+        complete={async (project, products) => {
+          const created = await createProject<Project>(project);
+          versionRef.current = created.version;
+          setProjects((current) => {
+            const nextProjects = [...current.filter((item) => item.id !== created.project.id), created.project];
+            baselineRef.current = { projects: structuredClone(nextProjects), catalog: structuredClone(catalog) };
+            latestRef.current = { projects: structuredClone(nextProjects), catalog: structuredClone(catalog) };
+            return nextProjects;
+          });
+          setPid(created.project.id);
           setUid("");
           setView("dashboard");
           setMode("app");
@@ -1561,7 +1569,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
             )}
           </div>
           <p className="side-title project-section-title">專案／建案</p>
-          {canManageProjects && <button
+          {canCreateProject && <button
             className="primary wide"
             onClick={() => {
               setMenuOpen(false);
@@ -1915,7 +1923,7 @@ function ProjectOnboarding({
 }: {
   catalog: Product[];
   cancel: () => void;
-  complete: (project: Project, products: Product[]) => void;
+  complete: (project: Project, products: Product[]) => Promise<void>;
 }) {
   const authUserId = useAuthOwner();
   const emptyRow = { building: "", floor: "", number: "", model: "", colorNo: "", estimated: "", areaUnit: "坪" as AreaUnit, note: "" };
@@ -1926,6 +1934,7 @@ function ProjectOnboarding({
   const [product, setProduct] = useState<Product>(() => ({ id: id(), brand: "", model: "", colorNo: "", spec: "", note: "" }));
   const [rows, setRows] = useState([{ ...emptyRow }]);
   const [importing, setImporting] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
     void removeDurableDraft(onboardingKey);
@@ -1942,7 +1951,7 @@ function ProjectOnboarding({
     setError("");
     setStep(4);
   };
-  const finish = () => {
+  const finish = async () => {
     const invalid = rows.findIndex((r) => !onboardingUnitRowIsValid(r, areaInputToPing(r.estimated, r.areaUnit || "坪")));
     if (invalid >= 0) return setError(`第 ${invalid + 1} 戶資料不完整，請確認棟別、樓層、戶別與坪數。`);
     const units = rows.map((r) => {
@@ -1951,13 +1960,21 @@ function ProjectOnboarding({
       const product = findExactUnitProduct({ model, colorNo }, products);
       return { ...blankUnit(), building: r.building, floor: r.floor, number: r.number, brand: product?.brand || "", model, colorNo, spec: product?.spec || "", estimated: areaInputToPing(r.estimated, r.areaUnit || "坪"), note: r.note };
     });
-    complete({
-      id: id(), name: basic.name.trim(), address: basic.address.trim(), builder: basic.builder.trim(), contact: basic.contact.trim(), phone: basic.phone.trim(), note: basic.note,
-      expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "",
-      units, products, journals: [],
-    }, products);
-    removeDurableDraft(onboardingKey);
-    void removeOfflineDraft(onboardingKey);
+    setSaving(true);
+    setError("");
+    try {
+      await complete({
+        id: id(), name: basic.name.trim(), address: basic.address.trim(), builder: basic.builder.trim(), contact: basic.contact.trim(), phone: basic.phone.trim(), note: basic.note,
+        expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "",
+        units, products, journals: [],
+      }, products);
+      removeDurableDraft(onboardingKey);
+      await removeOfflineDraft(onboardingKey);
+    } catch (error) {
+      setError(`案場建立失敗：${error instanceof Error ? error.message : "請稍後再試"}`);
+    } finally {
+      setSaving(false);
+    }
   };
   return (
     <main className="onboarding-screen">
@@ -1969,7 +1986,7 @@ function ProjectOnboarding({
         </div><button className="primary next-step" disabled={!basic.name.trim() || !basic.address.trim()} onClick={() => setStep(2)}>下一步：確認SPC產品 →</button></section>}
         {step === 2 && <section className="panel form"><div><p className="eyebrow">全案場共用產品庫</p><h1>選擇或新增SPC產品</h1><p className="muted">點一下已有色號即可自動帶入下方欄位；沒有的產品只需新增一次。</p></div><div className="onboarding-products">{products.map((p) => <button type="button" className={product.id === p.id ? "selected" : ""} key={p.id} onClick={() => { setProduct({ ...p }); setError(""); }}><b>{p.model}</b><span>{p.colorNo}</span><small>{p.brand || "未填品牌"}</small></button>)}</div><div className="grid3 product-inline"><Field label="品牌／廠商" value={product.brand} set={(brand) => setProduct({ ...product, brand })} /><Field label="SPC編號" value={product.model} set={(model) => setProduct({ ...product, model })} /><Field label="色號" value={product.colorNo} set={(colorNo) => setProduct({ ...product, colorNo })} /><Field label="規格" value={product.spec} set={(spec) => setProduct({ ...product, spec })} /><button className="ghost" onClick={addProduct}>＋ 加入產品庫</button></div><div className="step-actions"><button className="ghost" onClick={() => setStep(1)}>← 上一步</button><button className="primary" disabled={!products.length} onClick={() => setStep(3)}>下一步：建立戶別 →</button></div></section>}
         {step === 3 && <section className="panel form"><div className="panel-head"><div><p className="eyebrow">固定欄位，一列一戶</p><h1>建立第一批戶別</h1><p>少量資料直接填寫；大量資料可在這裡直接使用 Excel／CSV 匯入。</p></div><div className="actions"><button className="unit-import-toggle" onClick={() => setImporting(true)}>▤ 匯入 Excel</button><button className="add-row" onClick={() => setRows([...rows, { ...emptyRow }])}>＋ 新增一戶</button><button className="primary" onClick={goToConfirmation}>下一步：確認資料 →</button></div></div><div className="batch-rows">{rows.map((r, i) => { const models = [...new Set(products.map((p) => p.model))]; const colors = products.filter((p) => p.model === r.model).map((p) => p.colorNo); return <div className="batch-row" key={i}><div className="batch-row-title"><b>第 {i + 1} 戶</b>{rows.length > 1 && <button onClick={() => setRows(rows.filter((_, j) => j !== i))}>移除</button>}</div><div className="grid3"><Field label="棟別" value={r.building} set={(v) => updateRow(i, "building", v)} /><Field label="樓層" value={r.floor} set={(v) => updateRow(i, "floor", v)} /><Field label="戶別" value={r.number} set={(v) => updateRow(i, "number", v)} /><label className="field"><span>SPC編號</span><select value={r.model} onChange={(e) => updateRow(i, "model", e.target.value)}><option value="">請選擇</option>{models.map((m) => <option key={m}>{m}</option>)}</select></label><label className="field"><span>色號</span><select value={r.colorNo} disabled={!r.model} onChange={(e) => updateRow(i, "colorNo", e.target.value)}><option value="">請選擇</option>{colors.map((c) => <option key={c}>{c}</option>)}</select></label><AreaDraftInput value={r.estimated} unit={r.areaUnit || "坪"} setArea={(estimated, areaUnit) => setRows((current) => current.map((row, index) => index === i ? { ...row, estimated, areaUnit } : row))} /><Field label="備註／特殊說明" value={r.note} set={(v) => updateRow(i, "note", v)} /></div></div>})}</div><div className="step-actions"><button className="ghost" onClick={() => setStep(2)}>← 上一步</button><button className="primary" onClick={goToConfirmation}>下一步：確認資料 →</button></div>{importing && <ImportUnits p={{ id: "project-onboarding-import", name: basic.name, address: basic.address, builder: basic.builder, contact: basic.contact, phone: basic.phone, note: basic.note, expectedDate: basic.expectedDate, unitNamingRule: "", productRule: "", specialRule: "", acceptanceRule: "", importRule: "", products, journals: [], units: rows.filter((row) => row.building && row.floor && row.number).map((row) => ({ ...blankUnit(), building: row.building, floor: row.floor, number: row.number, model: row.model, colorNo: row.colorNo, estimated: areaInputToPing(row.estimated, row.areaUnit || "坪") || 0, note: row.note })) }} close={() => setImporting(false)} save={(units, importedProducts, projectName) => { const existingRows = rows.filter((row) => [row.building, row.floor, row.number, row.model, row.colorNo, row.estimated, row.note].some(Boolean)); setRows([...existingRows, ...units.map((unit) => ({ building: unit.building, floor: unit.floor, number: unit.number, model: unit.model, colorNo: unit.colorNo, estimated: String(unit.estimated), areaUnit: "坪" as AreaUnit, note: unit.note }))]); setProducts((current) => [...current, ...importedProducts.filter((item) => !current.some((existing) => existing.model === item.model && existing.colorNo === item.colorNo))]); if (projectName) setBasic({ ...basic, name: projectName }); setImporting(false); setError(""); }} />}</section>}
-        {step === 4 && <section className="panel form"><div><p className="eyebrow">最後確認</p><h1>確認並啟用案場</h1></div><div className="activation-summary"><span>建案<b>{basic.name}</b></span><span>案場地址<b>{basic.address}</b></span><span>SPC產品<b>{products.length} 筆</b></span><span>第一批戶別<b>{rows.length} 戶</b></span></div><div className="warning">確認後會正式建立案場，戶別基本資料將直接沿用至場勘、施工、驗收與報告。</div><div className="step-actions"><button className="ghost" onClick={() => setStep(3)}>← 返回修改</button><button className="primary" onClick={finish}>確認並開始使用</button></div></section>}
+        {step === 4 && <section className="panel form"><div><p className="eyebrow">最後確認</p><h1>確認並啟用案場</h1></div><div className="activation-summary"><span>建案<b>{basic.name}</b></span><span>案場地址<b>{basic.address}</b></span><span>SPC產品<b>{products.length} 筆</b></span><span>第一批戶別<b>{rows.length} 戶</b></span></div><div className="warning">確認後會正式建立案場，戶別基本資料將直接沿用至場勘、施工、驗收與報告。</div><div className="step-actions"><button className="ghost" disabled={saving} onClick={() => setStep(3)}>← 返回修改</button><button className="primary" disabled={saving} onClick={() => void finish()}>{saving ? "建立中…" : "確認並開始使用"}</button></div></section>}
         {error && <div className="form-error">{error}</div>}
       </section>
     </main>

@@ -20,6 +20,7 @@ export type FinanceExportData = {
   canExportShipmentDetails: boolean;
   projects: FinanceExportProject[];
 };
+export type CreatedProjectResult<T = unknown> = { version: number; project: T };
 
 const storageScheme = "spc-storage://";
 
@@ -101,6 +102,14 @@ export async function loadLegacyWorkspace() {
   return data ? hydratePrivatePhotos(data as { projects: unknown[]; catalog: unknown[] }) : null;
 }
 
+export async function createProject<T>(project: T): Promise<CreatedProjectResult<T>> {
+  const { data, error } = await supabase.rpc("spc_create_project", {
+    p_project: serializePrivatePhotos(project),
+  });
+  if (error) throw error;
+  return hydratePrivatePhotos(data as CreatedProjectResult<T>);
+}
+
 export async function saveWorkspace(
   expectedVersion: number,
   projects: unknown[],
@@ -117,7 +126,7 @@ export async function saveWorkspace(
   };
   const { data, error } = await supabase.rpc("spc_merge_workspace", payload);
   if (!error) return Number((data as { version?: number } | null)?.version ?? data);
-  if (!error.message.includes("spc_merge_workspace")) throw error;
+  if (error.code !== "42883" && error.code !== "PGRST202") throw error;
   const legacy = await supabase.rpc("spc_save_workspace", {
     p_expected_version: expectedVersion, p_projects: serializePrivatePhotos(projects), p_catalog: catalog,
   });
