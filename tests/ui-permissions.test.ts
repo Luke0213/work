@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { canConfirmUnit, canCreateUnit, canDeleteUnit, canEditUnitMaster, canUsePermissionUnitTab, canUsePermissionView, canViewCustomerDetails, financeUiMode } from "../lib/ui-permissions.ts";
 import { NO_ROLE_PERMISSIONS, type RolePermissions } from "../lib/role-permissions.ts";
@@ -43,6 +44,15 @@ test("unit creation deletion and confirmation stay restricted to project manager
     assert.equal(canConfirmUnit(role), true);
   }
   assert.equal(canViewCustomerDetails("crew"), false);
+});
+
+test("unit confirmation UI guards both Next navigation and the Master handler", () => {
+  const page = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const next = page.slice(page.indexOf("function Next("), page.indexOf("function Master("));
+  const master = page.slice(page.indexOf("function Master("), page.indexOf("function SurveyTab("));
+
+  assert.match(next, /unit\.status === "待確認" && !canConfirmUnit\(role\)/);
+  assert.match(master, /onClick=\{\(\) => \{\s*if \(!canConfirm\) return;\s*patch\(\{/);
 });
 
 test("unit tabs use independent permission flags and always retain master", () => {

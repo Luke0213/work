@@ -4308,6 +4308,7 @@ function Next({ unit, setTab, role, permissions }: { unit: Unit; setTab: (x: str
     已計價: ["查看完整工程歷程", "此戶已完成計價，可查詢所有紀錄", "timeline"],
   };
   const [x, , t] = map[unit.status];
+  if (unit.status === "待確認" && !canConfirmUnit(role)) return null;
   if (!canUseUnitTab(role, permissions, t)) return null;
   return (
     <div className="next-card">
@@ -4550,7 +4551,8 @@ function Master({
             !u.model ||
             !u.colorNo
           }
-          onClick={() =>
+          onClick={() => {
+            if (!canConfirm) return;
             patch({
               status: "待場勘",
               events: [
@@ -4563,8 +4565,8 @@ function Master({
                 },
                 ...u.events,
               ],
-            })
-          }
+            });
+          }}
         >
           確認資料無誤 → 安排場勘
         </button>
