@@ -2,7 +2,7 @@
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { AlignmentType, BorderStyle, Document, ImageRun, Packer, PageOrientation, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
-import { loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity } from "../lib/spc-backend";
+import { loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
 import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
@@ -5982,6 +5982,52 @@ type BillingUnitDraft = { rate: string; priced: boolean };
 function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeAccess: ReturnType<typeof financeUiMode> }) {
   const authUserId = useAuthOwner();
   const { canExportReceivables, canExportShipment, canManageFinance } = financeAccess;
+  const needsProtectedFinanceData = !canManageFinance && (canExportReceivables || canExportShipment);
+  const [protectedFinanceData, setProtectedFinanceData] = useState<FinanceExportData | null>(null);
+  const [protectedFinanceProject, setProtectedFinanceProject] = useState<FinanceExportProject | null>(null);
+  const [financeExportLoading, setFinanceExportLoading] = useState(false);
+  const [financeExportError, setFinanceExportError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    if (!needsProtectedFinanceData) {
+      setProtectedFinanceData(null);
+      setProtectedFinanceProject(null);
+      setFinanceExportLoading(false);
+      setFinanceExportError("");
+      return () => { active = false; };
+    }
+    setProtectedFinanceData(null);
+    setProtectedFinanceProject(null);
+    setFinanceExportLoading(true);
+    setFinanceExportError("");
+    loadFinanceExportData().then((data) => {
+      if (!active) return;
+      const project = data.projects.find((candidate) => candidate.id === p.id);
+      setProtectedFinanceData(data);
+      if (!project) {
+        setFinanceExportError("無法取得此案場的財務匯出資料，請重新整理或洽管理員。");
+        return;
+      }
+      setProtectedFinanceProject(project);
+      if ((canExportReceivables && !data.canExportReceivables)
+        || (canExportShipment && !data.canExportShipmentDetails)) {
+        setFinanceExportError("財務匯出權限已更新，請重新整理後再試。");
+      }
+    }).catch(() => {
+      if (!active) return;
+      setFinanceExportError("財務匯出資料讀取失敗，請稍後再試。");
+    }).finally(() => {
+      if (active) setFinanceExportLoading(false);
+    });
+    return () => { active = false; };
+  }, [needsProtectedFinanceData, p.id, canExportReceivables, canExportShipment]);
+
+  const financeExportProject = canManageFinance ? p : protectedFinanceProject;
+  const serverCanExportReceivables = canManageFinance || protectedFinanceData?.canExportReceivables === true;
+  const serverCanExportShipment = canManageFinance || protectedFinanceData?.canExportShipmentDetails === true;
+  const receivableExportReady = canExportReceivables && serverCanExportReceivables && !!financeExportProject && !financeExportLoading;
+  const shipmentExportReady = canExportShipment && serverCanExportShipment && !!financeExportProject && !financeExportLoading;
   const [y, setY] = useState(String(new Date().getFullYear())),
     [m, setM] = useState(String(new Date().getMonth() + 1).padStart(2, "0")),
     [receivablePreview, setReceivablePreview] = useState(false),
@@ -5996,11 +6042,11 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
     [shipmentReportDraft, setShipmentReportDraft] = useState<ReportSourceDraft | null>(null),
     [shipmentReportMessage, setShipmentReportMessage] = useState(""),
     ym = `${y}-${m}`,
-    monthlyBillingRecords = buildAcceptanceExportRecords(p).filter((record) => record.exportDate.startsWith(ym)),
+    monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter((record) => record.exportDate.startsWith(ym)) : [],
     monthlyUnitIds = new Set(monthlyBillingRecords.map((record) => record.unitId)),
     monthlyUnits = p.units.filter((unit) => monthlyUnitIds.has(unit.id)),
     billRecords = monthlyBillingRecords.filter((record) => {
-      const unit = p.units.find((item) => item.id === record.unitId);
+      const unit = financeExportProject?.units?.find((item) => item.id === record.unitId);
       return unit ? unit.status === "已驗收" || unit.status === "已計價" : false;
     }),
     billRows = billRecords.flatMap((record) => {
@@ -6101,12 +6147,12 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       setShipmentReportMessage("✓ 正式報表來源資料已保存");
     },
     openReceivablePreview = () => {
-      if (!canExportReceivables) return;
-      setReceivableDraft(buildReceivableExportDraft(p, billRecords));
+      if (!receivableExportReady || !financeExportProject) return;
+      setReceivableDraft(buildReceivableExportDraft(financeExportProject, billRecords));
       setReceivablePreview(true);
     },
     openShipmentPreview = () => {
-      if (!canExportShipment) return;
+      if (!shipmentExportReady || !financeExportProject) return;
       setShipmentPreview(true); setShipmentReportDraft(null); setShipmentReportMessage("");
     },
     changeBillingPeriod = (kind: "year" | "month", value: string) => {
@@ -6145,14 +6191,16 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
         </select>
       </div>
       {canManageFinance && billingMessage && <div className="warning billing-no-print">{billingMessage}</div>}
+      {!canManageFinance && financeExportLoading && <div className="muted billing-no-print">正在讀取財務匯出資料…</div>}
+      {!canManageFinance && financeExportError && <div className="form-error billing-no-print">{financeExportError}</div>}
       {canManageFinance && editing && billingChanges.length > 0 && <div className="warning billing-no-print">目前有尚未保存的月結修改；匯出內容仍以已保存資料為準。</div>}
       {canManageFinance && <div className="billing-print-month">計價月份：{ym}</div>}
       <section className="acceptance-exports billing-no-print">
         <div className="checklist-head"><div><h3>報表／匯出</h3><small>依目前月份與案場資料預覽、下載或列印報表。</small></div></div>
         <div className="export-cards">
-          {canExportReceivables && <button type="button" disabled={!billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>}
+          {canExportReceivables && <button type="button" disabled={!receivableExportReady || !billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>}
           {canManageFinance && <button type="button" onClick={printBilling}><i>PDF</i><span><b>PDF／列印</b><small>列印目前月結頁面</small></span><em>列印 ›</em></button>}
-          {canExportShipment && <button type="button" onClick={openShipmentPreview}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>}
+          {canExportShipment && <button type="button" disabled={!shipmentExportReady} onClick={openShipmentPreview}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>}
         </div>
       </section>
       {canManageFinance && <><div className="summary">
@@ -6292,7 +6340,7 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
             ["傳真", companyReportConfig.fax],
             ["地址", companyReportConfig.address],
           ]} />
-          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReceivablePreview(false); setReceivableDraft(null); }}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !billRecords.length} onClick={async () => { if (!canExportReceivables) return; setReceivableExporting(true); try { const workbook = createReceivableWorkbook(p, billRecords, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${p.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
+          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReceivablePreview(false); setReceivableDraft(null); }}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !billRecords.length || !receivableExportReady} onClick={async () => { if (!receivableExportReady || !financeExportProject) return; setReceivableExporting(true); try { const workbook = createReceivableWorkbook(financeExportProject, billRecords, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${financeExportProject.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
       {canExportShipment && shipmentPreview && <Modal close={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }} title="SPC 已出貨明細總表｜匯出預覽">
@@ -6304,7 +6352,7 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
           {!shipmentRecords.length && <div className="form-error">目前沒有符合條件的施工或驗收資料。</div>}
           {canManageFinance && shipmentReportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；Excel 仍只會使用正式資料。確認保存後會更新同一戶別及同一筆正式驗收。</div><ReportMetadataEditor draft={shipmentReportDraft} setDraft={setShipmentReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setShipmentReportDraft(null); setShipmentReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveShipmentReportSource}>確認保存正式來源</button></div></section>}
           {shipmentReportMessage && <div className={shipmentReportMessage.startsWith("✓") ? "save-success" : "form-error"}>{shipmentReportMessage}</div>}
-          <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length || !!shipmentReportDraft} onClick={async () => { if (!canExportShipment) return; setShipmentExporting(true); try { const workbook = createShipmentWorkbook(p, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${p.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
+          <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length || !!shipmentReportDraft || !shipmentExportReady} onClick={async () => { if (!shipmentExportReady || !financeExportProject) return; setShipmentExporting(true); try { const workbook = createShipmentWorkbook(financeExportProject, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${financeExportProject.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
     </div>

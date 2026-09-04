@@ -1,6 +1,7 @@
 import { supabase } from "./supabase";
 import { readPhotoCleanupQueue, scopedStorageKey, writePhotoCleanupQueue } from "./auth-storage";
 import { logStorageException } from "./storage-durability.ts";
+import type { ExportProject } from "./acceptance-exports";
 
 export type EntityActivity = {
   entityType: string;
@@ -13,6 +14,12 @@ export type EntityActivity = {
   updatedAt: string;
 };
 export type WorkspaceSnapshot = { version: number; projects: unknown[]; catalog: unknown[]; activity?: EntityActivity[] };
+export type FinanceExportProject = ExportProject & { id: string };
+export type FinanceExportData = {
+  canExportReceivables: boolean;
+  canExportShipmentDetails: boolean;
+  projects: FinanceExportProject[];
+};
 
 const storageScheme = "spc-storage://";
 
@@ -77,6 +84,16 @@ export async function loadWorkspace(): Promise<WorkspaceSnapshot> {
   const { data: activity } = await supabase.rpc("spc_load_entity_activity");
   snapshot.activity = (activity || []) as EntityActivity[];
   return hydratePrivatePhotos(snapshot);
+}
+
+export async function loadFinanceExportData(): Promise<FinanceExportData> {
+  const { data, error } = await supabase.rpc("spc_load_finance_export_data");
+  if (error) throw error;
+  return (data || {
+    canExportReceivables: false,
+    canExportShipmentDetails: false,
+    projects: [],
+  }) as FinanceExportData;
 }
 
 export async function loadLegacyWorkspace() {
