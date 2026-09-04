@@ -76,7 +76,7 @@ type Survey = {
   draft?: boolean;
   doorInspection?: {
     thresholdCm?: number;
-    meetsThreshold: boolean;
+    meetsThreshold: boolean | null;
     hasGap: boolean | null;
     result: "合格" | "不合格";
     rationale: string;
@@ -346,7 +346,6 @@ const sideViews: [string, string, string][] = [
 const surveyLabels = [
   "地坪平整度",
   "地面是否乾淨",
-  "垃圾是否清除",
   "門框是否完成",
   "門扇是否已安裝",
   "廁所門框狀態",
@@ -614,7 +613,7 @@ function exportFullExcel(projects: Project[], catalog: Product[]) {
     坪數: areaStatus === "known" ? areaValue ?? "" : "",
     坪數單位: areaUnit || "坪",
     門檻實測公分: doorInspection?.thresholdCm ?? "",
-    門檻至少1點5公分: doorInspection?.meetsThreshold ? "是" : "否",
+    門檻至少1點5公分: doorInspection?.meetsThreshold === true ? "是" : doorInspection?.meetsThreshold === false ? "否" : "",
     門檻有空隙: doorInspection?.hasGap === null || doorInspection?.hasGap === undefined ? "未檢查" : doorInspection.hasGap ? "是" : "否",
     門檢查結果: doorInspection?.result || "",
     門檢查判斷依據: doorInspection?.rationale || "",
@@ -4219,7 +4218,7 @@ function UnitDetail({
         </div>
         <div className="unit-head-status">
           <div className="unit-head-estimated">
-            <small>預估施工坪數</small>
+            <small>坪數</small>
             <b>{Number.isFinite(unit.estimated) ? `${unit.estimated} 坪` : "—"}</b>
           </div>
           <div className="unit-head-current-status">
@@ -4484,7 +4483,7 @@ function Master({
         <Field label="品牌／廠商" value={u.brand} disabled />
         <Field label="規格" value={u.spec} disabled />
         <label className="field">
-          <span>預估施工坪數</span>
+          <span>坪數</span>
           <div className="area-input-row">
             <input
               type="number"
@@ -4594,7 +4593,7 @@ function SurveyTab({
       areaStatus: "pending",
       areaValue: undefined,
       areaUnit: "坪",
-      doorInspection: { thresholdCm: undefined, meetsThreshold: false, hasGap: null, result: "不合格", rationale: "", note: "", photos: [] },
+      doorInspection: { thresholdCm: undefined, meetsThreshold: null, hasGap: null, result: "不合格", rationale: "", note: "", photos: [] },
       siliconeInspection: { matchesFloor: null, otherColor: "", note: "", photos: [] },
       dividerInspection: { needed: "待確認", quantity: undefined, location: "", note: "", photos: [] },
       parking: { count: "", location: "", note: "", photos: [] },
@@ -4612,8 +4611,9 @@ function SurveyTab({
       return latestFormalSurvey || initial;
     }),
     [risk, setRisk] = useState(false),
-    [surveySigning, setSurveySigning] = useState(false),
+    [surveySigning, setSurveySigning] = useState<number | null>(null),
     [surveyDetail, setSurveyDetail] = useState<"door" | "silicone" | "divider" | "parking" | "staging" | "signatures" | null>(null),
+    [expandedDoorNotes, setExpandedDoorNotes] = useState<string[]>([]),
     [doorFlowActive, setDoorFlowActive] = useState(false),
     [doorFlowResume, setDoorFlowResume] = useState(0),
     [saved, setSaved] = useState(""),
@@ -4652,20 +4652,17 @@ function SurveyTab({
     setS(resumeSurvey);
     setSaved("已結束查看，可建立新的場勘紀錄");
   };
-  const door = s.doorInspection || { thresholdCm: undefined, meetsThreshold: false, hasGap: null, result: "不合格" as const, rationale: "", note: "", photos: [] },
+  const door = s.doorInspection || { thresholdCm: undefined, meetsThreshold: null, hasGap: null, result: "不合格" as const, rationale: "", note: "", photos: [] },
     silicone = s.siliconeInspection || { matchesFloor: null, otherColor: "", note: "", photos: [] },
     divider = s.dividerInspection || { needed: "待確認" as const, quantity: undefined, location: "", note: "", photos: [] },
     parking = s.parking || { count: "" as const, location: "", note: "", photos: [] },
     stagingArea = s.stagingArea || { location: "", note: "", cautions: "", photos: [] },
     surveySignatures = s.surveySignatures || [],
-    doorMeasured = Number.isFinite(Number(door.thresholdCm)) && Number(door.thresholdCm) > 0,
-    doorThresholdFailed = doorMeasured && Number(door.thresholdCm) < 1.5,
-    doorResult: "合格" | "不合格" = doorThresholdFailed || door.hasGap === true ? "不合格" : "合格",
+    doorResult: "合格" | "不合格" = door.meetsThreshold === false || door.hasGap === true ? "不合格" : "合格",
+    doorThresholdDisplay = Number.isFinite(Number(door.thresholdCm)) && Number(door.thresholdCm) > 0 ? `${door.thresholdCm} cm` : door.meetsThreshold === true ? "有 1.5 cm 以上" : door.meetsThreshold === false ? "沒有 1.5 cm 以上" : "尚未確認",
     updateDoor = (change: Partial<NonNullable<Survey["doorInspection"]>>) => {
       const next = { ...door, ...change };
-      const nextMeasured = Number.isFinite(Number(next.thresholdCm)) && Number(next.thresholdCm) > 0;
-      next.meetsThreshold = nextMeasured && Number(next.thresholdCm) >= 1.5;
-      next.result = (nextMeasured && Number(next.thresholdCm) < 1.5) || next.hasGap === true ? "不合格" : "合格";
+      next.result = next.meetsThreshold === false || next.hasGap === true ? "不合格" : "合格";
       setS({ ...s, doorInspection: next });
     },
     doorItems = s.items.filter((item) => doorSurveyLabels.includes(item.label)),
@@ -4676,15 +4673,15 @@ function SurveyTab({
     doorBad: CheckItem[] = doorResult === "不合格" ? [{ label: "門檻檢查", result: "不合格", note: [door.rationale, door.note].filter(Boolean).join("；"), photos: door.photos }] : [],
     bad = [...s.items.filter((x) => x.result === "不合格"), ...doorBad],
     incomplete = s.items.some((x) => !x.result),
-    invalidBad = bad.some((x) => !x.note.trim() || !x.photos?.length),
-    doorInvalid = door.hasGap === null || (doorResult === "不合格" && (!door.rationale.trim() || !door.photos?.length)),
+    invalidBad = s.items.some((x) => x.result === "不合格" && (!x.note.trim() || !x.photos?.length)) || doorBad.some((x) => !x.note.trim()),
+    doorInvalid = (door.meetsThreshold === null || door.meetsThreshold === undefined) || door.hasGap === null || (doorResult === "不合格" && !door.rationale.trim()),
     doorCombinedInvalid = doorInvalid || doorItemsInvalid || doorItemEvidenceInvalid,
     doorCombinedResult = !doorCombinedInvalid && doorResult === "合格" && !doorItemsBad ? "合格" : "不合格",
     siliconeInvalid = silicone.matchesFloor === null || (silicone.matchesFloor === false && !silicone.otherColor.trim()),
     dividerInvalid = divider.needed === "是" && (!Number.isFinite(Number(divider.quantity)) || Number(divider.quantity) <= 0 || !divider.location.trim()),
     signaturesInvalid = surveySignatures.filter((signature) => signature.valid).length < 2,
     surveyChecklistItems = [
-      ...s.items.filter((item) => !doorSurveyLabels.includes(item.label) && item.label !== "其他異常"),
+      ...s.items.filter((item) => !doorSurveyLabels.includes(item.label) && item.label !== "垃圾是否清除" && item.label !== "其他異常"),
       ...s.items.filter((item) => item.label === "其他異常"),
     ],
     allPhotos = [...s.photos, ...s.items.flatMap((x) => x.photos || []), ...(door.photos || []), ...(silicone.photos || []), ...(divider.photos || []), ...(parking.photos || []), ...(stagingArea.photos || [])],
@@ -4700,7 +4697,7 @@ function SurveyTab({
       const survey: Survey = {
         ...s,
         draft: false,
-        doorInspection: { ...door, meetsThreshold: doorMeasured && Number(door.thresholdCm) >= 1.5, result: doorResult },
+        doorInspection: { ...door, result: doorResult },
       };
       const surveyUpdate = {
         surveys: u.surveys.some((record) => record.id === survey.id)
@@ -4764,23 +4761,21 @@ function SurveyTab({
           <p>基本資料會沿用至後續所有工程節點。</p>
         </div>
       </div>
-      {historyMode && <div className="warning history-view-banner"><span>正在查看最新場勘紀錄</span><button className="ghost" type="button" onClick={exitSurveyHistory}>結束查看／建立新場勘</button></div>}
       {surveyDetail === "door" && <Modal close={() => { setSurveyDetail(null); setDoorFlowActive(false); }} title="門與門檻檢查"><section className="survey-area-panel door-inspection-panel">
         <div className="panel-head"><div><h3>門與門檻檢查</h3><p>門框、門扇、廁所門框與門檻集中在同一頁完成；門檻標準至少 1.5 cm 且不可有空隙。</p></div><span className={doorCombinedResult === "合格" ? "status done" : "status danger"}>{doorCombinedInvalid ? "尚未完成" : doorCombinedResult}</span></div>
         <div className="door-combined-checks">
-          {doorItems.map((item) => <section className={`door-subcheck ${item.result === "合格" ? "good" : item.result === "不合格" ? "bad" : ""}`} key={item.label}><b>{item.label}</b><div className="result-actions">{(["合格", "不合格", "不適用"] as Choice[]).map((result) => <button type="button" key={result} className={item.result === result ? `selected ${result === "合格" ? "good" : result === "不合格" ? "bad" : "na"}` : ""} onClick={() => updateDoorItem(item.label, { result })}>{result}</button>)}</div><label className="field"><span>備註／原因</span><textarea value={item.note} onChange={(event) => updateDoorItem(item.label, { note: event.target.value })} placeholder={item.result === "不合格" ? "請填寫原因及改善方式" : "可補充現場狀況"} /></label><Photos node={`場勘｜${item.label}`} label={`${item.label}照片`} photos={item.photos || []} set={(photos: Photo[]) => updateDoorItem(item.label, { photos })} /></section>)}
+          {doorItems.map((item) => <section className={`door-subcheck ${item.result === "合格" ? "good" : item.result === "不合格" ? "bad" : ""}`} key={item.label}><b>{item.label}</b><div className="result-actions">{(["合格", "不合格", "不適用"] as Choice[]).map((result) => <button type="button" key={result} className={item.result === result ? `selected ${result === "合格" ? "good" : result === "不合格" ? "bad" : "na"}` : ""} onClick={() => updateDoorItem(item.label, { result })}>{result}</button>)}</div><button type="button" className="ghost" onClick={() => setExpandedDoorNotes((current) => current.includes(item.label) ? current.filter((label) => label !== item.label) : [...current, item.label])}>{expandedDoorNotes.includes(item.label) ? "－ 收起備註／原因" : "＋ 備註／原因"}</button>{expandedDoorNotes.includes(item.label) && <label className="field"><span>備註／原因</span><textarea value={item.note} onChange={(event) => updateDoorItem(item.label, { note: event.target.value })} placeholder={item.result === "不合格" ? "請填寫原因及改善方式" : "可補充現場狀況"} /></label>}<Photos node={`場勘｜${item.label}`} label={`${item.label}照片`} photos={item.photos || []} set={(photos: Photo[]) => updateDoorItem(item.label, { photos })} /></section>)}
         </div>
         <div className="grid3">
-          <label className="field"><span>門檻實際測量（cm）</span><input type="number" min="0" step="0.1" value={door.thresholdCm ?? ""} onChange={(event) => updateDoor({ thresholdCm: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
-          <div className="completion-check"><b>是否達到至少 1.5 cm</b><strong>{doorMeasured ? (Number(door.thresholdCm) >= 1.5 ? "✓ 是" : "✕ 否") : "等待輸入實測值"}</strong></div>
+          <div className="completion-check"><b>門檻是否有 1.5 cm 以上</b><div><button type="button" className={door.meetsThreshold === true ? "selected" : ""} onClick={() => updateDoor({ meetsThreshold: true })}>有 1.5 cm 以上</button><button type="button" className={door.meetsThreshold === false ? "selected" : ""} onClick={() => updateDoor({ meetsThreshold: false })}>沒有 1.5 cm 以上</button></div></div>
           <div className="completion-check"><b>門檻是否有空隙</b><div><button type="button" className={door.hasGap === true ? "selected" : ""} onClick={() => updateDoor({ hasGap: true })}>有空隙</button><button type="button" className={door.hasGap === false ? "selected" : ""} onClick={() => updateDoor({ hasGap: false })}>無空隙</button></div></div>
         </div>
         <label className="field"><span>{doorResult === "合格" && !doorItemsBad ? "判斷依據（選填）" : "為什麼不合格／如何改善（必填）"}</span><textarea value={door.rationale} onChange={(event) => updateDoor({ rationale: event.target.value })} placeholder={doorResult === "合格" && !doorItemsBad ? "正常情況可不填；如有測量可補充數值與現況" : "請說明不合格原因及預計改善方式"} /></label>
         <Field label="門檢查備註" value={door.note} set={(note: string) => updateDoor({ note })} />
         <Photos node="場勘｜門檢查" label="門檢查照片" photos={door.photos || []} set={(photos: Photo[]) => updateDoor({ photos })} />
-        {doorCombinedInvalid && <div className="form-error">請完成門框、門扇、廁所門框與空隙確認；有不合格時必須補充問題說明及照片。</div>}
-        {doorResult === "不合格" && (!door.rationale.trim() || !door.photos?.length) && <div className="form-error">門檢查不合格時，必須說明如何改善並上傳至少 1 張照片。</div>}
-        <div className="form-actions"><button type="button" className="primary" disabled={doorCombinedInvalid} onClick={() => { setSurveyDetail(null); if (doorFlowActive) { setDoorFlowActive(false); setDoorFlowResume((value) => value + 1); } }}>{doorFlowActive ? "下一項：其他異常" : "完成門與門檻檢查"}</button></div>
+        {doorCombinedInvalid && <div className="form-error">請完成門框、門扇、廁所門框、門檻高度與空隙確認；有不合格時必須補充問題說明。</div>}
+        {doorResult === "不合格" && !door.rationale.trim() && <div className="form-error">門檢查不合格時，必須說明如何改善。</div>}
+        <div className="form-actions"><button type="button" className="ghost" onClick={() => { setSurveyDetail(null); setDoorFlowActive(false); }}>上一項</button><button type="button" className="primary" disabled={doorCombinedInvalid} onClick={() => { setDoorFlowActive(false); setSurveyDetail("silicone"); }}>下一項：矽利康施工</button></div>
       </section></Modal>}
       {surveyDetail === "silicone" && <Modal close={() => setSurveyDetail(null)} title="矽利康施工檢查"><section className="survey-area-panel">
         <div className="panel-head"><div><h3>矽利康施工檢查</h3><p>此項已由驗收移至場勘，確認預定使用的矽利康是否與地板顏色一致。</p></div></div>
@@ -4789,6 +4784,7 @@ function SurveyTab({
         <Field label="矽利康檢查備註" value={silicone.note} set={(note: string) => setS({ ...s, siliconeInspection: { ...silicone, note } })} />
         <Photos node="場勘｜矽利康施工" label="矽利康照片" photos={silicone.photos} set={(photos: Photo[]) => setS({ ...s, siliconeInspection: { ...silicone, photos } })} />
         {siliconeInvalid && <div className="form-error">請選擇矽利康是否與地板同色；選「否」時必須填寫其他顏色。</div>}
+        <div className="form-actions"><button type="button" className="ghost" onClick={() => setSurveyDetail("door")}>上一項：門與門檻</button><button type="button" className="primary" disabled={siliconeInvalid} onClick={() => setSurveyDetail("divider")}>下一項：分隔條</button></div>
       </section></Modal>}
       {surveyDetail === "divider" && <Modal close={() => setSurveyDetail(null)} title="分隔條"><section className="survey-area-panel">
         <div className="panel-head"><div><h3>分隔條</h3><p>確認是否需要分隔條；待確認時可先保存並於之後補充。</p></div></div>
@@ -4797,6 +4793,7 @@ function SurveyTab({
         <Field label="分隔條備註（選填）" value={divider.note} set={(note: string) => setS({ ...s, dividerInspection: { ...divider, note } })} />
         {divider.needed === "是" && <Photos node="場勘｜分隔條" label="分隔條照片" photos={divider.photos} set={(photos: Photo[]) => setS({ ...s, dividerInspection: { ...divider, photos } })} />}
         {dividerInvalid && <div className="form-error">需要分隔條時，必須填寫大於 0 的數量及位置。</div>}
+        <div className="form-actions"><button type="button" className="ghost" onClick={() => setSurveyDetail("silicone")}>上一項：矽利康施工</button><button type="button" className="primary" disabled={dividerInvalid} onClick={() => setSurveyDetail("staging")}>下一項：放料區域</button></div>
       </section></Modal>}
       {surveyDetail === "parking" && <Modal close={() => setSurveyDetail(null)} title="停車"><section className="survey-area-panel">
         <div className="panel-head"><div><h3>停車</h3><p>記錄施工期間可使用的停車數量與位置。</p></div></div>
@@ -4807,6 +4804,7 @@ function SurveyTab({
         <div className="panel-head"><div><h3>放料區域</h3><p>記錄材料放置位置、現場限制與注意事項。</p></div></div>
         <div className="grid3"><Field label="位置" value={stagingArea.location} set={(location: string) => setS({ ...s, stagingArea: { ...stagingArea, location } })} /><Field label="備註" value={stagingArea.note} set={(note: string) => setS({ ...s, stagingArea: { ...stagingArea, note } })} /><Field label="注意事項" value={stagingArea.cautions} set={(cautions: string) => setS({ ...s, stagingArea: { ...stagingArea, cautions } })} /></div>
         <Photos node="場勘｜放料區域" label="放料區域照片" photos={stagingArea.photos} set={(photos: Photo[]) => setS({ ...s, stagingArea: { ...stagingArea, photos } })} />
+        <div className="form-actions"><button type="button" className="ghost" onClick={() => setSurveyDetail("divider")}>上一項：分隔條</button><button type="button" className="primary" onClick={() => { setSurveyDetail(null); setDoorFlowResume((value) => value + 1); }}>下一項：其他異常</button></div>
       </section></Modal>}
       <Checklist
         node="場勘"
@@ -4814,22 +4812,16 @@ function SurveyTab({
         set={(items) => setS({ ...s, items: s.items.map((existing) => items.find((item) => item.label === existing.label) || existing) })}
         showCompleteAll={false}
         onBeforeLast={() => { setDoorFlowActive(true); setSurveyDetail("door"); }}
+        onAfterLast={() => setSurveyDetail("signatures")}
         resumeAtLast={doorFlowResume}
-        beforeLastItem={<button type="button" className={`inspection-tile ${doorCombinedInvalid ? "" : doorCombinedResult === "合格" ? "good" : "bad"}`} onClick={() => { setDoorFlowActive(false); setSurveyDetail("door"); }}><i>{doorCombinedInvalid ? "○" : doorCombinedResult === "合格" ? "✓" : "!"}</i><b>門與門檻</b><small>{doorCombinedInvalid ? "尚未完成" : `${doorCombinedResult} · ${doorMeasured ? `${door.thresholdCm} cm` : "未測量（選填）"}`}</small></button>}
+        beforeLastItem={<><button type="button" className={`inspection-tile ${doorCombinedInvalid ? "" : doorCombinedResult === "合格" ? "good" : "bad"}`} onClick={() => { setDoorFlowActive(false); setSurveyDetail("door"); }}><i>{doorCombinedInvalid ? "○" : doorCombinedResult === "合格" ? "✓" : "!"}</i><b>門與門檻</b><small>{doorCombinedInvalid ? "尚未完成" : `${doorCombinedResult} · ${doorThresholdDisplay}`}</small></button><button type="button" className={`inspection-tile ${siliconeInvalid ? "" : "good"}`} onClick={() => setSurveyDetail("silicone")}><i>{siliconeInvalid ? "○" : "✓"}</i><b>矽利康施工</b><small>{siliconeInvalid ? "尚未完成" : silicone.matchesFloor ? "與地板同色" : `其他顏色：${silicone.otherColor}`}</small></button><button type="button" className={`inspection-tile ${divider.needed === "待確認" ? "" : dividerInvalid ? "bad" : "good"}`} onClick={() => setSurveyDetail("divider")}><i>{divider.needed === "待確認" ? "○" : dividerInvalid ? "!" : "✓"}</i><b>分隔條</b><small>{divider.needed === "待確認" ? "待確認" : divider.needed === "否" ? "不需要" : dividerInvalid ? "資料未完成" : `需要 · ${divider.quantity} 個`}</small></button><button type="button" className={`inspection-tile ${stagingArea.location || stagingArea.note || stagingArea.cautions || stagingArea.photos.length ? "good" : ""}`} onClick={() => setSurveyDetail("staging")}><i>{stagingArea.location || stagingArea.note || stagingArea.cautions || stagingArea.photos.length ? "✓" : "○"}</i><b>放料區域</b><small>{stagingArea.location || "尚未填寫"}</small></button></>}
         extraItems={<>
-          <button type="button" className={`inspection-tile ${siliconeInvalid ? "" : "good"}`} onClick={() => setSurveyDetail("silicone")}><i>{siliconeInvalid ? "○" : "✓"}</i><b>矽利康施工</b><small>{siliconeInvalid ? "尚未完成" : silicone.matchesFloor ? "與地板同色" : `其他顏色：${silicone.otherColor}`}</small></button>
-          <button type="button" className={`inspection-tile ${divider.needed === "待確認" ? "" : dividerInvalid ? "bad" : "good"}`} onClick={() => setSurveyDetail("divider")}><i>{divider.needed === "待確認" ? "○" : dividerInvalid ? "!" : "✓"}</i><b>分隔條</b><small>{divider.needed === "待確認" ? "待確認" : divider.needed === "否" ? "不需要" : dividerInvalid ? "資料未完成" : `需要 · ${divider.quantity} 個`}</small></button>
-          <button type="button" className={`inspection-tile ${stagingArea.location || stagingArea.note || stagingArea.cautions || stagingArea.photos.length ? "good" : ""}`} onClick={() => setSurveyDetail("staging")}><i>{stagingArea.location || stagingArea.note || stagingArea.cautions || stagingArea.photos.length ? "✓" : "○"}</i><b>放料區域</b><small>{stagingArea.location || "尚未填寫"}</small></button>
-          <button type="button" className={`inspection-tile signature-tile ${signaturesInvalid ? "" : "good"}`} onClick={() => setSurveyDetail("signatures")}><i><SignatureIcon /></i><b>場勘簽名</b><small>{surveySignatures.filter((signature) => signature.valid).length} / 2 位已簽名</small><em>查看全部紀錄</em></button>
           <button type="button" className={`inspection-tile parking-tile${parking.count ? " good" : ""}`} onClick={() => setSurveyDetail("parking")}><i><CarIcon /></i><b>停車</b><small>{parking.count ? parking.count === "5台以上" ? parking.count : `${parking.count} 台` : "未記錄"}</small></button>
+          <button type="button" className={`inspection-tile signature-tile ${signaturesInvalid ? "" : "good"}`} onClick={() => setSurveyDetail("signatures")}><i><SignatureIcon /></i><b>場勘簽名</b><small>{surveySignatures.filter((signature) => signature.valid).length} / 2 位已簽名</small><em>查看全部紀錄</em></button>
         </>}
       />
       <div className="grid3">
-        <Field
-          label="場勘人員"
-          value={s.person}
-          set={(person: string) => setS({ ...s, person })}
-        />
+        <div className="field"><span>場勘人員</span><strong>{s.person || "尚未簽名"}</strong></div>
         <Field
           label="備註"
           value={s.note}
@@ -4868,10 +4860,10 @@ function SurveyTab({
       {surveyDetail === "signatures" && <Modal close={() => setSurveyDetail(null)} title="場勘檢查人員簽名"><section className="survey-area-panel">
         <div className="panel-head"><div><h3>場勘檢查人員簽名</h3><p>簽名代表已確認現場條件及本次場勘內容，至少需要 2 位人員簽名；日期與時間由系統自動記錄。</p></div><b>{surveySignatures.filter((signature) => signature.valid).length} / 2</b></div>
         <div className="completion-signatures">
-          {surveySignatures.map((signature, index) => <div className="completion-sign-box" key={`${signature.at}-${index}`}><Signed s={signature} /></div>)}
+          {(["場勘人員", "工班人員"] as const).map((role, index) => <div className="completion-sign-box" key={role}><b>{role}</b>{surveySignatures[index]?.valid ? <><Signed s={surveySignatures[index]} /><button type="button" className="ghost" onClick={() => setSurveySigning(index)}>修改簽名</button></> : <button type="button" className="ghost" disabled={index === 1 && !surveySignatures[0]?.valid} onClick={() => setSurveySigning(index)}>觸控電子簽名</button>}</div>)}
         </div>
-        <button type="button" className="ghost" onClick={() => setSurveySigning(true)}>＋ 新增場勘簽名</button>
         {signaturesInvalid && <div className="form-error">儲存場勘前，至少需要 2 位檢查人員完成簽名。</div>}
+        <div className="form-actions"><button type="button" className="ghost" onClick={() => { setSurveyDetail(null); setDoorFlowResume((value) => value + 1); }}>上一項：其他異常</button><button type="button" className="primary" disabled={signaturesInvalid} onClick={() => setSurveyDetail(null)}>完成／返回場勘總覽</button></div>
       </section></Modal>}
       {incomplete && <div className="form-error">仍有尚未檢查的項目。</div>}
       {invalidBad && (
@@ -4887,7 +4879,13 @@ function SurveyTab({
           }}
         />
       )}
-      {surveySigning && <Sign close={() => setSurveySigning(false)} save={(signature) => { setS({ ...s, surveySignatures: [...surveySignatures, signature] }); setSurveySigning(false); }} />}
+      {surveySigning !== null && <Sign close={() => setSurveySigning(null)} save={(signature) => {
+        if (!signature.valid) return;
+        const nextSignatures = [...surveySignatures];
+        nextSignatures[surveySigning] = signature;
+        setS({ ...s, ...(surveySigning === 0 ? { person: signature.name } : {}), surveySignatures: nextSignatures });
+        setSurveySigning(null);
+      }} />}
       <div className="form-actions">
       <button className="ghost" type="button" disabled={historyMode} onClick={saveDraft}>暫存未完成場勘</button>
       <button
@@ -4911,7 +4909,7 @@ function SurveyTab({
         <RecordConfirmation title="場勘資料" rows={[
           ["案場／戶別", `${project.name}｜${u.building} ${u.floor}-${u.number}`],
           ["預估施工坪數", `${u.estimated} 坪`],
-          ["門檢查", `${door.thresholdCm || "—"} cm｜${doorResult}｜${door.rationale || "—"}`],
+          ["門檢查", `${doorThresholdDisplay}｜${doorResult}｜${door.rationale || "—"}`],
           ["停車", parking.count ? `${parking.count === "5台以上" ? parking.count : `${parking.count} 台`}｜${parking.location || "未填位置"}` : "未記錄（選填）"],
           ["放料區", stagingArea.location || "未填位置"],
           ["矽利康", silicone.matchesFloor === true ? "與地板同色" : `不同色：${silicone.otherColor || "未填"}`],
@@ -5043,7 +5041,6 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
           <p>基本資料會沿用，施工時間由系統自動記錄。</p>
         </div>
       </div>
-      {historyMode && <div className="warning history-view-banner"><span>正在查看最新施工紀錄</span><button className="ghost" type="button" onClick={exitWorkHistory}>結束查看／建立新施工紀錄</button></div>}
       {!canWriteWork && (
         <div className="warning">
           目前狀態不是「可進場／施工中」，請先完成前一節點。
@@ -5060,12 +5057,6 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
           type="number"
           value={w.people}
           set={(people: string) => setW({ ...w, people: Number(people) })}
-        />
-        <Field
-          label="本次施工坪數"
-          type="number"
-          value={w.area}
-          set={(area: string) => setW({ ...w, area: Number(area) })}
         />
         <Field
           label="異常狀況"
@@ -5300,16 +5291,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
           <p>基本資料與施工紀錄會自動帶入；戶別完成以逐項驗收結果為準，四人簽名統一於樓層驗收完成。</p>
         </div>
       </div>
-      {historyMode && <div className="warning">正在查看最新正式驗收／複驗紀錄；檢視期間不會寫入或覆蓋未完成草稿。 <button type="button" className="ghost" onClick={exitAcceptanceHistory}>結束查看／建立新驗收</button></div>}
       {!historyMode && !canWriteAcceptanceLifecycle(u.status, a.recheck) && <div className="warning">目前工程狀態不可建立新的{a.recheck ? "複驗" : "驗收"}；仍可查看既有驗收歷史。</div>}
-      <div className="summary">
-        <span>
-          實際施工坪數<b>{u.works.reduce((s, w) => s + w.area, 0)}</b>
-        </span>
-        <span>
-          施工照片<b>{u.works.reduce((n, w) => n + w.photos.length, 0)} 張</b>
-        </span>
-      </div>
       <Checklist
         className="acceptance-checklist"
         node={a.recheck ? "複驗" : "驗收"}
@@ -6029,7 +6011,10 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
     [shipmentReportDraft, setShipmentReportDraft] = useState<ReportSourceDraft | null>(null),
     [shipmentReportMessage, setShipmentReportMessage] = useState(""),
     ym = `${y}-${m}`,
-    monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter((record) => record.exportDate.startsWith(ym)) : [],
+    monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter((record) => {
+      const shipmentDate = record.shipmentDateText?.trim() || record.exportDate;
+      return shipmentDate.startsWith(ym);
+    }) : [],
     monthlyUnitIds = new Set(monthlyBillingRecords.map((record) => record.unitId)),
     monthlyUnits = p.units.filter((unit) => monthlyUnitIds.has(unit.id)),
     billRecords = monthlyBillingRecords.filter((record) => {
@@ -6501,6 +6486,7 @@ function Checklist({
   extraItems,
   className = "",
   onBeforeLast,
+  onAfterLast,
   resumeAtLast = 0,
   beforeLastItem,
 }: {
@@ -6511,6 +6497,7 @@ function Checklist({
   extraItems?: any;
   className?: string;
   onBeforeLast?: () => void;
+  onAfterLast?: () => void;
   resumeAtLast?: number;
   beforeLastItem?: any;
 }) {
@@ -6708,11 +6695,12 @@ function Checklist({
                 className="primary"
                 onClick={() => {
                   if (onBeforeLast && active === items.length - 2) onBeforeLast();
+                  else if (onAfterLast && active === items.length - 1) onAfterLast();
                   else if (active < items.length - 1) open(active + 1);
                   else setActive(null);
                 }}
               >
-                {active < items.length - 1 ? "下一項" : "完成檢查"}
+                {active < items.length - 1 || onAfterLast ? "下一項" : "完成檢查"}
               </button>
             </div>
           </div>

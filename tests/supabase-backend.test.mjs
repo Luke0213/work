@@ -283,26 +283,40 @@ test("Excel unit import accepts partial rows without importing blanks or duplica
   assert.doesNotMatch(importer, /const valid = rows\.filter/);
 });
 
-test("survey door inspection records measurements, gap, evidence, photos, and Excel fields", async () => {
+test("survey door inspection records threshold choice, gap, evidence, photos, and compatible Excel fields", async () => {
   const page = await read("app/page.tsx");
-  for (const value of ["doorInspection", "thresholdCm", "meetsThreshold", "hasGap", "rationale", "至少 1.5 cm", "判斷依據（選填）", "如何改善", "門檢查照片", "門檢查結果"]) {
+  for (const value of ["doorInspection", "thresholdCm", "meetsThreshold", "hasGap", "rationale", "有 1.5 cm 以上", "沒有 1.5 cm 以上", "判斷依據（選填）", "如何改善", "門檢查照片", "門檢查結果"]) {
     assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
-  assert.match(page, /Number\(door\.thresholdCm\) >= 1\.5/);
+  assert.match(page, /thresholdCm\?: number/);
+  assert.match(page, /meetsThreshold: boolean \| null/);
+  assert.match(page, /門檻實測公分: doorInspection\?\.thresholdCm \?\? ""/);
+  assert.match(page, /doorInspection\?\.meetsThreshold === true \? "是" : doorInspection\?\.meetsThreshold === false \? "否" : ""/);
+  assert.doesNotMatch(page, /Number\(door\.thresholdCm\) >= 1\.5|Number\(door\.thresholdCm\) < 1\.5/);
 });
 
 test("survey uses responsive launchers and one combined door workflow", async () => {
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  const surveyDefaults = page.slice(page.indexOf("const surveyLabels ="), page.indexOf("const acceptLabels ="));
+  const launcherFlow = survey.slice(survey.indexOf("<Checklist"), survey.indexOf("<div className=\"grid3\">", survey.indexOf("<Checklist")));
   for (const value of ["doorSurveyLabels", "門與門檻", "door-combined-checks", "updateDoorItem", "doorCombinedResult"])
     assert.match(page, new RegExp(value));
   assert.match(page, /const doorSurveyLabels = \["門框是否完成", "門扇是否已安裝", "廁所門框狀態"\]/);
-  assert.match(page, /surveyChecklistItems = \[[\s\S]*!doorSurveyLabels\.includes\(item\.label\)[\s\S]*item\.label !== "其他異常"[\s\S]*item\.label === "其他異常"/);
+  assert.doesNotMatch(surveyDefaults, /垃圾是否清除/);
+  assert.match(survey, /surveyChecklistItems = \[[\s\S]*item\.label !== "垃圾是否清除"[\s\S]*item\.label !== "其他異常"[\s\S]*item\.label === "其他異常"/);
+  assert.match(survey, /set=\{\(items\) => setS\(\{ \.\.\.s, items: s\.items\.map\(\(existing\) => items\.find\(\(item\) => item\.label === existing\.label\) \|\| existing\) \}\)\}/);
   assert.match(page, /items=\{surveyChecklistItems\}/);
   assert.match(page, /panel form survey-tab/);
   assert.match(css, /\.survey-tab \.survey-section-grid\{grid-template-columns:repeat\(5,minmax\(0,1fr\)\)/);
   assert.match(css, /@media\(min-width:701px\) and \(max-width:1099px\)/);
   assert.match(css, /\.survey-tab \.survey-section-grid\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
+  assert.match(launcherFlow, /beforeLastItem=\{<>[\s\S]*門與門檻[\s\S]*矽利康施工[\s\S]*分隔條[\s\S]*放料區域[\s\S]*<\/>\}/);
+  assert.match(launcherFlow, /extraItems=\{<>[\s\S]*>停車<[\s\S]*場勘簽名[\s\S]*<\/>\}/);
+  assert.match(launcherFlow, /inspection-tile signature-tile/);
+  assert.doesNotMatch(css, /\.survey-tab \.survey-section-grid \.signature-tile\{grid-column:span 2\}/);
+  assert.match(css, /\.inspection-tile\.signature-tile\{[^}]*border:2px solid[^}]*background:/);
 });
 
 test("project navigation omits survey overview while unit survey remains available", async () => {
@@ -902,12 +916,13 @@ test("unit header shows estimated area and readable status while inspection page
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
   const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
+  const master = page.slice(page.indexOf("function Master("), page.indexOf("function SurveyTab"));
   const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
   const work = page.slice(page.indexOf("function WorkTab"), page.indexOf("function completionDefaults"));
   const accept = page.slice(page.indexOf("function AcceptTab"), page.indexOf("function DefectsTab"));
-  const acceptSummary = accept.slice(accept.indexOf('<div className="summary">'), accept.indexOf("<Checklist"));
   assert.match(unitDetail, /\{unit\.brand\} \{unit\.model\}／\{unit\.colorNo\}/);
-  assert.match(unitDetail, /className="unit-head-estimated"[\s\S]*預估施工坪數[\s\S]*Number\.isFinite\(unit\.estimated\) \? `\$\{unit\.estimated\} 坪` : "—"/);
+  assert.match(unitDetail, /className="unit-head-estimated"[\s\S]*<small>坪數<\/small>[\s\S]*Number\.isFinite\(unit\.estimated\) \? `\$\{unit\.estimated\} 坪` : "—"/);
+  assert.match(master, /<span>坪數<\/span>[\s\S]*value=\{areaValueFromPing\(u\.estimated, estimatedUnit\)\}/);
   assert.match(unitDetail, /className="unit-head-current-status"[\s\S]*目前工程狀態[\s\S]*<Pill s=\{unit\.status\}/);
   assert.match(css, /\.unit-head-estimated,\.unit-head-current-status\{[^}]*display:flex;[^}]*flex-direction:column;[^}]*align-items:flex-start/);
   assert.match(css, /\.unit-head-current-status>small\{[^}]*color:#fff/);
@@ -923,21 +938,81 @@ test("unit header shows estimated area and readable status while inspection page
   assert.match(accept, /className="acceptance-work-date"[\s\S]*<b>施工日期<\/b>[\s\S]*u\.works\.map\(\(w\) => w\.date\)\.join\("、"\) \|\| "—"/);
   assert.ok(accept.indexOf("acceptance-work-date") > accept.indexOf('title="歷次驗收／複驗"'));
   assert.ok(accept.indexOf("acceptance-work-date") < accept.indexOf("驗收開始時間"));
-  assert.doesNotMatch(acceptSummary, /施工日期/);
-  assert.match(acceptSummary, /實際施工坪數[\s\S]*施工照片/);
+  assert.doesNotMatch(survey, /結束查看／建立新場勘|正在查看最新場勘紀錄/);
+  assert.doesNotMatch(work, /結束查看／建立新施工|正在查看最新施工紀錄/);
+  assert.doesNotMatch(accept, /結束查看／建立新驗收|正在查看最新正式驗收／複驗紀錄/);
+  assert.doesNotMatch(accept, /實際施工坪數|施工照片<b>/);
+  assert.doesNotMatch(work, /label="本次施工坪數"[\s\S]*value=\{w\.area\}/);
+  assert.match(work, /area: u\.estimated/);
+});
+
+test("survey door photos are optional while required checks and rationale remain enforced", async () => {
+  const page = await read("app/page.tsx");
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  const validation = survey.slice(survey.indexOf("doorItemsInvalid ="), survey.indexOf("siliconeInvalid ="));
+  const doorModal = survey.slice(survey.indexOf('surveyDetail === "door"'), survey.indexOf('surveyDetail === "silicone"'));
+
+  assert.match(validation, /doorInvalid = \(door\.meetsThreshold === null \|\| door\.meetsThreshold === undefined\) \|\| door\.hasGap === null \|\| \(doorResult === "不合格" && !door\.rationale\.trim\(\)\)/);
+  assert.doesNotMatch(validation.slice(validation.indexOf("doorInvalid =")), /door\.photos/);
+  assert.match(validation, /doorItemEvidenceInvalid = doorItems\.some/);
+  assert.match(doorModal, /<Photos node="場勘｜門檢查" label="門檢查照片" photos=\{door\.photos \|\| \[\]\}/);
+  assert.doesNotMatch(doorModal, /上傳至少 1 張門檻照片|門檢查不合格時[^<]*照片/);
+});
+
+test("survey signature roles preserve shape and only a valid index-zero save syncs person", async () => {
+  const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
+  const surveyType = page.slice(page.indexOf("type Survey ="), page.indexOf("type Work ="));
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  const signaturePanel = survey.slice(survey.indexOf('surveyDetail === "signatures"'), survey.indexOf("{incomplete &&"));
+  const signing = survey.slice(survey.indexOf("{surveySigning !== null"), survey.indexOf('<div className="form-actions">', survey.indexOf("{surveySigning !== null")));
+  const signed = page.slice(page.indexOf("function Signed"), page.indexOf("function Sign("));
+  const personDisplay = survey.slice(survey.indexOf('<div className="grid3">', survey.indexOf("<Checklist")), survey.indexOf("<Photos", survey.indexOf("<Checklist")));
+
+  assert.match(surveyType, /surveySignatures\?: \{ name: string; data: string; at: string; valid: boolean \}\[\]/);
+  assert.match(signaturePanel, /\["場勘人員", "工班人員"\][\s\S]*\.map\(\(role, index\)/);
+  assert.match(signaturePanel, /surveySignatures\[index\]\?\.valid \? <>[\s\S]*<Signed s=\{surveySignatures\[index\]\} \/>[\s\S]*onClick=\{\(\) => setSurveySigning\(index\)\}>修改簽名<\/button><\/>/);
+  assert.match(signaturePanel, /disabled=\{index === 1 && !surveySignatures\[0\]\?\.valid\}[\s\S]*觸控電子簽名/);
+  assert.doesNotMatch(signed, /修改簽名|setSurveySigning/);
+  assert.match(signing, /if \(!signature\.valid\) return/);
+  assert.match(signing, /nextSignatures\[surveySigning\] = signature/);
+  assert.match(signing, /surveySigning === 0 \? \{ person: signature\.name \} : \{\}/);
+  assert.match(signing, /close=\{\(\) => setSurveySigning\(null\)\}/);
+  assert.match(personDisplay, /<div className="field"><span>場勘人員<\/span><strong>\{s\.person \|\| "尚未簽名"\}<\/strong><\/div>/);
+  assert.doesNotMatch(personDisplay, /<Field[\s\S]*label="場勘人員"|set=\{\(person: string\) => setS/);
+  assert.doesNotMatch(css, /\.survey-tab \.survey-section-grid \.signature-tile\{grid-column:span 2\}/);
+  assert.match(css, /\.completion-signatures\{display:grid/);
+  assert.match(css, /\.floor-signature-grid\{display:grid/);
+  assert.doesNotMatch(survey, /person:\s*["'](?:場勘人員|工班人員)["']/);
+  assert.doesNotMatch(survey, /surveySignatures[\s\S]{0,80}(?:backfill|migration)/i);
 });
 
 test("billing screen, receivable Excel, and totals share the selected month records", async () => {
   const page = await read("app/page.tsx");
   for (const value of [
     "monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter",
-    "record.exportDate.startsWith(ym)",
+    "const shipmentDate = record.shipmentDateText?.trim() || record.exportDate",
+    "shipmentDate.startsWith(ym)",
     "shipmentRecords = monthlyBillingRecords",
     "billSubtotal = billRecords.reduce",
     "record.areaPing",
     "record.amount",
   ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(page, /\.filter\(\(record\) => record\.exportDate\.startsWith\(ym\)\)/);
   assert.doesNotMatch(page, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV|月結\.csv/);
+});
+
+test("monthly shipment filtering prefers the formal shipment date and safely falls back", async () => {
+  const page = await read("app/page.tsx");
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
+  const included = (record, ym) => (record.shipmentDateText?.trim() || record.exportDate).startsWith(ym);
+
+  assert.match(billing, /const shipmentDate = record\.shipmentDateText\?\.trim\(\) \|\| record\.exportDate;[\s\S]*return shipmentDate\.startsWith\(ym\)/);
+  assert.equal(included({ shipmentDateText: "2026-08-27", exportDate: "2026-09-01" }, "2026-09"), false);
+  assert.equal(included({ shipmentDateText: "2026-09-02", exportDate: "2026-08-31" }, "2026-09"), true);
+  assert.equal(included({ shipmentDateText: "", exportDate: "2026-09-01" }, "2026-09"), true);
+  assert.equal(included({ shipmentDateText: "   ", exportDate: "2026-09-01" }, "2026-09"), true);
+  assert.equal(included({ exportDate: "2026-09-01" }, "2026-09"), true);
 });
 
 test("electronic acceptance excludes drafts after billing CSV export removal", async () => {
@@ -1066,31 +1141,47 @@ test("IndexedDB photo drafts restore through markers without overriding full loc
   assert.match(survey, /writeLocalDraft\(draftKey\(authUserId, "survey", u\.id\), s, authUserId\)/);
 });
 
-test("survey navigation inserts door inspection before the final other issue item", async () => {
+test("survey required-item navigation continues through special checks and excludes optional parking", async () => {
   const page = await read("app/page.tsx");
   const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
   const checklist = page.slice(page.indexOf("function Checklist"), page.indexOf("function History"));
   assert.match(survey, /onBeforeLast=\{\(\) => \{ setDoorFlowActive\(true\); setSurveyDetail\("door"\); \}\}/);
   assert.match(survey, /resumeAtLast=\{doorFlowResume\}/);
-  assert.match(survey, /下一項：其他異常/);
-  assert.match(survey, /beforeLastItem=\{<button[\s\S]*門與門檻/);
+  assert.match(survey, /onBeforeLast=\{\(\) => \{ setDoorFlowActive\(true\); setSurveyDetail\("door"\); \}\}/);
+  assert.match(survey, /onAfterLast=\{\(\) => setSurveyDetail\("signatures"\)\}/);
+  assert.match(survey, /<button type="button" className="ghost" onClick=\{\(\) => \{ setSurveyDetail\(null\); setDoorFlowActive\(false\); \}\}>上一項<\/button>[\s\S]*下一項：矽利康施工/);
+  assert.match(survey, /beforeLastItem=\{<>[\s\S]*門與門檻/);
   assert.match(checklist, /beforeLastItem && i === items\.length - 1/);
   assert.match(checklist, /if \(onBeforeLast && active === items\.length - 2\) onBeforeLast\(\)/);
+  assert.match(checklist, /else if \(onAfterLast && active === items\.length - 1\) onAfterLast\(\)/);
   assert.match(checklist, /if \(resumeAtLast > 0 && items\.length\) open\(items\.length - 1\)/);
   assert.match(checklist, /onClick=\{\(\) => setActive\(Math\.max\(0, active - 1\)\)\}/);
   assert.match(checklist, /else if \(active < items\.length - 1\) open\(active \+ 1\)/);
+  assert.match(survey, /上一項：門與門檻[\s\S]*setSurveyDetail\("divider"\)[\s\S]*下一項：分隔條/);
+  assert.match(survey, /上一項：矽利康施工[\s\S]*setSurveyDetail\("staging"\)[\s\S]*下一項：放料區域/);
+  assert.match(survey, /上一項：分隔條[\s\S]*setDoorFlowResume\(\(value\) => value \+ 1\)[\s\S]*下一項：其他異常/);
+  assert.match(survey, /上一項：其他異常[\s\S]*完成／返回場勘總覽/);
+  assert.doesNotMatch(survey, /(?:上一項|下一項)：停車/);
 });
 
-test("normal door inspection keeps measurement optional while defects require evidence", async () => {
+test("door threshold choices stay required while door photos are optional and old measurements remain compatible", async () => {
   const page = await read("app/page.tsx");
   const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
-  assert.match(survey, /doorThresholdFailed = doorMeasured && Number\(door\.thresholdCm\) < 1\.5/);
-  assert.match(survey, /doorInvalid = door\.hasGap === null \|\| \(doorResult === "不合格" && \(!door\.rationale\.trim\(\) \|\| !door\.photos\?\.length\)\)/);
-  assert.doesNotMatch(survey, /doorInvalid = !doorMeasured/);
+  assert.match(survey, /doorInspection: \{ thresholdCm: undefined, meetsThreshold: null/);
+  assert.match(survey, /doorResult: "合格" \| "不合格" = door\.meetsThreshold === false \|\| door\.hasGap === true \? "不合格" : "合格"/);
+  assert.match(survey, /doorInvalid = \(door\.meetsThreshold === null \|\| door\.meetsThreshold === undefined\) \|\| door\.hasGap === null \|\| \(doorResult === "不合格" && !door\.rationale\.trim\(\)\)/);
+  assert.doesNotMatch(survey, /門檻實際測量（cm）|doorMeasured|doorThresholdFailed/);
+  assert.match(survey, /updateDoor\(\{ meetsThreshold: true \}\)[\s\S]*有 1\.5 cm 以上/);
+  assert.match(survey, /updateDoor\(\{ meetsThreshold: false \}\)[\s\S]*沒有 1\.5 cm 以上/);
+  assert.match(survey, /door\.hasGap === true[\s\S]*updateDoor\(\{ hasGap: true \}\)[\s\S]*updateDoor\(\{ hasGap: false \}\)/);
   assert.match(survey, /doorItemEvidenceInvalid = doorItems\.some\(\(item\) => item\.result === "不合格" && \(!item\.note\.trim\(\) \|\| !item\.photos\?\.length\)\)/);
-  assert.match(survey, /門檢查不合格時，必須說明如何改善並上傳至少 1 張照片/);
-  assert.match(survey, /thresholdCm/);
-  assert.match(survey, /doorInspection: \{ \.\.\.door, meetsThreshold:/);
+  assert.match(survey, /門檢查不合格時，必須說明如何改善。/);
+  assert.doesNotMatch(survey, /上傳至少 1 張門檻照片|門檢查不合格時[^<]*照片/);
+  assert.match(survey, /expandedDoorNotes\.includes\(item\.label\)[\s\S]*<textarea value=\{item\.note\}/);
+  assert.match(survey, /<\/label>\}<Photos node=\{`場勘｜\$\{item\.label\}`\}/);
+  assert.match(survey, /doorInspection: \{ \.\.\.door, result: doorResult \}/);
+  assert.doesNotMatch(survey, /doorInspection: \{ \.\.\.door, meetsThreshold:/);
+  assert.match(survey, /doorThresholdDisplay = Number\.isFinite\(Number\(door\.thresholdCm\)\)/);
   assert.match(survey, /patch\(\{[\s\S]*surveys:/);
 });
 
@@ -1303,6 +1394,7 @@ test("daily and monthly shipment report edits persist only approved formal sourc
     assert.match(save, /queueRecordChange\(authUserId, "accept", updatedUnit\.id, updatedAcceptance, "complete"\)/);
     assert.doesNotMatch(save, /\bstatus\b|defects:|events:|\badd\(|removeDurableDraft|id: id\(\)/);
   }
+  assert.match(page, /function queueRecordChange[\s\S]*queueOfflineWrite\(\{[^}]*payload: record \}\)/);
 
   assert.match(daily, /buildAcceptanceExportRecord\(p, selected\.unit, selected\.acceptance, true\)/);
   assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(financeExportProject\)/);
