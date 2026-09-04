@@ -103,9 +103,10 @@ test("backups are daily with bounded retention instead of running on every save"
   assert.match(fix, /cron\.unschedule/);
 });
 
-test("unit estimated remains the canonical ping area and survey only displays it", async () => {
+test("unit estimated remains the canonical ping area and survey no longer duplicates its header display", async () => {
   const page = await read("app/page.tsx");
   const areaDraftInput = page.slice(page.indexOf("function AreaDraftInput"), page.indexOf("function Tabs"));
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
   assert.match(page, /estimated: areaInputToPing/);
   assert.match(areaDraftInput, /setArea\(convertAreaInput\(value, unit, nextUnit\), nextUnit\)/);
   assert.match(areaDraftInput, /setArea\(event\.target\.value, unit\)/);
@@ -113,8 +114,8 @@ test("unit estimated remains the canonical ping area and survey only displays it
   assert.match(page, /const importedEstimated = importedAreaEntry\(source\)\?\.value \?\? Number\.NaN/);
   assert.match(page, /const estimated = safeImportedEstimated\(importedEstimated\)/);
   assert.match(page, /const estimated = importedAreaToCanonicalPing\(row\.estimated, interpretedAreaUnit\)/);
-  assert.match(page, /survey-estimated-area/);
-  assert.match(page, /沿用戶別主資料，此處僅供查看/);
+  assert.doesNotMatch(survey, /survey-estimated-area/);
+  assert.doesNotMatch(survey, /沿用戶別主資料，此處僅供查看/);
   assert.doesNotMatch(page, /pendingSurvey/);
   assert.doesNotMatch(page, /setS\(\{ \.\.\.s, areaStatus: "known"/);
   assert.match(page, /record\.id === survey\.id/);
@@ -897,16 +898,36 @@ test("offline IndexedDB outbox and acceptance exports are wired", async () => {
   assert.doesNotMatch(page, /帳單 Word|createReceivableDocx|應收帳款明細表\.docx/);
 });
 
-test("unit header omits estimated area and inspection pages omit the six-step guide only", async () => {
+test("unit header shows estimated area and readable status while inspection pages omit the six-step guide only", async () => {
   const page = await read("app/page.tsx");
+  const css = await read("app/globals.css");
   const unitDetail = page.slice(page.indexOf("function UnitDetail("), page.indexOf("function Next("));
+  const survey = page.slice(page.indexOf("function SurveyTab"), page.indexOf("function WorkTab"));
+  const work = page.slice(page.indexOf("function WorkTab"), page.indexOf("function completionDefaults"));
+  const accept = page.slice(page.indexOf("function AcceptTab"), page.indexOf("function DefectsTab"));
+  const acceptSummary = accept.slice(accept.indexOf('<div className="summary">'), accept.indexOf("<Checklist"));
   assert.match(unitDetail, /\{unit\.brand\} \{unit\.model\}／\{unit\.colorNo\}/);
-  assert.doesNotMatch(unitDetail, /預估 \{unit\.estimated\} 坪/);
+  assert.match(unitDetail, /className="unit-head-estimated"[\s\S]*預估施工坪數[\s\S]*Number\.isFinite\(unit\.estimated\) \? `\$\{unit\.estimated\} 坪` : "—"/);
+  assert.match(unitDetail, /className="unit-head-current-status"[\s\S]*目前工程狀態[\s\S]*<Pill s=\{unit\.status\}/);
+  assert.match(css, /\.unit-head-estimated,\.unit-head-current-status\{[^}]*display:flex;[^}]*flex-direction:column;[^}]*align-items:flex-start/);
+  assert.match(css, /\.unit-head-current-status>small\{[^}]*color:#fff/);
   assert.doesNotMatch(page, /InspectionGuide|inspection-guide/);
   for (const value of ["進場條件場勘", "基本資料會沿用至後續所有工程節點。", "施工紀錄", "基本資料會沿用，施工時間由系統自動記錄。", "完工驗收", "基本資料與施工紀錄會自動帶入", "場勘開始時間", "施工紀錄時間", "驗收開始時間"]) assert.match(page, new RegExp(value));
+  assert.equal((survey.match(/<AutoRecord label="場勘開始時間" at=\{s\.startedAt \|\| s\.date\} \/>/g) || []).length, 1);
+  assert.ok(survey.indexOf("場勘開始時間") > survey.indexOf('title="歷次場勘"'));
+  assert.equal((work.match(/<AutoRecord label="施工紀錄時間" at=\{w\.startedAt \|\| w\.date\} \/>/g) || []).length, 1);
+  assert.ok(work.indexOf("施工紀錄時間") > work.indexOf('title="施工歷史（不覆蓋）"'));
+  assert.equal((accept.match(/<AutoRecord label=\{a\.recheck \? "複驗開始時間" : "驗收開始時間"\} at=\{a\.startedAt \|\| a\.date\} \/>/g) || []).length, 1);
+  assert.ok(accept.indexOf("驗收開始時間") > accept.indexOf('title="歷次驗收／複驗"'));
+  assert.match(accept, /複驗開始時間/);
+  assert.match(accept, /className="acceptance-work-date"[\s\S]*<b>施工日期<\/b>[\s\S]*u\.works\.map\(\(w\) => w\.date\)\.join\("、"\) \|\| "—"/);
+  assert.ok(accept.indexOf("acceptance-work-date") > accept.indexOf('title="歷次驗收／複驗"'));
+  assert.ok(accept.indexOf("acceptance-work-date") < accept.indexOf("驗收開始時間"));
+  assert.doesNotMatch(acceptSummary, /施工日期/);
+  assert.match(acceptSummary, /實際施工坪數[\s\S]*施工照片/);
 });
 
-test("billing screen, receivable Excel, totals, and print share the selected month records", async () => {
+test("billing screen, receivable Excel, and totals share the selected month records", async () => {
   const page = await read("app/page.tsx");
   for (const value of [
     "monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter",
@@ -915,7 +936,6 @@ test("billing screen, receivable Excel, totals, and print share the selected mon
     "billSubtotal = billRecords.reduce",
     "record.areaPing",
     "record.amount",
-    "printing-billing",
   ]) assert.match(page, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(page, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV|月結\.csv/);
 });
@@ -1156,22 +1176,25 @@ test("unit and project journals reopen and update the same record without duplic
   assert.doesNotMatch(wordExporter, /正在修改|新增今日日誌|新增驗收日誌/);
 });
 
-test("project daily acceptance view derives final history and reuses shipment workbook", async () => {
+test("daily acceptance keeps formal history without an export entry and billing owns the daily shipment export", async () => {
   const page = await read("app/page.tsx");
+  const dailyAcceptances = await read("lib/daily-acceptances.ts");
   const daily = page.slice(page.indexOf("function DailyAcceptanceView"), page.indexOf("function Dashboard"));
+  const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
   assert.match(page, /\["daily-acceptance", "✓", "今日驗收"\]/);
   assert.match(daily, /buildDailyAcceptanceEntries<Acceptance, Unit>/);
-  assert.match(daily, /dailyExportRecords = records\.map\(\(\{ unit, acceptance \}\) => buildAcceptanceExportRecord\(p, unit, acceptance, true\)\)/);
-  assert.match(daily, /canExportShipment && <button[\s\S]*setShipmentPreview\(true\)/);
-  assert.doesNotMatch(daily, /onClick=\{exportDay\}/);
-  assert.match(daily, /title="當日總細表｜匯出預覽"/);
-  assert.match(daily, /dailyExportRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
+  assert.doesNotMatch(daily, /當日總細表|shipmentPreview|exportDay|createShipmentWorkbook|saveShipmentWorkbook/);
   assert.match(daily, /<ReportMetadataEditor draft=\{reportDraft\}/);
-  assert.match(daily, /disabled=\{shipmentExporting \|\| !dailyExportRecords\.length \|\| !!reportDraft\}/);
-  assert.match(daily, /"確認產生 Excel"/);
-  assert.match(daily, /const workbook = createShipmentWorkbook\(p, dailyExportRecords/);
-  assert.match(daily, /saveShipmentWorkbook\(workbook/);
-  assert.doesNotMatch(daily, /function createDaily.*Workbook/i);
+  for (const label of ["SPC 已出貨明細總表", "當日細總表", "應收帳款 Excel"]) assert.match(billing, new RegExp(label));
+  assert.doesNotMatch(billing.slice(billing.indexOf('<section className="acceptance-exports billing-no-print">'), billing.indexOf("{canManageFinance && <><div className=\"summary\">")), /PDF／列印/);
+  assert.match(billing, /buildDailyAcceptanceEntries\(financeExportProject\.units \|\| \[\]\)\.filter\(\(entry\) => entry\.date === dailyShipmentDate\)/);
+  assert.doesNotMatch(billing, /as unknown(?: as Unit\[\])?/);
+  assert.match(billing, /dailyShipmentEntries\.map\(\(\{ unit, acceptance \}\) => buildAcceptanceExportRecord\(financeExportProject!, unit, acceptance, true\)\)/);
+  assert.match(billing, /createShipmentWorkbook\(financeExportProject, dailyShipmentRecords, dailyShipmentDate\.slice\(0, 7\)\)/);
+  assert.match(billing, /saveShipmentWorkbook\(workbook, `\$\{dailyShipmentDate\}_\$\{financeExportProject\.name\}_當日細總表\.xlsx`\)/);
+  assert.doesNotMatch(page, /(?:function|const)\s+createDaily(?:Shipment)?Workbook/i);
+  assert.match(dailyAcceptances, /id\?: string;[\s\S]*date\?: string;/);
+  assert.match(dailyAcceptances, /acceptance\.draft === true[\s\S]*\|\| !acceptance\.id[\s\S]*\|\| !acceptance\.date[\s\S]*\|\| seen\.has\(acceptance\.id\)[\s\S]*seen\.add\(acceptance\.id\)/);
 });
 
 test("receivable Excel uses a local billRecords preview draft before export", async () => {
@@ -1187,7 +1210,7 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   assert.match(receivableModal, /title="應收帳款 Excel｜匯出預覽"/);
   assert.match(receivableModal, /billRecords\.map\(\(record, index\)/);
   assert.match(receivableModal, /className="export-preview-table receivable-preview-table"/);
-  assert.match(receivableModal, /<th>數量\(坪\)<\/th><th>單價／元<\/th><th>合計<\/th><th>備註<\/th>/);
+  assert.match(receivableModal, /<th>日期<\/th><th>戶別<\/th><th>型號<\/th><th>尺寸cm<\/th><th>數量\(坪\)<\/th><th>單價／元<\/th><th>合計<\/th><th>備註<\/th>/);
   assert.match(receivableModal, /type="number" min="0" step="0\.01" value=\{detail\.quantity\}/);
   assert.match(receivableModal, /label="送貨聯絡人"/);
   assert.match(receivableModal, /實際戶別筆數<b>\{billRecords\.length\}<\/b>/);
@@ -1197,7 +1220,7 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   assert.match(receivableModal, /receivableExporting \? "產生中…" : "確認產生 Excel"/);
   for (const field of ["deliveryContact", "deliveryAddress", "invoiceTrack", "invoiceDate", "receivedAmount", "receivedDate", "preparedBy", "paymentMethod", "deliveryDate", "handler", "supervisor", "accounting"])
     assert.match(receivableModal, new RegExp(`receivableDraft\\.${field}`));
-  for (const field of ["date", "model", "sizeCm", "quantity", "unitPrice", "note"])
+  for (const field of ["date", "unitDisplay", "model", "sizeCm", "quantity", "unitPrice", "note"])
     assert.match(receivableModal, new RegExp(`detail\\.${field}`));
   assert.match(receivableModal, /value=\{detail\.note\}[\s\S]*updateDetail\(\{ note: event\.target\.value \}\)/);
   for (const field of ["bankAccount", "contactPerson", "mobile", "phone", "fax", "address"])
@@ -1205,19 +1228,37 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   assert.doesNotMatch(receivableFlow + receivableModal, /\bpatch\(|queueRecordChange|writeLocalDraft|saveOfflineDraft|localStorage|indexedDB|\bstatus\s*:|events\s*:/i);
 
   assert.match(exports, /const detailCount = records\.length/);
+  assert.match(exports, /export type ReceivableDetailDraft = \{[\s\S]*date: string;[\s\S]*unitDisplay: string;/);
   assert.match(exports, /deliveryAddress: project\.address \|\| ""/);
-  assert.match(exports, /\["日期", "型號", "尺寸cm", "數量\(坪\)", "單價／元", "合計", "備註"\]/);
+  assert.match(exports, /\["日期", "戶別", "型號", "尺寸cm", "數量\(坪\)", "單價／元", "合計", "備註"\]/);
   assert.match(exports, /\["送貨聯絡人：", draft\.deliveryContact/);
   assert.match(exports, /`\$\{project\.name \|\| ""\} SPC`/);
   assert.match(exports, /note: record\.noteText \?\? record\.note/);
   assert.match(exports, /detail\.note/);
-  assert.match(exports, /\["SPC", "", "", "", "", "", ""\]/);
-  assert.match(exports, /`A1:G1`[\s\S]*`A\$\{summaryTitle\}:G\$\{summaryTitle\}`[\s\S]*`A\$\{bankLabelRow\}:G\$\{bankLabelRow\}`/);
-  assert.match(exports, /worksheet\["!cols"\] = \[13, 18, 14, 13, 15, 17, 28\]/);
-  assert.match(exports, /worksheet\["!printArea"\] = `A1:G\$\{addressRow\}`/);
-  assert.match(exports, /col === 3\) cell\.z = "0\.00"/);
+  assert.match(exports, /\["SPC", "", "", "", "", "", "", ""\]/);
+  assert.match(exports, /`A1:H1`[\s\S]*`A\$\{summaryTitle\}:H\$\{summaryTitle\}`[\s\S]*`A\$\{bankLabelRow\}:H\$\{bankLabelRow\}`/);
+  assert.match(exports, /worksheet\["!cols"\] = \[13, 14, 18, 14, 13, 15, 17, 28\]/);
+  assert.match(exports, /worksheet\["!printArea"\] = `A1:H\$\{addressRow\}`/);
+  assert.match(exports, /col === 4\) cell\.z = "0\.00"/);
   assert.doesNotMatch(exports, /Math\.max\(records\.length,\s*10\)/);
-  assert.match(exports, /F\$\{subtotalRow\}-F\$\{taxRow\}/);
+  assert.match(exports, /IF\(OR\(E\$\{row\}=\\"\\",F\$\{row\}=\\"\\"\),0,E\$\{row\}\*F\$\{row\}\)/);
+  assert.match(exports, /SUM\(G\$\{detailStart\}:G\$\{detailEnd\}\)/);
+  assert.match(exports, /ROUND\(G\$\{subtotalRow\}/);
+  assert.match(exports, /G\$\{subtotalRow\}-G\$\{taxRow\}/);
+  assert.match(exports, /date: receivableDate\(record\.shipmentDateText \|\| record\.exportDate\)/);
+  for (const mapping of [
+    /unitDisplay: record\.unitDisplayText \?\? record\.unitDisplay/,
+    /model: record\.productText \?\? record\.model/,
+    /quantity: record\.pingText \?\? \(record\.areaPing > 0 \? String\(record\.areaPing\) : ""\)/,
+    /unitPrice: record\.unitPriceText \?\? \(record\.unitPrice > 0 \? String\(record\.unitPrice\) : ""\)/,
+    /note: record\.noteText \?\? record\.note/,
+  ]) assert.match(exports, mapping);
+  assert.match(exports, /invoiceTrack: records\.find\(\(record\) => record\.outgoingVoOriginal\.trim\(\)\)/);
+  assert.match(exports, /invoiceDate: records\.find\(\(record\) => record\.outgoingVoOriginalDate\.trim\(\)\)/);
+  assert.doesNotMatch(exports, /invoiceTrack:[^\n]*incomingVoOriginal|invoiceDate:[^\n]*incomingVoOriginal/);
+  assert.match(exports, /export type AcceptanceReportMetadata = \{[\s\S]*outgoingVoOriginalDate\?: string;/);
+  assert.match(exports, /outgoingVoOriginalDate: report\?\.outgoingVoOriginalDate \|\| ""/);
+  assert.match(exports, /\[record\.outgoingVoOriginal, record\.outgoingVoOriginalDate\]\.filter\(Boolean\)\.join\("\\n"\)/);
   for (const field of ["bankAccount", "contactPerson", "mobile", "phone", "fax", "address"])
     assert.match(exports, new RegExp(`companyReportConfig\\.${field}`));
   assert.match(css, /\.receivable-preview-table input\{[^}]*width:100%[^}]*max-width:150px[^}]*border:1px solid[^}]*border-radius:[^;]+;[^}]*background:#fff[^}]*padding:/);
@@ -1239,7 +1280,7 @@ test("daily and monthly shipment report edits persist only approved formal sourc
   const textFields = [
     "shipmentDateText", "sequenceText", "customerNameText", "productText", "unitDisplayText", "squareMetersText",
     "pingText", "unitPriceText", "amountText", "vendorText", "purchasePriceText", "noteText",
-    "incomingVoOriginal", "incomingVoCopy", "outgoingVoOriginal", "outgoingVoCopy", "submitted", "vendorInvoice",
+    "incomingVoOriginal", "incomingVoCopy", "outgoingVoOriginal", "outgoingVoOriginalDate", "outgoingVoCopy", "submitted", "vendorInvoice",
     "tier", "payable", "profitPercent", "profit",
   ];
   for (const field of [
@@ -1251,7 +1292,8 @@ test("daily and monthly shipment report edits persist only approved formal sourc
   for (const field of textFields) assert.match(editor, new RegExp(`value=\\{draft\\.${field}\\}`));
   assert.match(editor, /checked=\{draft\.signedOriginal\}/);
   assert.match(editor, /checked=\{draft\.signedCopy\}/);
-  assert.doesNotMatch(editor, /type="(?:number|date)"/);
+  assert.doesNotMatch(editor, /type="number"/);
+  assert.match(editor, /label="銷VO正日期" type="date" value=\{draft\.outgoingVoOriginalDate\}/);
   assert.doesNotMatch(sourceUpdate, /\bstatus\b|defects|events|\badd\(|removeDurableDraft|id: id\(\)|model: draft|colorNo: draft|brand: draft|rate:|area: draft|note: draft/);
 
   for (const save of [dailySave, shipmentSave]) {
@@ -1262,9 +1304,11 @@ test("daily and monthly shipment report edits persist only approved formal sourc
     assert.doesNotMatch(save, /\bstatus\b|defects:|events:|\badd\(|removeDurableDraft|id: id\(\)/);
   }
 
-  assert.match(daily, /buildAcceptanceExportRecord\(p, unit, acceptance, true\)/);
+  assert.match(daily, /buildAcceptanceExportRecord\(p, selected\.unit, selected\.acceptance, true\)/);
   assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(financeExportProject\)/);
   assert.equal((page.match(/<ReportMetadataEditor draft=/g) || []).length, 3);
+  assert.match(exports, /const headers = \["出貨日期", "序號", "客戶名稱", "商品", "戶別", "m²", "片／件\\n\*0\.3025", "單價／元", "合計", "廠商", "進價／元", "備註", "簽單正", "簽單影", "進VO正", "進VO影", "銷VO正", "銷VO影", "送單", "廠商帳單", "級距", "應付", "利潤%", "利潤"\]/);
+  assert.doesNotMatch(exports, /const headers = \[[^\]]*銷VO正日期/);
   assert.doesNotMatch(shipmentOpen, /\bpatch\(|queueRecordChange|updateReportSource/);
   assert.match(daily, /onClick=\{\(\) => \{ setSelected\(entry\); setReportDraft\(null\); setReportMessage\(""\); \}\}/);
   assert.match(daily, /onClick=\{\(\) => \{ setReportDraft\(null\); setReportMessage\(""\); \}\}>取消修改/);
@@ -1347,6 +1391,8 @@ test("floor batch acceptance export keeps unit-scoped drafts, signatures, and on
   assert.doesNotMatch(batch, /resolveUnitSignatures|resolveFloorSignatures|floorRecord|舊簽名資料不一致/);
   assert.match(batch, /還原此戶自動資料/);
   assert.match(batch, /className="floor-batch-export-editor-grid"/);
+  assert.match(batch, /<span>部門別<\/span><input value="派工部" readOnly/);
+  assert.doesNotMatch(batch, /\['department','部門別'\]/);
   assert.doesNotMatch(batch, /className="grid3"/);
   assert.match(batch, /printWithLifecycleCleanup\("printing-completion-batch"\)/);
   assert.match(batch, /completionCopyLabels\.map\(\(copy\) => <CompletionCopy/);
@@ -1367,6 +1413,14 @@ test("completion export confirmation edits one temporary draft shared by all thr
   const report = page.slice(page.indexOf("type CompletionExportDraft"), page.indexOf("function Timeline"));
   const css = await read("app/globals.css");
   assert.match(report, /buildCompletionExportDraft\(project, unit, acceptance, completion\)/);
+  assert.match(report, /department: "派工部"/);
+  assert.doesNotMatch(report, /department: completion\.department/);
+  assert.equal((report.match(/<span>部門別<\/span><input value="派工部" readOnly/g) || []).length, 1);
+  assert.doesNotMatch(report, /\['department','部門別'\]/);
+  assert.match(report, /<td colSpan=\{2\}>\{draft\.department\}<\/td>/);
+  assert.doesNotMatch(report.slice(report.indexOf("function CompletionCopy")), /<td colSpan=\{2\}>派工部<\/td>/);
+  assert.match(page, /function completionDefaults[\s\S]*department: a\.completion\?\.department \|\| "工程部"/);
+  assert.match(page, /completion: \{\s*department: "工程部"/);
   for (const value of ["project.name", "project.address", "unit.order", "acceptance.area", "unit.estimated", "completion.floorAbnormal", "completion.boardDamaged", "completion.trashCleared"])
     assert.match(report, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(report, /const \[exportDraft, setExportDraft\]/);
@@ -1428,24 +1482,21 @@ test("acceptance editor remounts by unit and rejects stale cross-unit draft rest
   assert.doesNotMatch(acceptance, /cleanupRemovedPhotos|deletePhoto|removePhoto/);
 });
 
-test("shipment preview exposes the company summary fields without changing other exporters", async () => {
+test("billing shipment previews expose the same company summary fields without changing other exporters", async () => {
   const page = await read("app/page.tsx");
-  const daily = page.slice(page.indexOf("function DailyAcceptanceView"), page.indexOf("function Dashboard"));
   const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
-  for (const preview of [daily, billing]) {
-    assert.match(preview, /<thead><tr><th>操作<\/th><th>出貨日期<\/th>/);
-  }
-  assert.match(daily, /<td><button type="button" className="primary" disabled=\{!!reportDraft\} onClick=\{\(\) => startDailyReportEdit\(record, index\)\}>修改<\/button><\/td><td>\{display\.shipmentDateText\}<\/td>/);
+  assert.equal((billing.match(/<thead><tr><th>操作<\/th><th>出貨日期<\/th>/g) || []).length, 2);
   assert.match(billing, /<td><button type="button" className="primary" disabled=\{!!shipmentReportDraft\} onClick=\{\(\) => startShipmentReportEdit\(record, index\)\}>修改<\/button><\/td><td>\{display\.shipmentDateText\}<\/td>/);
   assert.match(billing, /shipmentRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
+  assert.match(billing, /dailyShipmentRecords\.map\(\(record, index\) => \{ const display = shipmentDisplayValues\(record, index\)/);
   for (const field of [
     "shipmentDateText", "sequenceText", "customerNameText", "productText", "unitDisplayText", "squareMetersText",
     "pingText", "unitPriceText", "amountText", "vendorText", "purchasePriceText", "noteText",
     "signedOriginal", "signedCopy", "incomingVoOriginal", "incomingVoCopy", "outgoingVoOriginal", "outgoingVoCopy",
     "submitted", "vendorInvoice", "tier", "payable", "profitPercent", "profit",
-  ]) for (const preview of [daily, billing]) assert.match(preview, new RegExp(`display\\.${field}`));
+  ]) assert.ok((billing.match(new RegExp(`display\\.${field}`, "g")) || []).length >= 2);
   for (const heading of ["出貨日期", "序號", "客戶名稱", "商品", "戶別", "m²", "片／件 *0.3025", "單價／元", "合計", "廠商", "進價／元", "備註", "簽單正", "簽單影", "進VO正", "進VO影", "銷VO正", "銷VO影", "送單", "廠商帳單", "級距", "應付", "利潤%", "利潤"])
-    for (const preview of [daily, billing]) assert.match(preview, new RegExp(`<th>${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}<\\/th>`));
+    assert.ok((billing.match(new RegExp(`<th>${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}<\\/th>`, "g")) || []).length >= 2);
   assert.match(billing, /<ReportMetadataEditor draft=\{shipmentReportDraft\}/);
 });
 

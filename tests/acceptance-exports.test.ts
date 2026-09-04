@@ -23,7 +23,7 @@ const project = {
 };
 const emptyReportFields = {
   signedOriginal: false, signedCopy: false, incomingVoOriginal: "", incomingVoCopy: "",
-  outgoingVoOriginal: "", outgoingVoCopy: "", submitted: "", vendorInvoice: "", tier: "",
+  outgoingVoOriginal: "", outgoingVoOriginalDate: "", outgoingVoCopy: "", submitted: "", vendorInvoice: "", tier: "",
   payable: "", profitPercent: "", profit: "",
 };
 
@@ -80,23 +80,27 @@ test("receivable workbook uses exactly one detail row and safe Excel formulas", 
   assert.equal(sheet.A2.v, "神銀建材 應收帳款明細表");
   assert.equal(sheet.A3.v, "送貨聯絡人：");
   assert.equal(sheet.A6.v, "日期");
-  assert.equal(sheet.B6.v, "型號");
-  assert.equal(sheet.C6.v, "尺寸cm");
-  assert.equal(sheet.D6.v, "數量(坪)");
-  assert.equal(sheet.E6.v, "單價／元");
-  assert.equal(sheet.F6.v, "合計");
-  assert.equal(sheet.G6.v, "備註");
-  assert.equal(sheet.C7.v, "");
+  assert.equal(sheet.B6.v, "戶別");
+  assert.equal(sheet.C6.v, "型號");
+  assert.equal(sheet.D6.v, "尺寸cm");
+  assert.equal(sheet.E6.v, "數量(坪)");
+  assert.equal(sheet.F6.v, "單價／元");
+  assert.equal(sheet.G6.v, "合計");
+  assert.equal(sheet.H6.v, "備註");
+  assert.equal(sheet.A7.v, "115.04.30");
+  assert.equal(sheet.B7.v, "A棟 15樓 A15-5");
+  assert.equal(sheet.C7.v, "Y5006");
   assert.equal(sheet.D7.v, "");
-  assert.equal(sheet.D7.z, "0.00");
-  assert.equal(sheet.E7.v, 2750);
-  assert.equal(sheet.F7.f, 'IF(OR(D7="",E7=""),0,D7*E7)');
-  assert.equal(sheet.G7.v, "完成");
+  assert.equal(sheet.E7.v, 12.69);
+  assert.equal(sheet.E7.z, "0.00");
+  assert.equal(sheet.F7.v, 2750);
+  assert.equal(sheet.G7.f, 'IF(OR(E7="",F7=""),0,E7*F7)');
+  assert.equal(sheet.H7.v, "完成");
   assert.equal(sheet.A8.v, "");
   assert.equal(sheet.A9.v, "SPC");
-  assert.equal(sheet.F11.f, "SUM(F7:F7)");
-  assert.equal(sheet.F12.f, "ROUND(F11*5%,0)");
-  assert.equal(sheet.F13.f, "F11-F12");
+  assert.equal(sheet.G11.f, "SUM(G7:G7)");
+  assert.equal(sheet.G12.f, "ROUND(G11*5%,0)");
+  assert.equal(sheet.G13.f, "G11-G12");
   assert.equal(sheet.A14.v, "發票字軌：");
   assert.equal(sheet.A19.v, "匯款帳號如下：");
   assert.equal(sheet.A20.v, "永豐銀行 龍江分行 戶名:神銀建材資訊有限公司 帳號:148-018-0005023-3");
@@ -104,9 +108,9 @@ test("receivable workbook uses exactly one detail row and safe Excel formulas", 
   assert.equal(sheet.A22.v, "傳真: (02)2587-3028 地址: 臺北市中山區建國北路3段92號3樓");
   assert.equal((sheet as unknown as { "!rows": Array<{ hpt: number }> })["!rows"][18].hpt, 32);
   assert.equal((sheet as unknown as { "!rows": Array<{ hpt: number }> })["!rows"][21].hpt, 32);
-  assert.equal(sheet["!printArea"], "A1:G22");
-  assert.deepEqual((sheet as any)["!cols"].map((column: { wch: number }) => column.wch), [13, 18, 14, 13, 15, 17, 28]);
-  assert.ok((sheet as any)["!merges"].some((range: { s: { r: number; c: number }; e: { r: number; c: number } }) => range.s.r === 0 && range.s.c === 0 && range.e.r === 0 && range.e.c === 6));
+  assert.equal(sheet["!printArea"], "A1:H22");
+  assert.deepEqual((sheet as any)["!cols"].map((column: { wch: number }) => column.wch), [13, 14, 18, 14, 13, 15, 17, 28]);
+  assert.ok((sheet as any)["!merges"].some((range: { s: { r: number; c: number }; e: { r: number; c: number } }) => range.s.r === 0 && range.s.c === 0 && range.e.r === 0 && range.e.c === 7));
   assert.equal((sheet as any)["!pageSetup"].fitToHeight, 0);
   assert.doesNotMatch(JSON.stringify(workbook), /#REF!|#VALUE!|#DIV\/0!|#NAME\?/);
 });
@@ -118,12 +122,12 @@ test("receivable workbook uses six actual detail rows before its summary", () =>
     Sheets: Record<string, Record<string, { f?: string; v?: string | number }>>;
   };
   const sheet = workbook.Sheets["應收帳款明細表"];
-  assert.equal(sheet.F12.f, 'IF(OR(D12="",E12=""),0,D12*E12)');
+  assert.equal(sheet.G12.f, 'IF(OR(E12="",F12=""),0,E12*F12)');
   assert.equal(sheet.A13.v, "");
   assert.equal(sheet.A14.v, "SPC");
-  assert.equal(sheet.F16.f, "SUM(F7:F12)");
-  assert.equal(sheet.F17.f, "ROUND(F16*5%,0)");
-  assert.equal(sheet.F18.f, "F16-F17");
+  assert.equal(sheet.G16.f, "SUM(G7:G12)");
+  assert.equal(sheet.G17.f, "ROUND(G16*5%,0)");
+  assert.equal(sheet.G18.f, "G16-G17");
 });
 
 test("receivable workbook expands to twelve actual detail rows", () => {
@@ -133,20 +137,21 @@ test("receivable workbook expands to twelve actual detail rows", () => {
     Sheets: Record<string, Record<string, { f?: string; v?: string | number }>>;
   };
   const sheet = workbook.Sheets["應收帳款明細表"];
-  assert.equal(sheet.F18.f, 'IF(OR(D18="",E18=""),0,D18*E18)');
+  assert.equal(sheet.G18.f, 'IF(OR(E18="",F18=""),0,E18*F18)');
   assert.equal(sheet.A19.v, "");
   assert.equal(sheet.A20.v, "SPC");
-  assert.equal(sheet.F22.f, "SUM(F7:F18)");
-  assert.equal(sheet.F23.f, "ROUND(F22*5%,0)");
-  assert.equal(sheet.F24.f, "F22-F23");
-  assert.equal(sheet["!printArea"], "A1:G33");
+  assert.equal(sheet.G22.f, "SUM(G7:G18)");
+  assert.equal(sheet.G23.f, "ROUND(G22*5%,0)");
+  assert.equal(sheet.G24.f, "G22-G23");
+  assert.equal(sheet["!printArea"], "A1:H33");
 });
 
 test("receivable export-only draft overrides editable document fields", () => {
   const records = buildAcceptanceExportRecords(project);
   const draft = buildReceivableExportDraft(project, records);
   assert.equal(draft.deliveryAddress, project.address);
-  draft.details[0] = { date: "115.08.31", model: "手動型號", sizeCm: "18x122", quantity: "15.40", unitPrice: "3200", note: "本次匯出備註" };
+  assert.equal(draft.details[0].unitDisplay, "A棟 15樓 A15-5");
+  draft.details[0] = { date: "115.08.31", unitDisplay: "", model: "手動型號", sizeCm: "18x122", quantity: "15.40", unitPrice: "3200", note: "本次匯出備註" };
   Object.assign(draft, {
     deliveryContact: "林主任", deliveryAddress: "台北市測試地址", invoiceTrack: "AB12345678", invoiceDate: "115.09.01",
     receivedAmount: "1000", receivedDate: "115.09.02", preparedBy: "小王", paymentMethod: "匯款",
@@ -159,10 +164,10 @@ test("receivable export-only draft overrides editable document fields", () => {
   assert.deepEqual(receivableDraftTotals(draft), { subtotal: 49280, tax: 2464, receivable: 46816 });
   assert.equal(sheet.B3.v, "林主任");
   assert.equal(sheet.B4.v, "台北市測試地址");
-  assert.deepEqual([sheet.A7.v, sheet.B7.v, sheet.C7.v, sheet.D7.v, sheet.E7.v], ["115.08.31", "手動型號", "18x122", 15.4, 3200]);
-  assert.equal(sheet.D7.z, "0.00");
-  assert.equal(sheet.F7.f, 'IF(OR(D7="",E7=""),0,D7*E7)');
-  assert.equal(sheet.G7.v, "本次匯出備註");
+  assert.deepEqual([sheet.A7.v, sheet.B7.v, sheet.C7.v, sheet.D7.v, sheet.E7.v, sheet.F7.v], ["115.08.31", "", "手動型號", "18x122", 15.4, 3200]);
+  assert.equal(sheet.E7.z, "0.00");
+  assert.equal(sheet.G7.f, 'IF(OR(E7="",F7=""),0,E7*F7)');
+  assert.equal(sheet.H7.v, "本次匯出備註");
   assert.equal(sheet.A14.v, "發票字軌：AB12345678");
   assert.equal(sheet.C14.v, "發票日期：115.09.01");
   assert.equal(sheet.A15.v, "已收款金額：1000");

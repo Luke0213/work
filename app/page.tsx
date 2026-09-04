@@ -2044,7 +2044,7 @@ function ProjectArea({
         <Dashboard p={project} setView={setView} permissions={permissions} />
       )}{" "}
       {safeView === "units" && <Units p={project} patch={patch} open={open} openFloor={openFloor} canEditExisting={canEditUnitMaster(role, permissions)} canCreate={canCreateUnit(role)} canAccept={canUseUnitTab(role, permissions, "accept")} />}{" "}
-      {safeView === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} canExportShipment={financeAccess.canExportShipment} canManageFinance={financeAccess.canManageFinance} />}{" "}
+      {safeView === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} canManageFinance={financeAccess.canManageFinance} />}{" "}
       {safeView === "products" && <Products p={project} patch={patch} />}{" "}
       {safeView === "journal" && <Journal p={project} patch={patch} />}{" "}
       {safeView === "billing" && <Billing p={project} patch={patch} financeAccess={financeAccess} />}{" "}
@@ -2072,6 +2072,7 @@ type ReportSourceDraft = {
   incomingVoOriginal: string;
   incomingVoCopy: string;
   outgoingVoOriginal: string;
+  outgoingVoOriginalDate: string;
   outgoingVoCopy: string;
   submitted: string;
   vendorInvoice: string;
@@ -2101,7 +2102,7 @@ const updateReportSource = (unit: Unit, draft: ReportSourceDraft): Unit => ({
         vendorText: draft.vendorText, purchasePriceText: draft.purchasePriceText, noteText: draft.noteText,
         signedOriginal: draft.signedOriginal, signedCopy: draft.signedCopy,
         incomingVoOriginal: draft.incomingVoOriginal, incomingVoCopy: draft.incomingVoCopy,
-        outgoingVoOriginal: draft.outgoingVoOriginal, outgoingVoCopy: draft.outgoingVoCopy,
+        outgoingVoOriginal: draft.outgoingVoOriginal, outgoingVoOriginalDate: draft.outgoingVoOriginalDate, outgoingVoCopy: draft.outgoingVoCopy,
         submitted: draft.submitted, vendorInvoice: draft.vendorInvoice, tier: draft.tier,
         payable: draft.payable, profitPercent: draft.profitPercent, profit: draft.profit,
       } }
@@ -2129,6 +2130,7 @@ function ReportMetadataEditor({ draft, setDraft }: { draft: ReportSourceDraft; s
     <Field label="進VO正" value={draft.incomingVoOriginal} set={(incomingVoOriginal: string) => setDraft({ ...draft, incomingVoOriginal })} />
     <Field label="進VO影" value={draft.incomingVoCopy} set={(incomingVoCopy: string) => setDraft({ ...draft, incomingVoCopy })} />
     <Field label="銷VO正" value={draft.outgoingVoOriginal} set={(outgoingVoOriginal: string) => setDraft({ ...draft, outgoingVoOriginal })} />
+    <Field label="銷VO正日期" type="date" value={draft.outgoingVoOriginalDate} set={(outgoingVoOriginalDate: string) => setDraft({ ...draft, outgoingVoOriginalDate })} />
     <Field label="銷VO影" value={draft.outgoingVoCopy} set={(outgoingVoCopy: string) => setDraft({ ...draft, outgoingVoCopy })} />
     <Field label="送單" value={draft.submitted} set={(submitted: string) => setDraft({ ...draft, submitted })} />
     <Field label="廠商帳單" value={draft.vendorInvoice} set={(vendorInvoice: string) => setDraft({ ...draft, vendorInvoice })} />
@@ -2139,7 +2141,7 @@ function ReportMetadataEditor({ draft, setDraft }: { draft: ReportSourceDraft; s
   </div></>;
 }
 
-function DailyAcceptanceView({ p, patch, canExportShipment, canManageFinance }: { p: Project; patch: (x: Partial<Project>) => void; canExportShipment: boolean; canManageFinance: boolean }) {
+function DailyAcceptanceView({ p, patch, canManageFinance }: { p: Project; patch: (x: Partial<Project>) => void; canManageFinance: boolean }) {
   const authUserId = useAuthOwner();
   const entries = useMemo(() => buildDailyAcceptanceEntries<Acceptance, Unit>(p.units), [p.units]);
   const dates = [...new Set(entries.map((entry) => entry.date))];
@@ -2150,22 +2152,7 @@ function DailyAcceptanceView({ p, patch, canExportShipment, canManageFinance }: 
   const [selected, setSelected] = useState<(typeof entries)[number] | null>(null);
   const [reportDraft, setReportDraft] = useState<ReportSourceDraft | null>(null);
   const [reportMessage, setReportMessage] = useState("");
-  const [shipmentPreview, setShipmentPreview] = useState(false);
-  const [shipmentExporting, setShipmentExporting] = useState(false);
   const records = entries.filter((entry) => entry.date === selectedDate);
-  const dailyExportRecords = records.map(({ unit, acceptance }) => buildAcceptanceExportRecord(p, unit, acceptance, true));
-  const exportDay = () => {
-    if (!canExportShipment) return;
-    const workbook = createShipmentWorkbook(p, dailyExportRecords, selectedDate.slice(0, 7));
-    saveShipmentWorkbook(workbook, `${selectedDate}_${p.name}_SPC已出貨明細總表.xlsx`);
-  };
-  const startDailyReportEdit = (record: AcceptanceExportRecord, index: number) => {
-    if (!canManageFinance) return;
-    const entry = records[index];
-    if (!entry || entry.unit.id !== record.unitId) return setReportMessage("找不到原正式驗收紀錄，未開啟修改");
-    setReportDraft(reportSourceDraftFor(record, index, entry.unit, entry.acceptance));
-    setReportMessage("");
-  };
   const saveReportSource = () => {
     if (!canManageFinance) return;
     if (!reportDraft) return;
@@ -2185,7 +2172,6 @@ function DailyAcceptanceView({ p, patch, canExportShipment, canManageFinance }: 
       <section className="panel">
         <div className="panel-head">
           <div><p className="eyebrow">案場正式驗收紀錄</p><h2>今日驗收</h2><p>依驗收／複驗紀錄本身的日期顯示，不含草稿。</p></div>
-          {canExportShipment && <button className="primary" disabled={!records.length || !!reportDraft} onClick={() => { if (!canExportShipment) return; setShipmentPreview(true); setReportMessage(""); }}>{reportDraft ? "請先保存或取消修改" : "當日總細表"}</button>}
         </div>
         <div className="daily-acceptance-summary">
           <label className="field"><span>日期</span><input type="date" value={selectedDate} onChange={(event) => reportDraft ? setReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換日期。") : setSelectedDate(event.target.value)} /></label>
@@ -2228,15 +2214,6 @@ function DailyAcceptanceView({ p, patch, canExportShipment, canManageFinance }: 
           {reportMessage && <div className="form-error">{reportMessage}</div>}
           <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div>
         </div>}
-      </Modal>}
-      {canExportShipment && shipmentPreview && <Modal close={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }} title="當日總細表｜匯出預覽">
-        <div className={`form export-preview shipment-export-preview ${canManageFinance ? "" : "finance-readonly"}`}>
-          <div className="export-summary"><span>日期<b>{selectedDate}</b></span><span>案場<b>{p.name}</b></span><span>正式驗收筆數<b>{dailyExportRecords.length}</b></span></div>
-          <div className="export-preview-table"><table><thead><tr><th>操作</th><th>出貨日期</th><th>序號</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th><th>簽單正</th><th>簽單影</th><th>進VO正</th><th>進VO影</th><th>銷VO正</th><th>銷VO影</th><th>送單</th><th>廠商帳單</th><th>級距</th><th>應付</th><th>利潤%</th><th>利潤</th></tr></thead><tbody>{dailyExportRecords.map((record, index) => { const display = shipmentDisplayValues(record, index); return <tr key={`${record.unitId}-${index}`}><td><button type="button" className="primary" disabled={!!reportDraft} onClick={() => startDailyReportEdit(record, index)}>修改</button></td><td>{display.shipmentDateText}</td><td>{display.sequenceText}</td><td>{display.customerNameText}</td><td>{display.productText}</td><td>{display.unitDisplayText}</td><td>{display.squareMetersText}</td><td>{display.pingText}</td><td>{display.unitPriceText}</td><td>{display.amountText}</td><td>{display.vendorText}</td><td>{display.purchasePriceText}</td><td>{display.noteText}</td><td>{display.signedOriginal ? "✓" : ""}</td><td>{display.signedCopy ? "✓" : ""}</td><td>{display.incomingVoOriginal}</td><td>{display.incomingVoCopy}</td><td>{display.outgoingVoOriginal}</td><td>{display.outgoingVoCopy}</td><td>{display.submitted}</td><td>{display.vendorInvoice}</td><td>{display.tier}</td><td>{display.payable}</td><td>{display.profitPercent}</td><td>{display.profit}</td></tr>; })}</tbody></table></div>
-          {canManageFinance && reportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；請先保存或取消後再產生 Excel。</div><ReportMetadataEditor draft={reportDraft} setDraft={setReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setReportDraft(null); setReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveReportSource}>確認保存正式來源</button></div></section>}
-          {reportMessage && <div className={reportMessage.startsWith("✓") ? "save-success" : "form-error"}>{reportMessage}</div>}
-          <div className="form-actions"><button type="button" className="ghost" onClick={() => { if (reportDraft) return setReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setReportMessage(""); }}>返回</button><button type="button" className="primary" disabled={shipmentExporting || !dailyExportRecords.length || !!reportDraft} onClick={async () => { setShipmentExporting(true); try { exportDay(); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : reportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
-        </div>
       </Modal>}
     </div>
   );
@@ -4157,7 +4134,8 @@ function FloorBatchExport({ project, units, context, close }: { project: Project
           <div className="floor-batch-unit-selector" aria-label="批次匯出戶別切換">{selectedUnits.map((unit, index) => <button className={unit.id === currentUnit.id ? "current" : ""} key={unit.id} onClick={() => setCurrentUnitId(unit.id)}>{unit.number || "未命名"}<small>{index + 1}/{selectedUnits.length}</small></button>)}</div>
           <div className="panel-head"><div><p className="eyebrow">準備匯出 {selectedUnits.length} 戶</p><h3>{currentUnit.number || "未命名戶別"}｜文件資料</h3><p>第 {currentIndex + 1} 戶，共 {selectedUnits.length} 戶；修改只影響本次匯出。</p></div><button className="ghost" onClick={() => { const initialized = createUnitExport(currentUnit); setDrafts((record) => ({ ...record, [currentUnit.id]: initialized.draft })); }}>還原此戶自動資料</button></div>
           <div className="floor-batch-export-editor-grid">
-            {([['department','部門別'],['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={currentDraft[key]} set={(value) => setCurrentDraft((draft) => ({ ...draft, [key]: value }))} />)}
+            <label className="field"><span>部門別</span><input value="派工部" readOnly /></label>
+            {([['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={currentDraft[key]} set={(value) => setCurrentDraft((draft) => ({ ...draft, [key]: value }))} />)}
             <CompletionDraftBoolean label="地坪是否異常" value={currentDraft.floorAbnormal} set={(value) => setCurrentDraft((draft) => ({ ...draft, floorAbnormal: value }))} />
             <CompletionDraftBoolean label="現場板材是否損壞" value={currentDraft.boardDamaged} set={(value) => setCurrentDraft((draft) => ({ ...draft, boardDamaged: value }))} />
             <CompletionDraftBoolean label="現場垃圾是否清運完畢" value={currentDraft.trashCleared} set={(value) => setCurrentDraft((draft) => ({ ...draft, trashCleared: value }))} />
@@ -4240,8 +4218,14 @@ function UnitDetail({
           {activity && <small className="muted">最後修改：{activity.updatedByEmail || "未知帳號"} · {new Date(activity.updatedAt).toLocaleString("zh-TW")}</small>}
         </div>
         <div className="unit-head-status">
-          <small>目前工程狀態</small>
-          <Pill s={unit.status} />
+          <div className="unit-head-estimated">
+            <small>預估施工坪數</small>
+            <b>{Number.isFinite(unit.estimated) ? `${unit.estimated} 坪` : "—"}</b>
+          </div>
+          <div className="unit-head-current-status">
+            <small>目前工程狀態</small>
+            <Pill s={unit.status} />
+          </div>
         </div>
       </div>
       <Next unit={unit} setTab={setTab} role={role} permissions={permissions} />
@@ -4781,11 +4765,6 @@ function SurveyTab({
         </div>
       </div>
       {historyMode && <div className="warning history-view-banner"><span>正在查看最新場勘紀錄</span><button className="ghost" type="button" onClick={exitSurveyHistory}>結束查看／建立新場勘</button></div>}
-      <AutoRecord label="場勘開始時間" at={s.startedAt || s.date} />
-      <section className="survey-area-panel survey-estimated-area">
-        <div><h3>預估施工坪數</h3><p>沿用戶別主資料，此處僅供查看。</p></div>
-        <strong>{u.estimated} 坪</strong>
-      </section>
       {surveyDetail === "door" && <Modal close={() => { setSurveyDetail(null); setDoorFlowActive(false); }} title="門與門檻檢查"><section className="survey-area-panel door-inspection-panel">
         <div className="panel-head"><div><h3>門與門檻檢查</h3><p>門框、門扇、廁所門框與門檻集中在同一頁完成；門檻標準至少 1.5 cm 且不可有空隙。</p></div><span className={doorCombinedResult === "合格" ? "status done" : "status danger"}>{doorCombinedInvalid ? "尚未完成" : doorCombinedResult}</span></div>
         <div className="door-combined-checks">
@@ -4948,6 +4927,7 @@ function SurveyTab({
         title="歷次場勘"
         rows={u.surveys.map((x) => ({ a: x.date, b: x.person, c: `${x.draft ? "暫存" : "完成"} · ${x.decision} · 預估 ${u.estimated} 坪`, onOpen: () => { openSurveyRecord(x); setSaved(x.draft ? "已開啟場勘草稿" : "已開啟正式場勘紀錄，可查看或修改後重新儲存"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))}
       />
+      <AutoRecord label="場勘開始時間" at={s.startedAt || s.date} />
     </div>
   );
 }
@@ -5064,7 +5044,6 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
         </div>
       </div>
       {historyMode && <div className="warning history-view-banner"><span>正在查看最新施工紀錄</span><button className="ghost" type="button" onClick={exitWorkHistory}>結束查看／建立新施工紀錄</button></div>}
-      <AutoRecord label="施工紀錄時間" at={w.startedAt || w.date} />
       {!canWriteWork && (
         <div className="warning">
           目前狀態不是「可進場／施工中」，請先完成前一節點。
@@ -5122,6 +5101,7 @@ function WorkTab({ u, patch, add }: { u: Unit; patch: any; add: any }) {
           onOpen: () => { openWorkRecord(x); setSaved(x.draft ? "已開啟施工草稿" : "已開啟正式施工紀錄，可查看或修改"); window.scrollTo({ top: 0, behavior: "smooth" }); },
         }))}
       />
+      <AutoRecord label="施工紀錄時間" at={w.startedAt || w.date} />
     </div>
   );
 }
@@ -5321,14 +5301,10 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         </div>
       </div>
       {historyMode && <div className="warning">正在查看最新正式驗收／複驗紀錄；檢視期間不會寫入或覆蓋未完成草稿。 <button type="button" className="ghost" onClick={exitAcceptanceHistory}>結束查看／建立新驗收</button></div>}
-      <AutoRecord label={a.recheck ? "複驗開始時間" : "驗收開始時間"} at={a.startedAt || a.date} />
       {!historyMode && !canWriteAcceptanceLifecycle(u.status, a.recheck) && <div className="warning">目前工程狀態不可建立新的{a.recheck ? "複驗" : "驗收"}；仍可查看既有驗收歷史。</div>}
       <div className="summary">
         <span>
           實際施工坪數<b>{u.works.reduce((s, w) => s + w.area, 0)}</b>
-        </span>
-        <span>
-          施工日期<b>{u.works.map((w) => w.date).join("、") || "—"}</b>
         </span>
         <span>
           施工照片<b>{u.works.reduce((n, w) => n + w.photos.length, 0)} 張</b>
@@ -5427,6 +5403,11 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
           onOpen: () => openAcceptanceRecord(x),
         }))}
       />
+      <div className="acceptance-work-date">
+        <b>施工日期</b>
+        <span>{u.works.map((w) => w.date).join("、") || "—"}</span>
+      </div>
+      <AutoRecord label={a.recheck ? "複驗開始時間" : "驗收開始時間"} at={a.startedAt || a.date} />
     </div>
   );
 }
@@ -6035,6 +6016,12 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
     [receivableDraft, setReceivableDraft] = useState<ReceivableExportDraft | null>(null),
     [shipmentPreview, setShipmentPreview] = useState(false),
     [shipmentExporting, setShipmentExporting] = useState(false),
+    [dailyShipmentPreview, setDailyShipmentPreview] = useState(false),
+    [dailyShipmentExporting, setDailyShipmentExporting] = useState(false),
+    [dailyShipmentDate, setDailyShipmentDate] = useState(() => {
+      const now = new Date();
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    }),
     [editing, setEditing] = useState(false),
     [billingDrafts, setBillingDrafts] = useState<Record<string, BillingUnitDraft>>({}),
     [saveConfirmation, setSaveConfirmation] = useState(false),
@@ -6054,9 +6041,11 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       return unit ? [{ unit, record }] : [];
     }),
     shipmentRecords = monthlyBillingRecords,
+    dailyShipmentEntries = financeExportProject ? buildDailyAcceptanceEntries(financeExportProject.units || []).filter((entry) => entry.date === dailyShipmentDate) : [],
+    dailyShipmentRecords = dailyShipmentEntries.map(({ unit, acceptance }) => buildAcceptanceExportRecord(financeExportProject!, unit, acceptance, true)),
     billSubtotal = billRecords.reduce((sum, record) => sum + record.amount, 0),
     receivableTotals = receivableDraft ? receivableDraftTotals(receivableDraft) : null,
-    printBilling = () => printWithLifecycleCleanup("printing-billing");
+    dailyShipmentExportReady = shipmentExportReady;
   const safeDraftRate = (value: string | number) => {
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
@@ -6155,6 +6144,21 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       if (!shipmentExportReady || !financeExportProject) return;
       setShipmentPreview(true); setShipmentReportDraft(null); setShipmentReportMessage("");
     },
+    openDailyShipmentPreview = () => {
+      if (!dailyShipmentExportReady || !financeExportProject) return;
+      setDailyShipmentPreview(true); setShipmentReportDraft(null); setShipmentReportMessage("");
+    },
+    startDailyShipmentReportEdit = (record: AcceptanceExportRecord, index: number) => {
+      if (!canManageFinance) return;
+      if (editing) return setShipmentReportMessage("請先保存或取消目前的月結修改，再修改報表資料。");
+      const entry = dailyShipmentEntries[index];
+      if (!entry || entry.unit.id !== record.unitId) return setShipmentReportMessage("找不到原正式驗收紀錄，未開啟修改");
+      const sourceUnit = p.units.find((unit) => unit.id === entry.unit.id);
+      const sourceAcceptance = sourceUnit?.acceptances.find((acceptance) => acceptance.id === entry.acceptance.id && acceptance.draft !== true);
+      if (!sourceUnit || !sourceAcceptance) return setShipmentReportMessage("找不到原正式驗收紀錄，未開啟修改");
+      setShipmentReportDraft(reportSourceDraftFor(record, index, sourceUnit, sourceAcceptance));
+      setShipmentReportMessage("");
+    },
     changeBillingPeriod = (kind: "year" | "month", value: string) => {
       if (editing && billingChanges.length) {
         setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。");
@@ -6196,11 +6200,11 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       {canManageFinance && editing && billingChanges.length > 0 && <div className="warning billing-no-print">目前有尚未保存的月結修改；匯出內容仍以已保存資料為準。</div>}
       {canManageFinance && <div className="billing-print-month">計價月份：{ym}</div>}
       <section className="acceptance-exports billing-no-print">
-        <div className="checklist-head"><div><h3>報表／匯出</h3><small>依目前月份與案場資料預覽、下載或列印報表。</small></div></div>
+        <div className="checklist-head"><div><h3>報表／匯出</h3><small>依月份或指定日期預覽、下載案場報表。</small></div></div>
         <div className="export-cards">
-          {canExportReceivables && <button type="button" disabled={!receivableExportReady || !billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>}
-          {canManageFinance && <button type="button" onClick={printBilling}><i>PDF</i><span><b>PDF／列印</b><small>列印目前月結頁面</small></span><em>列印 ›</em></button>}
           {canExportShipment && <button type="button" disabled={!shipmentExportReady} onClick={openShipmentPreview}><i className="excel">X</i><span><b>SPC 已出貨明細總表</b><small>Excel · 自動帶入驗收與施工資料</small></span><em>預覽 ›</em></button>}
+          {canExportShipment && <button type="button" disabled={!dailyShipmentExportReady} onClick={openDailyShipmentPreview}><i className="excel">X</i><span><b>當日細總表</b><small>Excel · 依正式驗收日期匯出</small></span><em>預覽 ›</em></button>}
+          {canExportReceivables && <button type="button" disabled={!receivableExportReady || !billRecords.length} onClick={openReceivablePreview}><i className="excel">X</i><span><b>應收帳款 Excel</b><small>公司應收帳款明細表 · XLSX</small></span><em>預覽 ›</em></button>}
         </div>
       </section>
       {canManageFinance && <><div className="summary">
@@ -6301,12 +6305,13 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
               <Field label="送貨地址" value={receivableDraft.deliveryAddress} set={(deliveryAddress: string) => setReceivableDraft({ ...receivableDraft, deliveryAddress })} />
             </div>
           </section>
-          <div className="export-preview-table receivable-preview-table"><table><thead><tr><th>日期</th><th>型號</th><th>尺寸cm</th><th>數量(坪)</th><th>單價／元</th><th>合計</th><th>備註</th></tr></thead><tbody>{billRecords.map((record, index) => {
+          <div className="export-preview-table receivable-preview-table"><table><thead><tr><th>日期</th><th>戶別</th><th>型號</th><th>尺寸cm</th><th>數量(坪)</th><th>單價／元</th><th>合計</th><th>備註</th></tr></thead><tbody>{billRecords.map((record, index) => {
             const detail = receivableDraft.details[index];
             const updateDetail = (updates: Partial<typeof detail>) => setReceivableDraft({ ...receivableDraft, details: receivableDraft.details.map((item, detailIndex) => detailIndex === index ? { ...item, ...updates } : item) });
             const amount = Number(detail.quantity) * Number(detail.unitPrice);
             return <tr key={record.unitId}>
               <td><input value={detail.date} onChange={(event) => updateDetail({ date: event.target.value })} /></td>
+              <td><input value={detail.unitDisplay} onChange={(event) => updateDetail({ unitDisplay: event.target.value })} /></td>
               <td><input value={detail.model} onChange={(event) => updateDetail({ model: event.target.value })} /></td>
               <td><input value={detail.sizeCm} onChange={(event) => updateDetail({ sizeCm: event.target.value })} /></td>
               <td><input type="number" min="0" step="0.01" value={detail.quantity} onChange={(event) => updateDetail({ quantity: event.target.value })} /></td>
@@ -6355,6 +6360,17 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
           <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={shipmentExporting || !shipmentRecords.length || !!shipmentReportDraft || !shipmentExportReady} onClick={async () => { if (!shipmentExportReady || !financeExportProject) return; setShipmentExporting(true); try { const workbook = createShipmentWorkbook(financeExportProject, shipmentRecords, ym); saveShipmentWorkbook(workbook, `${ym}_${financeExportProject.name}_SPC已出貨明細總表.xlsx`); } finally { setShipmentExporting(false); } }}>{shipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
+      {canExportShipment && dailyShipmentPreview && <Modal close={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setDailyShipmentPreview(false); setShipmentReportMessage(""); }} title="當日細總表｜匯出預覽">
+        <div className={`form export-preview shipment-export-preview ${canManageFinance ? "" : "finance-readonly"}`}>
+          <Field label="匯出日期" type="date" value={dailyShipmentDate} set={(value) => { if (shipmentReportDraft) return setShipmentReportMessage("目前有尚未保存的報表修改，請先保存或取消後再切換日期。"); setDailyShipmentDate(value); }} />
+          <div className="export-summary"><span>日期<b>{dailyShipmentDate}</b></span><span>案場<b>{financeExportProject?.name || p.name}</b></span><span>正式驗收筆數<b>{dailyShipmentRecords.length}</b></span></div>
+          <div className="export-preview-table"><table><thead><tr><th>操作</th><th>出貨日期</th><th>序號</th><th>客戶名稱</th><th>商品</th><th>戶別</th><th>m²</th><th>片／件 *0.3025</th><th>單價／元</th><th>合計</th><th>廠商</th><th>進價／元</th><th>備註</th><th>簽單正</th><th>簽單影</th><th>進VO正</th><th>進VO影</th><th>銷VO正</th><th>銷VO影</th><th>送單</th><th>廠商帳單</th><th>級距</th><th>應付</th><th>利潤%</th><th>利潤</th></tr></thead><tbody>{dailyShipmentRecords.map((record, index) => { const display = shipmentDisplayValues(record, index); return <tr key={`${record.unitId}-${index}`}><td><button type="button" className="primary" disabled={!!shipmentReportDraft} onClick={() => startDailyShipmentReportEdit(record, index)}>修改</button></td><td>{display.shipmentDateText}</td><td>{display.sequenceText}</td><td>{display.customerNameText}</td><td>{display.productText}</td><td>{display.unitDisplayText}</td><td>{display.squareMetersText}</td><td>{display.pingText}</td><td>{display.unitPriceText}</td><td>{display.amountText}</td><td>{display.vendorText}</td><td>{display.purchasePriceText}</td><td>{display.noteText}</td><td>{display.signedOriginal ? "✓" : ""}</td><td>{display.signedCopy ? "✓" : ""}</td><td>{display.incomingVoOriginal}</td><td>{display.incomingVoCopy}</td><td>{display.outgoingVoOriginal}</td><td>{display.outgoingVoCopy}</td><td>{display.submitted}</td><td>{display.vendorInvoice}</td><td>{display.tier}</td><td>{display.payable}</td><td>{display.profitPercent}</td><td>{display.profit}</td></tr>; })}</tbody></table></div>
+          {!dailyShipmentRecords.length && <div className="form-error">沒有符合該日期的正式驗收資料。</div>}
+          {canManageFinance && shipmentReportDraft && <section className="panel form"><div className="warning">這些修改尚未保存；Excel 仍只會使用正式資料。確認保存後會更新同一戶別及同一筆正式驗收。</div><ReportMetadataEditor draft={shipmentReportDraft} setDraft={setShipmentReportDraft} /><div className="form-actions"><button type="button" className="ghost" onClick={() => { setShipmentReportDraft(null); setShipmentReportMessage(""); }}>取消修改</button><button type="button" className="primary" onClick={saveShipmentReportSource}>確認保存正式來源</button></div></section>}
+          {shipmentReportMessage && <div className={shipmentReportMessage.startsWith("✓") ? "save-success" : "form-error"}>{shipmentReportMessage}</div>}
+          <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setDailyShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={dailyShipmentExporting || !dailyShipmentRecords.length || !!shipmentReportDraft || !dailyShipmentExportReady} onClick={async () => { if (!dailyShipmentExportReady || !financeExportProject) return; setDailyShipmentExporting(true); try { const workbook = createShipmentWorkbook(financeExportProject, dailyShipmentRecords, dailyShipmentDate.slice(0, 7)); saveShipmentWorkbook(workbook, `${dailyShipmentDate}_${financeExportProject.name}_當日細總表.xlsx`); } finally { setDailyShipmentExporting(false); } }}>{dailyShipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
+        </div>
+      </Modal>}
     </div>
   );
 }
@@ -6369,7 +6385,7 @@ type CompletionExportDraft = {
 function buildCompletionExportDraft(project: Project, unit: Unit, acceptance: Acceptance, completion: NonNullable<Acceptance["completion"]>): CompletionExportDraft {
   const constructionDate = unit.works.map((work) => work.date).filter(Boolean).join("、") || acceptance.date;
   return {
-    department: completion.department,
+    department: "派工部",
     officePerson: completion.officePerson || acceptance.person,
     projectName: project.name,
     projectAddress: project.address,
@@ -6418,7 +6434,8 @@ function CompletionReport({ project, unit, acceptance, completion, signatures, s
     {stage === "edit" && <section className="panel form completion-export-editor">
       <div className="panel-head"><div><h2>編輯／確認驗收單</h2><p>所有修改只套用本次三聯匯出。</p></div><button className="ghost" type="button" onClick={() => setExportDraft(createDraft())}>還原自動資料</button></div>
       <div className="grid3">
-        {([['department','部門別'],['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={exportDraft[key]} set={(value) => setText(key, value)} />)}
+        <label className="field"><span>部門別</span><input value="派工部" readOnly /></label>
+        {([['officePerson','工務人員'],['projectName','案場名稱'],['projectAddress','案場地址'],['order','訂單編號'],['constructionDate','施工日期'],['highlights','其他重點列示'],['area','坪數確認'],['unitDisplay','戶別'],['abnormalUnit','地坪異常戶別'],['damagedMaterialType','損壞板材種類'],['materialModel','板材型號']] as const).map(([key,label]) => <Field key={key} label={label} value={exportDraft[key]} set={(value) => setText(key, value)} />)}
         <CompletionDraftBoolean label="地坪是否異常" value={exportDraft.floorAbnormal} set={(value) => setBoolean("floorAbnormal", value)} />
         <CompletionDraftBoolean label="現場板材是否損壞" value={exportDraft.boardDamaged} set={(value) => setBoolean("boardDamaged", value)} />
         <CompletionDraftBoolean label="現場垃圾是否清運完畢" value={exportDraft.trashCleared} set={(value) => setBoolean("trashCleared", value)} />

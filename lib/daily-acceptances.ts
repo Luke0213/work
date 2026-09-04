@@ -1,6 +1,6 @@
 export type DailyAcceptance = {
-  id: string;
-  date: string;
+  id?: string;
+  date?: string;
   draft?: boolean;
 };
 
@@ -20,7 +20,12 @@ export function buildDailyAcceptanceEntries<A extends DailyAcceptance, U extends
   return units.filter((unit) => unit._deleted !== true).flatMap((unit) => {
     const seen = new Set<string>();
     return (unit.acceptances || []).flatMap((acceptance) => {
-      if (acceptance.draft === true || !acceptance.date || seen.has(acceptance.id)) return [];
+      if (
+        acceptance.draft === true
+        || !acceptance.id
+        || !acceptance.date
+        || seen.has(acceptance.id)
+      ) return [];
       seen.add(acceptance.id);
       return [{ date: acceptance.date.slice(0, 10), unit, acceptance }];
     });

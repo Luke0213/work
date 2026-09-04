@@ -36,6 +36,7 @@ export type AcceptanceExportRecord = {
   incomingVoOriginal: string;
   incomingVoCopy: string;
   outgoingVoOriginal: string;
+  outgoingVoOriginalDate: string;
   outgoingVoCopy: string;
   submitted: string;
   vendorInvoice: string;
@@ -63,6 +64,7 @@ export type AcceptanceReportMetadata = {
   incomingVoOriginal?: string;
   incomingVoCopy?: string;
   outgoingVoOriginal?: string;
+  outgoingVoOriginalDate?: string;
   outgoingVoCopy?: string;
   submitted?: string;
   vendorInvoice?: string;
@@ -131,6 +133,7 @@ export function buildAcceptanceExportRecord(project: ExportProject, unit: Export
     incomingVoOriginal: report?.incomingVoOriginal || "",
     incomingVoCopy: report?.incomingVoCopy || "",
     outgoingVoOriginal: report?.outgoingVoOriginal || "",
+    outgoingVoOriginalDate: report?.outgoingVoOriginalDate || "",
     outgoingVoCopy: report?.outgoingVoCopy || "",
     submitted: report?.submitted || "",
     vendorInvoice: report?.vendorInvoice || "",
@@ -167,6 +170,7 @@ const rocDate = (value: string) => {
 
 export type ReceivableDetailDraft = {
   date: string;
+  unitDisplay: string;
   model: string;
   sizeCm: string;
   quantity: string;
@@ -191,19 +195,21 @@ export type ReceivableExportDraft = {
 };
 
 export function buildReceivableExportDraft(project: ExportProject, records: AcceptanceExportRecord[]): ReceivableExportDraft {
+  const receivableDate = (value: string) => rocDate(value) || value;
   return {
     details: records.map((record) => ({
-      date: rocDate(record.exportDate),
-      model: record.model,
+      date: receivableDate(record.shipmentDateText || record.exportDate),
+      unitDisplay: record.unitDisplayText ?? record.unitDisplay,
+      model: record.productText ?? record.model,
       sizeCm: "",
-      quantity: "",
-      unitPrice: record.unitPrice > 0 ? String(record.unitPrice) : "",
+      quantity: record.pingText ?? (record.areaPing > 0 ? String(record.areaPing) : ""),
+      unitPrice: record.unitPriceText ?? (record.unitPrice > 0 ? String(record.unitPrice) : ""),
       note: record.noteText ?? record.note,
     })),
     deliveryContact: project.contact || "",
     deliveryAddress: project.address || "",
-    invoiceTrack: "",
-    invoiceDate: "",
+    invoiceTrack: records.find((record) => record.outgoingVoOriginal.trim())?.outgoingVoOriginal || "",
+    invoiceDate: records.find((record) => record.outgoingVoOriginalDate.trim())?.outgoingVoOriginalDate || "",
     receivedAmount: "",
     receivedDate: "",
     preparedBy: "",
@@ -245,33 +251,34 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
   const contactRow = bankAccountRow + 1;
   const addressRow = contactRow + 1;
   const rows: unknown[][] = [
-    [`${project.name || ""} SPC`, "", "", "", "", "", ""],
-    [`${companyReportConfig.companyName} 應收帳款明細表`, "", "", "", "", "", ""],
-    ["送貨聯絡人：", draft.deliveryContact, "", "", "", "", ""],
-    ["送貨地址：", draft.deliveryAddress, "", "", "", "", ""],
-    ["", "", "", "", "", "", ""],
-    ["日期", "型號", "尺寸cm", "數量(坪)", "單價／元", "合計", "備註"],
+    [`${project.name || ""} SPC`, "", "", "", "", "", "", ""],
+    [`${companyReportConfig.companyName} 應收帳款明細表`, "", "", "", "", "", "", ""],
+    ["送貨聯絡人：", draft.deliveryContact, "", "", "", "", "", ""],
+    ["送貨地址：", draft.deliveryAddress, "", "", "", "", "", ""],
+    ["", "", "", "", "", "", "", ""],
+    ["日期", "戶別", "型號", "尺寸cm", "數量(坪)", "單價／元", "合計", "備註"],
   ];
   for (let index = 0; index < detailCount; index += 1) {
     const row = detailStart + index;
     const detail = draft.details[index] || buildReceivableExportDraft(project, [records[index]]).details[0];
     rows.push([
       detail.date,
+      detail.unitDisplay,
       detail.model,
       detail.sizeCm,
       receivableNumber(detail.quantity),
       receivableNumber(detail.unitPrice),
-      { f: `IF(OR(D${row}=\"\",E${row}=\"\"),0,D${row}*E${row})`, v: 0, t: "n" },
+      { f: `IF(OR(E${row}=\"\",F${row}=\"\"),0,E${row}*F${row})`, v: 0, t: "n" },
       detail.note,
     ]);
   }
   rows.push(
-    ["", "", "", "", "", "", ""],
-    ["SPC", "", "", "", "", "", ""],
-    [`${companyReportConfig.companyName} 應收帳款明細表`, "", "", "", "", "", ""],
-    ["銷貨小計", "", "", "", "", { f: detailCount ? `SUM(F${detailStart}:F${detailEnd})` : "0", v: 0, t: "n" }, ""],
-    [`稅金（${companyReportConfig.receivableTaxRate * 100}%）`, "", "", "", "", { f: `ROUND(F${subtotalRow}*${companyReportConfig.receivableTaxRate * 100}%,0)`, v: 0, t: "n" }, ""],
-    ["應收合計", "", "", "", "", { f: `F${subtotalRow}-F${taxRow}`, v: 0, t: "n" }, ""],
+    ["", "", "", "", "", "", "", ""],
+    ["SPC", "", "", "", "", "", "", ""],
+    [`${companyReportConfig.companyName} 應收帳款明細表`, "", "", "", "", "", "", ""],
+    ["銷貨小計", "", "", "", "", "", { f: detailCount ? `SUM(G${detailStart}:G${detailEnd})` : "0", v: 0, t: "n" }, ""],
+    [`稅金（${companyReportConfig.receivableTaxRate * 100}%）`, "", "", "", "", "", { f: `ROUND(G${subtotalRow}*${companyReportConfig.receivableTaxRate * 100}%,0)`, v: 0, t: "n" }, ""],
+    ["應收合計", "", "", "", "", "", { f: `G${subtotalRow}-G${taxRow}`, v: 0, t: "n" }, ""],
     [`發票字軌：${draft.invoiceTrack}`, "", `發票日期：${draft.invoiceDate}`, "", "", "", ""],
     [`已收款金額：${draft.receivedAmount}`, "", `收款日期：${draft.receivedDate}`, "", `製表：${draft.preparedBy}`, "", ""],
     [`支付方式：${draft.paymentMethod}`, "", `送單日期：${draft.deliveryDate}`, "", `承辦人：${draft.handler}`, "", ""],
@@ -285,17 +292,17 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
 
   const worksheet = XLSXStyle.utils.aoa_to_sheet(rows);
   const merges = [
-    `A1:G1`, `A2:G2`, `B3:G3`, `B4:G4`,
-    `A${summaryTitle}:G${summaryTitle}`, `A${summarySubtitle}:G${summarySubtitle}`,
-    `A${subtotalRow}:E${subtotalRow}`, `F${subtotalRow}:G${subtotalRow}`, `A${taxRow}:E${taxRow}`, `F${taxRow}:G${taxRow}`, `A${receivableRow}:E${receivableRow}`, `F${receivableRow}:G${receivableRow}`,
-    `A${invoiceRow}:B${invoiceRow}`, `C${invoiceRow}:D${invoiceRow}`, `E${invoiceRow}:G${invoiceRow}`,
-    `A${receiptRow}:B${receiptRow}`, `C${receiptRow}:D${receiptRow}`, `E${receiptRow}:G${receiptRow}`,
-    `A${businessRow}:B${businessRow}`, `C${businessRow}:D${businessRow}`, `E${businessRow}:G${businessRow}`,
-    `A${approvalRow}:B${approvalRow}`, `C${approvalRow}:D${approvalRow}`, `E${approvalRow}:G${approvalRow}`,
-    `A${bankLabelRow}:G${bankLabelRow}`, `A${bankAccountRow}:G${bankAccountRow}`, `A${contactRow}:G${contactRow}`, `A${addressRow}:G${addressRow}`,
+    `A1:H1`, `A2:H2`, `B3:H3`, `B4:H4`,
+    `A${summaryTitle}:H${summaryTitle}`, `A${summarySubtitle}:H${summarySubtitle}`,
+    `A${subtotalRow}:F${subtotalRow}`, `G${subtotalRow}:H${subtotalRow}`, `A${taxRow}:F${taxRow}`, `G${taxRow}:H${taxRow}`, `A${receivableRow}:F${receivableRow}`, `G${receivableRow}:H${receivableRow}`,
+    `A${invoiceRow}:B${invoiceRow}`, `C${invoiceRow}:D${invoiceRow}`, `E${invoiceRow}:H${invoiceRow}`,
+    `A${receiptRow}:B${receiptRow}`, `C${receiptRow}:D${receiptRow}`, `E${receiptRow}:H${receiptRow}`,
+    `A${businessRow}:B${businessRow}`, `C${businessRow}:D${businessRow}`, `E${businessRow}:H${businessRow}`,
+    `A${approvalRow}:B${approvalRow}`, `C${approvalRow}:D${approvalRow}`, `E${approvalRow}:H${approvalRow}`,
+    `A${bankLabelRow}:H${bankLabelRow}`, `A${bankAccountRow}:H${bankAccountRow}`, `A${contactRow}:H${contactRow}`, `A${addressRow}:H${addressRow}`,
   ];
   worksheet["!merges"] = merges.map((range) => XLSXStyle.utils.decode_range(range));
-  worksheet["!cols"] = [13, 18, 14, 13, 15, 17, 28].map((wch) => ({ wch }));
+  worksheet["!cols"] = [13, 14, 18, 14, 13, 15, 17, 28].map((wch) => ({ wch }));
   const fixedCompanyRows = new Set([bankLabelRow, bankAccountRow, contactRow, addressRow]);
   worksheet["!rows"] = rows.map((_, index) => {
     const sheetRow = index + 1;
@@ -303,11 +310,11 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
   });
   worksheet["!margins"] = { left: 0.35, right: 0.35, top: 0.4, bottom: 0.4, header: 0.15, footer: 0.15 };
   worksheet["!pageSetup"] = { orientation: "portrait", fitToWidth: 1, fitToHeight: 0, paperSize: 9, horizontalCentered: true };
-  worksheet["!printArea"] = `A1:G${addressRow}`;
+  worksheet["!printArea"] = `A1:H${addressRow}`;
   worksheet["!freeze"] = { xSplit: 0, ySplit: 6, topLeftCell: "A7", activePane: "bottomLeft", state: "frozen" };
 
   for (let row = 0; row < rows.length; row += 1) {
-    for (let col = 0; col < 7; col += 1) {
+    for (let col = 0; col < 8; col += 1) {
       const address = XLSXStyle.utils.encode_cell({ r: row, c: col });
       const cell = worksheet[address] || (worksheet[address] = { t: "s", v: "" });
       const sheetRow = row + 1;
@@ -319,9 +326,9 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
         border: inDetail || inSummary ? excelBorder : undefined,
         fill: sheetRow === 6 ? { fgColor: { rgb: "FFF2CC" } } : sheetRow === receivableRow ? { fgColor: { rgb: "FFF200" } } : { fgColor: { rgb: "FFFFFF" } },
       };
-      if (sheetRow >= detailStart && sheetRow <= detailEnd && col === 4) cell.z = '#,##0.0"元"';
-      if (sheetRow >= detailStart && sheetRow <= detailEnd && col === 3) cell.z = "0.00";
-      if ((sheetRow >= detailStart && sheetRow <= detailEnd && col === 5) || (sheetRow >= subtotalRow && sheetRow <= receivableRow && col === 5)) cell.z = "#,##0";
+      if (sheetRow >= detailStart && sheetRow <= detailEnd && col === 5) cell.z = '#,##0.0"元"';
+      if (sheetRow >= detailStart && sheetRow <= detailEnd && col === 4) cell.z = "0.00";
+      if ((sheetRow >= detailStart && sheetRow <= detailEnd && col === 6) || (sheetRow >= subtotalRow && sheetRow <= receivableRow && col === 6)) cell.z = "#,##0";
     }
   }
   const workbook = XLSXStyle.utils.book_new();
@@ -353,7 +360,8 @@ export function shipmentDisplayValues(record: AcceptanceExportRecord, index: num
     signedCopy: record.signedCopy,
     incomingVoOriginal: record.incomingVoOriginal,
     incomingVoCopy: record.incomingVoCopy,
-    outgoingVoOriginal: record.outgoingVoOriginal,
+    outgoingVoOriginal: [record.outgoingVoOriginal, record.outgoingVoOriginalDate].filter(Boolean).join("\n"),
+    outgoingVoOriginalDate: record.outgoingVoOriginalDate,
     outgoingVoCopy: record.outgoingVoCopy,
     submitted: record.submitted,
     vendorInvoice: record.vendorInvoice,
@@ -392,7 +400,7 @@ export function createShipmentWorkbook(project: ExportProject, records: Acceptan
         record.signedCopy ? "✓" : "",
         record.incomingVoOriginal,
         record.incomingVoCopy,
-        record.outgoingVoOriginal,
+        [record.outgoingVoOriginal, record.outgoingVoOriginalDate].filter(Boolean).join("\n"),
         record.outgoingVoCopy,
         record.submitted,
         record.vendorInvoice,

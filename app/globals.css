@@ -1099,7 +1099,10 @@ img,canvas{max-width:100%}
 .unit-head .unit-head-title{font-size:clamp(28px,3.2vw,42px);font-weight:800;line-height:1.18;margin-bottom:10px;overflow-wrap:anywhere}
 .unit-head .unit-head-meta{font-size:clamp(16px,1.65vw,21px);font-weight:650;line-height:1.45;color:#fff1e5}
 .unit-head-status{flex:0 0 auto;min-width:170px;display:flex;flex-direction:column;align-items:flex-start;gap:9px;color:#f6e6d8}
-.unit-head-status>small{font-size:13px;font-weight:700;letter-spacing:.04em}
+.unit-head-estimated,.unit-head-current-status{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
+.unit-head-estimated>small,.unit-head-current-status>small{font-size:13px;font-weight:800;letter-spacing:.04em}
+.unit-head-estimated>b{color:#fff;font-size:17px}
+.unit-head-current-status>small{color:#fff}
 .unit-head-status .pill{font-size:15px;padding:8px 13px;line-height:1.2;white-space:nowrap}
 
 @media(min-width:601px) and (max-width:1180px){
@@ -1112,6 +1115,7 @@ img,canvas{max-width:100%}
   .unit-head .unit-head-title{font-size:clamp(27px,8vw,34px);overflow-wrap:normal;word-break:keep-all}
   .unit-head .unit-head-meta{font-size:clamp(16px,4.6vw,18px);overflow-wrap:anywhere}
   .unit-head-status{width:100%;min-width:0;flex-direction:row;align-items:center;justify-content:space-between;gap:12px;padding-top:13px;border-top:1px solid #ffffff2e}
+  .unit-head-current-status{align-items:flex-end}
   .unit-head-status .pill{flex:0 0 auto;max-width:60%;overflow:hidden;text-overflow:ellipsis}
 }
 
@@ -1244,17 +1248,6 @@ img,canvas{max-width:100%}
   min-width: 0;
 }
 
-.survey-estimated-area {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.survey-estimated-area strong {
-  white-space: nowrap;
-  font-size: 1.2rem;
-}
 .daily-acceptance-summary{display:flex;align-items:end;gap:16px;margin:16px 0}
 .daily-acceptance-summary .field{min-width:220px}
 .daily-acceptance-summary article{display:grid;gap:4px;padding:12px 18px;border:1px solid var(--line,#ddd);border-radius:12px}
