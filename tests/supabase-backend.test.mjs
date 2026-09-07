@@ -1032,7 +1032,7 @@ test("survey signature roles preserve shape and only a valid index-zero save syn
 test("billing screen, receivable Excel, and totals share the selected month records", async () => {
   const page = await read("app/page.tsx");
   for (const value of [
-    "monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter",
+    "monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(",
     "const shipmentDate = record.shipmentDateText?.trim() || record.exportDate",
     "shipmentDate.startsWith(ym)",
     "shipmentRecords = monthlyBillingRecords",
@@ -1130,31 +1130,33 @@ test("unit import confirms one batch area unit before canonical ping conversion"
   assert.doesNotMatch(unitImport.slice(unitImport.indexOf("const parsed ="), unitImport.indexOf("const importable =")), /areaInputToPing|importedAreaToCanonicalPing/);
 });
 
-test("billing edits stay local until one confirmed project patch", async () => {
+test("billing edits await one verified project save", async () => {
   const page = await read("app/page.tsx");
   const billing = page.slice(page.indexOf("type BillingUnitDraft"), page.indexOf("type CompletionExportDraft"));
-  const confirmSave = billing.slice(billing.indexOf("confirmSave = () => {"), billing.indexOf("startShipmentReportEdit ="));
+  const confirmSave = billing.slice(billing.indexOf("confirmSave = async () => {"), billing.indexOf("startShipmentReportEdit ="));
 
   assert.match(billing, /type BillingUnitDraft = \{ rate: string; priced: boolean \}/);
   assert.match(billing, /setBillingDrafts\(\(current\) =>/);
   assert.match(billing, /保存修改/);
   assert.match(billing, /確認保存月結修改/);
   assert.match(billing, /確認保存/);
-  assert.match(confirmSave, /const changes = new Map\(billingChanges/);
-  assert.equal((confirmSave.match(/\bpatch\(\{/g) || []).length, 1);
-  assert.match(confirmSave, /units: p\.units\.map/);
-  assert.match(confirmSave, /if \(!changed\) return unit/);
+  assert.equal((confirmSave.match(/await persistFinance\(/g) || []).length, 1);
+  assert.match(confirmSave, /applyBillingChanges\(current, changes, day\(\)\)/);
+  assert.ok(confirmSave.indexOf("await persistFinance") < confirmSave.indexOf("setBillingDrafts({})"));
+  assert.match(confirmSave, /catch \(error\)[\s\S]*setBillingMessage/);
+  const finance = await read("lib/finance-persistence.ts");
+  assert.match(finance, /rate: change.rate/);
+  assert.match(finance, /statusChanged = change.priced !== \(unit.status === "已計價"\)/);
+  assert.match(finance, /status: change.priced \? "已計價" : "已驗收"/);
+  assert.match(finance, /pricedAt: change.priced \? date : ""/);
+  assert.match(finance, /events: \[change.event, ...unit.events\]/);
+  assert.match(confirmSave, /title: row.draft.priced \? "月結已計價" : "月結取消計價"/);
+  assert.match(confirmSave, /detail: row.draft.priced \? `金額 \$\{row.record.amount\}` : "狀態恢復為已驗收"/);
   assert.match(billing, /沒有需要保存的修改/);
   assert.match(billing, /record\.areaPing \* rate/);
   assert.match(billing, /editing \? previewSubtotal : billSubtotal/);
   assert.match(billing, /priced: unit\.status === "已計價"/);
-  assert.match(confirmSave, /rate,/);
-  assert.match(confirmSave, /pricingStatusChanged = changed\.draft\.priced !== wasPriced/);
-  assert.match(confirmSave, /status: changed\.draft\.priced \? "已計價" : "已驗收"/);
-  assert.match(confirmSave, /pricedAt: changed\.draft\.priced \? day\(\) : ""/);
-  assert.match(confirmSave, /title: changed\.draft\.priced \? "月結已計價" : "月結取消計價"/);
-  assert.match(confirmSave, /detail: changed\.draft\.priced \? `金額 \$\{changed\.record\.amount\}` : "狀態恢復為已驗收"/);
-  assert.match(confirmSave, /events: \[\{[\s\S]*\}, \.\.\.unit\.events\]/);
+
   assert.doesNotMatch(confirmSave, /acceptances\s*:/);
   assert.match(billing, /editing \? <label className="check"><input type="checkbox" checked=\{draft\.priced\}/);
   assert.match(billing, /\{draft\.priced \? "已計價" : "已驗收"\}/);
@@ -1162,7 +1164,7 @@ test("billing edits stay local until one confirmed project patch", async () => {
   assert.match(billing, /unit\.status === "已驗收" \|\| unit\.status === "已計價"/);
   assert.match(billing, /if \(editing && billingChanges\.length\)/);
   assert.match(billing, /匯出內容仍以已保存資料為準/);
-  assert.match(billing, /createReceivableWorkbook\(financeExportProject, billRecords, ym, receivableDraft\)/);
+  assert.match(billing, /createReceivableWorkbook\(financeExportProject, receivableRecordsRef.current, ym, receivableDraft\)/);
   assert.doesNotMatch(billing, /\bexportCsv\b|CSV 匯出|月結戶別明細 · CSV/);
   assert.match(billing, /shipmentRecords = monthlyBillingRecords/);
   assert.match(billing, /savedRecord: record/);
@@ -1347,7 +1349,7 @@ test("daily acceptance keeps formal history without an export entry and billing 
   assert.match(dailyAcceptances, /acceptance\.draft === true[\s\S]*\|\| !acceptance\.id[\s\S]*\|\| !acceptance\.date[\s\S]*\|\| seen\.has\(acceptance\.id\)[\s\S]*seen\.add\(acceptance\.id\)/);
 });
 
-test("receivable Excel uses a local billRecords preview draft before export", async () => {
+test("receivable Excel restores project-month data into its export preview", async () => {
   const page = await read("app/page.tsx");
   const exports = await read("lib/acceptance-exports.ts");
   const css = await read("app/globals.css");
@@ -1356,15 +1358,15 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   const receivableModal = billing.slice(billing.indexOf("{canExportReceivables && receivablePreview && receivableDraft"), billing.indexOf("{canExportShipment && shipmentPreview &&"));
 
   assert.match(billing, /onClick=\{openReceivablePreview\}[\s\S]*<b>應收帳款 Excel<\/b>[\s\S]*<em>預覽 ›<\/em>/);
-  assert.match(receivableFlow, /setReceivableDraft\(buildReceivableExportDraft\(financeExportProject, billRecords\)\)/);
+  assert.match(receivableFlow, /setReceivableDraft\(loadReceivableReportDraft\(financeExportProject, billRecords, ym\)\)/);
   assert.match(receivableModal, /title="應收帳款 Excel｜匯出預覽"/);
-  assert.match(receivableModal, /billRecords\.map\(\(record, index\)/);
+  assert.match(receivableModal, /receivableRecordsRef.current\.map\(\(record, index\)/);
   assert.match(receivableModal, /className="export-preview-table receivable-preview-table"/);
   assert.match(receivableModal, /<th>日期<\/th><th>戶別<\/th><th>型號<\/th><th>尺寸cm<\/th><th>數量\(坪\)<\/th><th>單價／元<\/th><th>合計<\/th><th>備註<\/th>/);
   assert.match(receivableModal, /type="number" min="0" step="0\.01" value=\{detail\.quantity\}/);
   assert.match(receivableModal, /label="送貨聯絡人"/);
-  assert.match(receivableModal, /實際戶別筆數<b>\{billRecords\.length\}<\/b>/);
-  assert.match(receivableModal, /createReceivableWorkbook\(financeExportProject, billRecords, ym, receivableDraft\)/);
+  assert.match(receivableModal, /實際戶別筆數<b>\{receivableRecordsRef.current\.length\}<\/b>/);
+  assert.match(receivableModal, /createReceivableWorkbook\(financeExportProject, receivableRecordsRef.current, ym, receivableDraft\)/);
   assert.match(billing, /receivableTotals = receivableDraft \? receivableDraftTotals\(receivableDraft\) : null/);
   assert.match(receivableModal, /saveReceivableWorkbook\(workbook/);
   assert.match(receivableModal, /receivableExporting \? "產生中…" : "確認產生 Excel"/);
@@ -1418,7 +1420,8 @@ test("receivable Excel uses a local billRecords preview draft before export", as
 test("daily and monthly shipment report edits persist only approved formal source fields", async () => {
   const page = await read("app/page.tsx");
   const exports = await read("lib/acceptance-exports.ts");
-  const sourceUpdate = page.slice(page.indexOf("const updateReportSource"), page.indexOf("function DailyAcceptanceView"));
+  const finance = await read("lib/finance-persistence.ts");
+  const sourceUpdate = finance.slice(finance.indexOf("export const updateReportSource"), finance.indexOf("export const financeSyncError"));
   const editor = page.slice(page.indexOf("function ReportMetadataEditor"), page.indexOf("function DailyAcceptanceView"));
   const daily = page.slice(page.indexOf("function DailyAcceptanceView"), page.indexOf("function Dashboard"));
   const billing = page.slice(page.indexOf("function Billing("), page.indexOf("type CompletionExportDraft"));
@@ -1446,17 +1449,22 @@ test("daily and monthly shipment report edits persist only approved formal sourc
   assert.match(editor, /label="銷VO正日期" type="date" value=\{draft\.outgoingVoOriginalDate\}/);
   assert.doesNotMatch(sourceUpdate, /\bstatus\b|defects|events|\badd\(|removeDurableDraft|id: id\(\)|model: draft|colorNo: draft|brand: draft|rate:|area: draft|note: draft/);
 
-  for (const save of [dailySave, shipmentSave]) {
+  for (const save of [dailySave]) {
     assert.match(save, /acceptance\.id === .*acceptanceId && acceptance\.draft !== true/);
     assert.match(save, /updateReportSource\(currentUnit/);
     assert.match(save, /patch\(\{ units: p\.units\.map\(\(unit\) => unit\.id === updatedUnit\.id \? updatedUnit : unit\) \}\)/);
     assert.match(save, /queueRecordChange\(authUserId, "accept", updatedUnit\.id, updatedAcceptance, "complete"\)/);
     assert.doesNotMatch(save, /\bstatus\b|defects:|events:|\badd\(|removeDurableDraft|id: id\(\)/);
   }
+  assert.match(shipmentSave, /a.id === draft.acceptanceId && a.draft !== true/);
+  assert.match(shipmentSave, /updateReportSource\(unit, draft\)/);
+  assert.match(shipmentSave, /await persistFinance\(reportBaseRef.current/);
+  assert.match(shipmentSave, /queueRecordChange\(authUserId, "accept", unit.id/);
+  assert.ok(shipmentSave.indexOf("await persistFinance") < shipmentSave.indexOf("setShipmentReportDraft(null)"));
   assert.match(page, /function queueRecordChange[\s\S]*queueOfflineWrite\(\{[^}]*payload: record \}\)/);
 
   assert.match(daily, /buildAcceptanceExportRecord\(p, selected\.unit, selected\.acceptance, true\)/);
-  assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(financeExportProject\)/);
+  assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(editing && canManageFinance \? billingBaseRef.current : financeExportProject\)/);
   assert.equal((page.match(/<ReportMetadataEditor draft=/g) || []).length, 3);
   assert.match(exports, /const headers = \["出貨日期", "序號", "客戶名稱", "商品", "戶別", "m²", "片／件\\n\*0\.3025", "單價／元", "合計", "廠商", "進價／元", "備註", "簽單正", "簽單影", "進VO正", "進VO影", "銷VO正", "銷VO影", "送單", "廠商帳單", "級距", "應付", "利潤%", "利潤"\]/);
   assert.doesNotMatch(exports, /const headers = \[[^\]]*銷VO正日期/);
@@ -1661,7 +1669,7 @@ test("overlapping saves keep the newest local state pending until Supabase confi
   assert.match(autosave, /if \(savingRef\.current\) \{\s*retrySyncRef\.current = true;\s*return;\s*\}/);
   assert.match(autosave, /finally \{\s*savingRef\.current = false;\s*if \(retrySyncRef\.current\) \{\s*retrySyncRef\.current = false;\s*window\.setTimeout\(\(\) => setSyncTick\(\(value\) => value \+ 1\), 0\);\s*\}/);
   assert.match(autosave, /const stillCurrent = JSON\.stringify\(latestRef\.current\) === saveInput/);
-  assert.match(autosave, /else \{\s*writeWorkspaceDraft\(authUserId,[^\r\n]*latestRef\.current\.projects[^\r\n]*latestRef\.current\.catalog, nextVersion, true\);\s*retrySyncRef\.current = true/);
+  assert.match(autosave, /else \{\s*writeWorkspaceDraft\(authUserId,[^\r\n]*latestRef\.current\.projects[^\r\n]*latestRef\.current\.catalog, committed.version, true\);\s*retrySyncRef\.current = true/);
 });
 
 test("tablet and phone layouts use drawers, stacked forms, and safe scrolling", async () => {
@@ -1817,15 +1825,15 @@ test("phase 5C-2 keeps ordinary finance exports on the protected project with no
   assert.match(billing, /serverCanExportReceivables = canManageFinance \|\| protectedFinanceData\?\.canExportReceivables === true/);
   assert.match(billing, /serverCanExportShipment = canManageFinance \|\| protectedFinanceData\?\.canExportShipmentDetails === true/);
   assert.match(billing, /financeExportProject = canManageFinance \? p : protectedFinanceProject/);
-  assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(financeExportProject\)/);
-  assert.match(billing, /const unit = financeExportProject\?\.units\?\.find\(\(item\) => item\.id === record\.unitId\)/);
-  assert.match(billing, /buildReceivableExportDraft\(financeExportProject, billRecords\)/);
-  assert.match(billing, /createReceivableWorkbook\(financeExportProject, billRecords, ym, receivableDraft\)/);
+  assert.match(billing, /monthlyBillingRecords = financeExportProject \? buildAcceptanceExportRecords\(editing && canManageFinance \? billingBaseRef.current : financeExportProject\)/);
+  assert.match(billing, /const unit = \(editing && canManageFinance \? billingBaseRef.current : financeExportProject\)\?\.units\?\.find\(\(item\) => item\.id === record\.unitId\)/);
+  assert.match(billing, /loadReceivableReportDraft\(financeExportProject, billRecords, ym\)/);
+  assert.match(billing, /createReceivableWorkbook\(financeExportProject, receivableRecordsRef.current, ym, receivableDraft\)/);
   assert.match(billing, /createShipmentWorkbook\(financeExportProject, shipmentRecords, ym\)/);
 
-  assert.match(billing, /confirmSave = \(\) => \{[\s\S]*patch\(\{\s*units: p\.units\.map/);
+  assert.match(billing, /confirmSave = async \(\) => \{[\s\S]*if \(!canManageFinance \|\| financeSaving\) return[\s\S]*await persistFinance\(billingBaseRef.current/);
   assert.match(billing, /startShipmentReportEdit = [\s\S]*if \(!canManageFinance\) return[\s\S]*const unit = p\.units\.find/);
-  assert.match(billing, /saveShipmentReportSource = [\s\S]*if \(!canManageFinance\) return[\s\S]*const currentUnit = p\.units\.find[\s\S]*patch\(\{ units: p\.units\.map/);
+  assert.match(billing, /saveShipmentReportSource = [\s\S]*if \(!canManageFinance \|\| !shipmentReportDraft \|\| financeSaving\) return[\s\S]*await persistFinance\(reportBaseRef.current/);
   assert.doesNotMatch(billing.slice(billing.indexOf("loadFinanceExportData().then"), billing.indexOf("const financeExportProject")), /\bpatch\(|saveWorkspace|spc_merge_workspace|uploadEmbeddedPhotos/);
   assert.doesNotMatch(billing, /financeExportError[\s\S]*(?:signOut|localStorage\.(?:clear|removeItem)|indexedDB\.deleteDatabase)/i);
   assert.doesNotMatch(billing, /cleanupRemovedPhotos|supabase\.storage|spc-photos/);

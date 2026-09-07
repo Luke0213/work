@@ -90,7 +90,7 @@ export type ExportUnit = {
   acceptances?: Array<{ id?: string; date?: string; startedAt?: string; area?: number; note?: string; draft?: boolean; report?: AcceptanceReportMetadata }>;
 };
 
-export type ExportProject = { name?: string; address?: string; contact?: string; units?: ExportUnit[] };
+export type ExportProject = { name?: string; address?: string; contact?: string; units?: ExportUnit[]; receivableReports?: Record<string, ReceivableReportMetadata> };
 export type ExportAcceptance = NonNullable<ExportUnit["acceptances"]>[number];
 
 export function buildAcceptanceExportRecord(project: ExportProject, unit: ExportUnit, acceptance?: ExportAcceptance, useAcceptanceDate = false): AcceptanceExportRecord {
@@ -193,6 +193,25 @@ export type ReceivableExportDraft = {
   supervisor: string;
   accounting: string;
 };
+
+export type ReceivableReportMetadata = Omit<ReceivableExportDraft, "details"> & {
+  detailsByUnit: Record<string, ReceivableDetailDraft>;
+};
+
+export function receivableReportMetadata(draft: ReceivableExportDraft, records: AcceptanceExportRecord[]): ReceivableReportMetadata {
+  const { details, ...headerAndSummary } = draft;
+  return { ...headerAndSummary, detailsByUnit: Object.fromEntries(records.map((record, index) => [record.unitId, { ...details[index] }])) };
+}
+
+export function loadReceivableReportDraft(project: ExportProject, records: AcceptanceExportRecord[], month: string): ReceivableExportDraft {
+  const defaults = buildReceivableExportDraft(project, records);
+  const saved = project.receivableReports?.[month];
+  if (!saved) return defaults;
+  const { detailsByUnit, ...headerAndSummary } = saved;
+  return { ...defaults, ...headerAndSummary,
+    details: records.map((record, index) => ({ ...defaults.details[index], ...detailsByUnit[record.unitId] })),
+  };
+}
 
 export function buildReceivableExportDraft(project: ExportProject, records: AcceptanceExportRecord[]): ReceivableExportDraft {
   const receivableDate = (value: string) => rocDate(value) || value;

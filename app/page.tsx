@@ -1,4 +1,6 @@
 "use client";
+import { updateReportSource, applyBillingChanges, canApplySharedReload, containsChanges, financeSnapshot, financeSyncError, rebaseProjectEdit } from "../lib/finance-persistence.ts";
+import { loadReceivableReportDraft, receivableReportMetadata, type ReceivableReportMetadata } from "../lib/acceptance-exports.ts";
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { saveUnitJournal } from "../lib/unit-journal-save";
@@ -8,7 +10,7 @@ import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, t
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
 import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
-import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDetailAmount, receivableDraftTotals, saveReceivableWorkbook, saveShipmentWorkbook, shipmentDisplayValues, type AcceptanceExportRecord, type AcceptanceReportMetadata, type ReceivableExportDraft } from "../lib/acceptance-exports";
+import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, receivableDetailAmount, receivableDraftTotals, saveReceivableWorkbook, saveShipmentWorkbook, shipmentDisplayValues, type AcceptanceExportRecord, type AcceptanceReportMetadata, type ReceivableExportDraft } from "../lib/acceptance-exports";
 import { companyReportConfig } from "../lib/company-report-config";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
@@ -234,7 +236,9 @@ type DailyNote = {
   deletedAt?: string;
   deletedBy?: string;
 };
+type FinanceSave = (displayed: Project, update: (current: Project) => Project, onPending?: (next: Project) => void) => Promise<void>;
 type Project = {
+  receivableReports?: Record<string, ReceivableReportMetadata>;
   id: string;
   ownerUserId?: string;
   name: string;
@@ -1048,6 +1052,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
   const canUseAcceptance = canUseUnitTab(appRole, permissions, "accept");
   const versionRef = useRef(0);
   const savingRef = useRef(false);
+  const financeWaitersRef = useRef<Array<{ base: ReturnType<typeof financeSnapshot>; intended: ReturnType<typeof financeSnapshot>; finish: (error?: Error) => void }>>([]);
   const retrySyncRef = useRef(false);
   const baselineRef = useRef<{ projects: Project[]; catalog: Product[] }>({ projects: [], catalog: [] });
   const latestRef = useRef<{ projects: Project[]; catalog: Product[] }>({ projects: [], catalog: [] });
@@ -1089,6 +1094,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     window.addEventListener("offline", refresh);
     return () => { active = false; window.removeEventListener("spc-offline-change", refresh); window.removeEventListener("online", refresh); window.removeEventListener("offline", refresh); };
   }, [authUserId]);
+
   useEffect(() => { latestRef.current = { projects, catalog }; }, [projects, catalog]);
   useEffect(() => {
     if (view === "survey") {
@@ -1202,42 +1208,55 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
       }
       savingRef.current = true;
       retrySyncRef.current = false;
-      const saveInput = JSON.stringify({ projects, catalog });
+      const saveState = structuredClone(latestRef.current);
+      const saveBase = structuredClone(baselineRef.current);
+      const saveVersion = versionRef.current;
+      const saveInput = JSON.stringify(saveState);
+      const acknowledgements = [...financeWaitersRef.current];
       try {
-        const uploaded = await uploadEmbeddedPhotos(projects);
+        const uploaded = await uploadEmbeddedPhotos(saveState.projects);
         const nextVersion = await saveWorkspace(
-          versionRef.current,
-          uploaded,
-          catalog,
-          baselineRef.current.projects,
-          baselineRef.current.catalog,
+          saveVersion, uploaded, saveState.catalog, saveBase.projects, saveBase.catalog,
         );
-        versionRef.current = nextVersion;
-        baselineRef.current = { projects: structuredClone(uploaded), catalog: structuredClone(catalog) };
-        try {
-          const committed = await loadWorkspace();
-          setActivity(committed.activity || []);
-          if (JSON.stringify(latestRef.current) === saveInput) {
-            const shared = { projects: normalize(committed.projects as Project[]), catalog: committed.catalog as Product[] };
-            versionRef.current = committed.version;
-            baselineRef.current = structuredClone(shared);
-            setProjects(shared.projects);
-            setCatalog(shared.catalog);
-          }
-        } catch { /* the save succeeded */ }
+        const committed = await loadWorkspace();
+        const shared = { projects: normalize(committed.projects as Project[]), catalog: committed.catalog as Product[] };
+        const committedFinance = financeSnapshot(shared.projects);
+        if (committed.version < nextVersion
+          || !containsChanges(financeSnapshot(saveBase.projects), financeSnapshot(uploaded), committedFinance)
+          || acknowledgements.some((item) => !containsChanges(item.base, item.intended, committedFinance))) {
+          throw new Error(financeSyncError);
+        }
+        // Only a verified reload can advance the baseline or acknowledge local edits.
         const stillCurrent = JSON.stringify(latestRef.current) === saveInput;
-        if (stillCurrent && JSON.stringify(uploaded) !== JSON.stringify(projects)) setProjects(uploaded);
+        const merged = threeWayMerge(saveState, latestRef.current, shared);
+        versionRef.current = committed.version;
+        baselineRef.current = structuredClone(shared);
+        latestRef.current = stillCurrent ? shared : merged.value;
+        setProjects(latestRef.current.projects);
+        setCatalog(latestRef.current.catalog);
+        setActivity(committed.activity || []);
+        if (merged.conflicts.length) {
+          remoteConflictRef.current = shared;
+          setConflictPaths(merged.conflicts);
+        }
+        acknowledgements.forEach((item) => item.finish());
         if (stillCurrent) {
-          const committedCache = writeWorkspaceDraft(authUserId, appRole === "admin" ? uploaded : durableProjects, catalog, nextVersion, false);
+          const cacheInput = JSON.stringify(latestRef.current);
+          const committedCache = writeWorkspaceDraft(authUserId, appRole === "admin" ? shared.projects : durableProjects, shared.catalog, committed.version, false);
           const indexedCache = await committedCache.indexedDb;
           const cacheErrors = [committedCache.localError, indexedCache.error].filter((error): error is StorageErrorDetails => !!error);
           const cacheState = durableStorageState(indexedCache.ok, committedCache.local, cacheErrors);
-          try { await completeSyncedOutbox(authUserId); } catch (error) { logStorageException("IndexedDB", "delete", error); }
-          setStorageWarning(cacheState.saved
-            ? `已儲存：已與 Supabase 同步 · 版本 ${nextVersion}`
-            : "雲端已同步，但本機離線暫存不可用");
+          if (JSON.stringify(latestRef.current) === cacheInput) {
+            try { await completeSyncedOutbox(authUserId); } catch (error) { logStorageException("IndexedDB", "delete", error); }
+            setStorageWarning(cacheState.saved
+              ? `已儲存：已與 Supabase 同步 · 版本 ${committed.version}`
+              : "雲端已同步，但本機離線暫存不可用");
+          } else {
+            writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, committed.version, true);
+            retrySyncRef.current = true;
+          }
         } else {
-          writeWorkspaceDraft(authUserId, appRole === "admin" ? latestRef.current.projects : durableProjects, latestRef.current.catalog, nextVersion, true);
+          writeWorkspaceDraft(authUserId, appRole === "admin" ? latestRef.current.projects : durableProjects, latestRef.current.catalog, committed.version, true);
           retrySyncRef.current = true;
           setStorageWarning("儲存中：上一筆已同步，正在接續同步最新修改…");
         }
@@ -1246,10 +1265,11 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         if (message.includes("SPC_VERSION_CONFLICT") || message.includes("40001")) {
           const latest = await loadWorkspace();
           const remote = { projects: normalize(latest.projects as Project[]), catalog: latest.catalog as Product[] };
-          const merged = threeWayMerge(baselineRef.current, { projects, catalog }, remote);
+          const merged = threeWayMerge(saveBase, latestRef.current, remote);
           remoteConflictRef.current = remote;
           versionRef.current = latest.version;
           baselineRef.current = structuredClone(remote);
+          latestRef.current = merged.value;
           setProjects(merged.value.projects);
           setCatalog(merged.value.catalog);
           setConflictPaths(merged.conflicts);
@@ -1257,7 +1277,8 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
             ? `已合併其他電腦的更新；${merged.conflicts.length} 個同欄位衝突保留這台電腦的內容，正在重新同步…`
             : "已自動合併其他電腦的更新，正在重新同步…");
         } else {
-        const fallback = writeWorkspaceDraft(authUserId, durableProjects, catalog, versionRef.current, true);
+        acknowledgements.forEach((item) => item.finish(new Error(`${financeSyncError}；${message}`)));
+        const fallback = writeWorkspaceDraft(authUserId, appRole === "admin" ? latestRef.current.projects : durableProjects, latestRef.current.catalog, versionRef.current, true);
           const indexedFallback = await fallback.indexedDb;
           const fallbackErrors = [fallback.localError, indexedFallback.error].filter((storageError): storageError is StorageErrorDetails => !!storageError);
           const durable = durableStorageState(indexedFallback.ok, fallback.local, fallbackErrors);
@@ -1279,14 +1300,17 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
   useEffect(() => {
     if (!ready) return;
     const refreshSharedData = async () => {
-      if (savingRef.current || JSON.stringify(latestRef.current) !== JSON.stringify(baselineRef.current)) return;
+      if (!canApplySharedReload(savingRef.current, latestRef.current, baselineRef.current, !!readWorkspaceDraft(authUserId)?.pending)) return;
       try {
         const snapshot = await loadWorkspace();
+        // Recheck after await: a local edit or save may have started during the request.
+        if (!canApplySharedReload(savingRef.current, latestRef.current, baselineRef.current, !!readWorkspaceDraft(authUserId)?.pending)) return;
         setActivity(snapshot.activity || []);
         if (snapshot.version <= versionRef.current) return;
         const shared = { projects: normalize(snapshot.projects as Project[]), catalog: snapshot.catalog as Product[] };
         versionRef.current = snapshot.version;
         baselineRef.current = structuredClone(shared);
+        latestRef.current = shared;
         setProjects(shared.projects);
         setCatalog(shared.catalog);
         setStorageWarning(`已收到其他使用者的更新 · 版本 ${snapshot.version}`);
@@ -1349,16 +1373,37 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     setFloorContext(null);
     setView("dashboard");
   }, [pid, projects]);
-  const setProjectsDurably = (update: (current: Project[]) => Project[], onDurable?: (error?: Error) => void) =>
-    setProjects((current) => {
-      const next = update(current);
-      latestRef.current = { projects: next, catalog: latestRef.current.catalog };
-      const storage = writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true);
-      if (onDurable) void storage.indexedDb.then((result) => {
-        onDurable(result === true || (typeof result === "object" && result.ok) ? undefined : new Error("工作區未能寫入本機儲存空間"));
-      }, (error) => onDurable(error instanceof Error ? error : new Error(String(error))));
-      return next;
-    });
+  const setProjectsDurably = (update: (current: Project[]) => Project[], onDurable?: (error?: Error) => void) => {
+    // Publish before React renders or an in-flight reload can finish.
+    const next = update(latestRef.current.projects);
+    latestRef.current = { projects: next, catalog: latestRef.current.catalog };
+    const storage = writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true);
+    setProjects(next);
+    if (onDurable) void storage.indexedDb.then((result) => {
+      onDurable(result === true || (typeof result === "object" && result.ok) ? undefined : new Error("工作區未能寫入本機儲存空間"));
+    }, (error) => onDurable(error instanceof Error ? error : new Error(String(error))));
+  };
+  const persistFinance: FinanceSave = (displayed, update, onPending) => new Promise((resolve, reject) => {
+    try {
+      const current = latestRef.current.projects.find((p) => p.id === displayed.id && !isDeletedEntity(p));
+      if (!current) throw new Error("找不到原案場，未保存修改");
+      const edited = update(displayed);
+      const next = rebaseProjectEdit(displayed, edited, current);
+      onPending?.(next);
+      const waiter = {
+        base: financeSnapshot([displayed]), intended: financeSnapshot([edited]),
+        finish: (error?: Error) => {
+          window.clearTimeout(timer);
+          financeWaitersRef.current = financeWaitersRef.current.filter((item) => item !== waiter);
+          if (error) reject(error); else resolve();
+        },
+      };
+      const timer = window.setTimeout(() => waiter.finish(new Error(financeSyncError)), 20000);
+      financeWaitersRef.current.push(waiter);
+      setProjectsDurably((ps) => ps.map((p) => p.id === current.id ? next : p));
+      setSyncTick((tick) => tick + 1);
+    } catch (error) { reject(error); }
+  });
   const updateCatalog = (products: Product[]) => {
     setCatalog(products);
     latestRef.current.catalog = products;
@@ -1683,6 +1728,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
               role={appRole}
               permissions={permissions}
               patch={patchProject}
+              persistFinance={persistFinance}
               open={(unitId) => { setFloorContext(null); setUid(unitId); }}
               openFloor={(building, floor) => { if (canUseAcceptance) setFloorContext(createFloorReturnContext(building, floor)); }}
               remove={removeProject}
@@ -2003,6 +2049,7 @@ function Empty() {
   );
 }
 function ProjectArea({
+  persistFinance,
   project,
   view,
   setView,
@@ -2013,6 +2060,7 @@ function ProjectArea({
   openFloor,
   remove,
 }: {
+  persistFinance: FinanceSave;
   project: Project;
   view: string;
   setView: (x: string) => void;
@@ -2071,7 +2119,7 @@ function ProjectArea({
       {safeView === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} canManageFinance={financeAccess.canManageFinance} />}{" "}
       {safeView === "products" && <Products p={project} patch={patch} />}{" "}
       {safeView === "journal" && <Journal p={project} patch={patch} />}{" "}
-      {safeView === "billing" && <Billing p={project} patch={patch} financeAccess={financeAccess} />}{" "}
+      {safeView === "billing" && <Billing key={project.id} p={project} persistFinance={persistFinance} financeAccess={financeAccess} />}{" "}
       {safeView === "project" && <ProjectForm p={project} patch={patch} />}
     </>
   );
@@ -2113,25 +2161,6 @@ const reportSourceDraftFor = (record: AcceptanceExportRecord, index: number, uni
     ...display,
   };
 };
-
-const updateReportSource = (unit: Unit, draft: ReportSourceDraft): Unit => ({
-  ...unit,
-  acceptances: unit.acceptances.map((acceptance) => acceptance.id === draft.acceptanceId
-    ? { ...acceptance, report: {
-        ...acceptance.report,
-        shipmentDateText: draft.shipmentDateText, sequenceText: draft.sequenceText,
-        customerNameText: draft.customerNameText, productText: draft.productText,
-        unitDisplayText: draft.unitDisplayText, squareMetersText: draft.squareMetersText,
-        pingText: draft.pingText, unitPriceText: draft.unitPriceText, amountText: draft.amountText,
-        vendorText: draft.vendorText, purchasePriceText: draft.purchasePriceText, noteText: draft.noteText,
-        signedOriginal: draft.signedOriginal, signedCopy: draft.signedCopy,
-        incomingVoOriginal: draft.incomingVoOriginal, incomingVoCopy: draft.incomingVoCopy,
-        outgoingVoOriginal: draft.outgoingVoOriginal, outgoingVoOriginalDate: draft.outgoingVoOriginalDate, outgoingVoCopy: draft.outgoingVoCopy,
-        submitted: draft.submitted, vendorInvoice: draft.vendorInvoice, tier: draft.tier,
-        payable: draft.payable, profitPercent: draft.profitPercent, profit: draft.profit,
-      } }
-    : acceptance),
-});
 
 function ReportMetadataEditor({ draft, setDraft }: { draft: ReportSourceDraft; setDraft: (draft: ReportSourceDraft) => void }) {
   return <><div className="grid3">
@@ -5945,8 +5974,15 @@ function Journal({
 }
 type BillingUnitDraft = { rate: string; priced: boolean };
 
-function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeAccess: ReturnType<typeof financeUiMode> }) {
+function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFinance: FinanceSave; financeAccess: ReturnType<typeof financeUiMode> }) {
   const authUserId = useAuthOwner();
+  const [financeSaving, setFinanceSaving] = useState(false);
+  const [receivableMessage, setReceivableMessage] = useState("");
+  const billingBaseRef = useRef(p);
+  const billingEventsRef = useRef<Record<string, { id: string; at: string }>>({});
+  const reportBaseRef = useRef(p);
+  const receivableBaseRef = useRef(p);
+  const receivableRecordsRef = useRef<AcceptanceExportRecord[]>([]);
   const { canExportReceivables, canExportShipment, canManageFinance } = financeAccess;
   const needsProtectedFinanceData = !canManageFinance && (canExportReceivables || canExportShipment);
   const [protectedFinanceData, setProtectedFinanceData] = useState<FinanceExportData | null>(null);
@@ -6014,18 +6050,18 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
     [shipmentReportDraft, setShipmentReportDraft] = useState<ReportSourceDraft | null>(null),
     [shipmentReportMessage, setShipmentReportMessage] = useState(""),
     ym = `${y}-${m}`,
-    monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(financeExportProject).filter((record) => {
+    monthlyBillingRecords = financeExportProject ? buildAcceptanceExportRecords(editing && canManageFinance ? billingBaseRef.current : financeExportProject).filter((record) => {
       const shipmentDate = record.shipmentDateText?.trim() || record.exportDate;
       return shipmentDate.startsWith(ym);
     }) : [],
     monthlyUnitIds = new Set(monthlyBillingRecords.map((record) => record.unitId)),
     monthlyUnits = p.units.filter((unit) => monthlyUnitIds.has(unit.id)),
     billRecords = monthlyBillingRecords.filter((record) => {
-      const unit = financeExportProject?.units?.find((item) => item.id === record.unitId);
+      const unit = (editing && canManageFinance ? billingBaseRef.current : financeExportProject)?.units?.find((item) => item.id === record.unitId);
       return unit ? unit.status === "已驗收" || unit.status === "已計價" : false;
     }),
     billRows = billRecords.flatMap((record) => {
-      const unit = p.units.find((item) => item.id === record.unitId);
+      const unit = (editing ? billingBaseRef.current : p).units.find((item) => item.id === record.unitId);
       return unit ? [{ unit, record }] : [];
     }),
     shipmentRecords = monthlyBillingRecords,
@@ -6052,6 +6088,8 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
     ),
     startEditing = () => {
       if (!canManageFinance) return;
+      billingBaseRef.current = p;
+      billingEventsRef.current = {};
       setBillingDrafts(Object.fromEntries(billRows.map(({ unit }) => [unit.id, {
         rate: String(unit.rate ?? ""),
         priced: unit.status === "已計價",
@@ -6070,36 +6108,22 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       setBillingMessage("");
       setSaveConfirmation(true);
     },
-    confirmSave = () => {
-      if (!canManageFinance) return;
-      const changes = new Map(billingChanges.map((row) => [row.unit.id, row]));
-      patch({
-        units: p.units.map((unit) => {
-          const changed = changes.get(unit.id);
-          if (!changed) return unit;
-          const rate = safeDraftRate(changed.draft.rate),
-            wasPriced = unit.status === "已計價",
-            pricingStatusChanged = changed.draft.priced !== wasPriced;
-          return {
-            ...unit,
-            rate,
-            ...(pricingStatusChanged ? {
-              status: changed.draft.priced ? "已計價" : "已驗收",
-              pricedAt: changed.draft.priced ? day() : "",
-              events: [{
-                id: id(),
-                at: stamp(),
-                title: changed.draft.priced ? "月結已計價" : "月結取消計價",
-                detail: changed.draft.priced ? `金額 ${changed.record.amount}` : "狀態恢復為已驗收",
-                photos: [],
-              }, ...unit.events],
-            } : {}),
-          };
-        }),
-      });
-      setSaveConfirmation(false);
-      setBillingDrafts({});
-      setEditing(false);
+    confirmSave = async () => {
+      if (!canManageFinance || financeSaving) return;
+      setFinanceSaving(true);
+      setBillingMessage("尚未完成 Supabase 同步／請勿關閉頁面，正在核對資料…");
+      const changes = billingChanges.map((row) => ({ unitId: row.unit.id, rate: safeDraftRate(row.draft.rate), priced: row.draft.priced,
+        event: { ...(billingEventsRef.current[row.unit.id] ||= { id: id(), at: stamp() }), title: row.draft.priced ? "月結已計價" : "月結取消計價",
+          detail: row.draft.priced ? `金額 ${row.record.amount}` : "狀態恢復為已驗收", photos: [] as Photo[] },
+      }));
+      try {
+        await persistFinance(billingBaseRef.current, (current) => applyBillingChanges(current, changes, day()));
+        setSaveConfirmation(false);
+        setBillingDrafts({});
+        setEditing(false);
+        setBillingMessage("✓ 月結資料已與 Supabase 同步並核對");
+      } catch (error) { setBillingMessage(error instanceof Error ? error.message : financeSyncError); }
+      finally { setFinanceSaving(false); }
     },
     startShipmentReportEdit = (record: AcceptanceExportRecord, index: number) => {
       if (!canManageFinance) return;
@@ -6107,25 +6131,50 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       const unit = p.units.find((candidate) => candidate.id === record.unitId);
       const acceptance = unit ? getLatestFinalAcceptance(unit) : undefined;
       if (!unit || !acceptance) return setShipmentReportMessage("此筆沒有可修改的正式驗收紀錄");
+      reportBaseRef.current = p;
       setShipmentReportDraft(reportSourceDraftFor(record, index, unit, acceptance as Acceptance));
       setShipmentReportMessage("");
     },
-    saveShipmentReportSource = () => {
-      if (!canManageFinance) return;
-      if (!shipmentReportDraft) return;
-      const currentUnit = p.units.find((unit) => unit.id === shipmentReportDraft.unitId);
-      const currentAcceptance = currentUnit?.acceptances.find((acceptance) => acceptance.id === shipmentReportDraft.acceptanceId && acceptance.draft !== true);
-      if (!currentUnit || !currentAcceptance) return setShipmentReportMessage("找不到原正式驗收紀錄，未保存任何修改");
-      const updatedUnit = updateReportSource(currentUnit, shipmentReportDraft);
-      const updatedAcceptance = updatedUnit.acceptances.find((acceptance) => acceptance.id === shipmentReportDraft.acceptanceId)!;
-      patch({ units: p.units.map((unit) => unit.id === updatedUnit.id ? updatedUnit : unit) });
-      queueRecordChange(authUserId, "accept", updatedUnit.id, updatedAcceptance, "complete");
-      setShipmentReportDraft(null);
-      setShipmentReportMessage("✓ 正式報表來源資料已保存");
+    saveShipmentReportSource = async () => {
+      if (!canManageFinance || !shipmentReportDraft || financeSaving) return;
+      const draft = shipmentReportDraft;
+      setFinanceSaving(true);
+      setShipmentReportMessage("尚未完成 Supabase 同步／請勿關閉頁面，正在核對資料…");
+      try {
+        await persistFinance(reportBaseRef.current, (current) => {
+          const unit = current.units.find((unit) => unit.id === draft.unitId && !isDeletedEntity(unit));
+          if (!unit?.acceptances.some((a) => a.id === draft.acceptanceId && a.draft !== true)) throw new Error("找不到原正式驗收紀錄，未保存任何修改");
+          const updated = updateReportSource(unit, draft);
+          return { ...current, units: current.units.map((u) => u.id === updated.id ? updated : u) };
+        }, (next) => {
+          const unit = next.units.find((u) => u.id === draft.unitId)!;
+          queueRecordChange(authUserId, "accept", unit.id, unit.acceptances.find((a) => a.id === draft.acceptanceId)!, "complete");
+        });
+        setShipmentReportDraft(null);
+        setShipmentReportMessage("✓ 正式報表來源已與 Supabase 同步並核對");
+      } catch (error) { setShipmentReportMessage(error instanceof Error ? error.message : financeSyncError); }
+      finally { setFinanceSaving(false); }
+    },
+    saveReceivableSource = async () => {
+      if (!canManageFinance || !receivableDraft || financeSaving) return;
+      setFinanceSaving(true);
+      setReceivableMessage("尚未完成 Supabase 同步／請勿關閉頁面，正在核對資料…");
+      const metadata = receivableReportMetadata(receivableDraft, receivableRecordsRef.current);
+      try {
+        await persistFinance(receivableBaseRef.current, (current) => ({ ...current,
+          receivableReports: { ...current.receivableReports, [ym]: metadata },
+        }));
+        receivableBaseRef.current = { ...p, receivableReports: { ...p.receivableReports, [ym]: metadata } };
+        setReceivableMessage("✓ 本月應收資料已與 Supabase 同步並核對");
+      } catch (error) { setReceivableMessage(error instanceof Error ? error.message : financeSyncError); }
+      finally { setFinanceSaving(false); }
     },
     openReceivablePreview = () => {
       if (!receivableExportReady || !financeExportProject) return;
-      setReceivableDraft(buildReceivableExportDraft(financeExportProject, billRecords));
+      receivableBaseRef.current = p;
+      receivableRecordsRef.current = billRecords;
+      setReceivableMessage("");
+      setReceivableDraft(loadReceivableReportDraft(financeExportProject, billRecords, ym));
       setReceivablePreview(true);
     },
     openShipmentPreview = () => {
@@ -6144,10 +6193,21 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       const sourceUnit = p.units.find((unit) => unit.id === entry.unit.id);
       const sourceAcceptance = sourceUnit?.acceptances.find((acceptance) => acceptance.id === entry.acceptance.id && acceptance.draft !== true);
       if (!sourceUnit || !sourceAcceptance) return setShipmentReportMessage("找不到原正式驗收紀錄，未開啟修改");
+      reportBaseRef.current = p;
       setShipmentReportDraft(reportSourceDraftFor(record, index, sourceUnit, sourceAcceptance));
       setShipmentReportMessage("");
     },
+    closeReceivablePreview = () => {
+      if (financeSaving) return;
+      if (canManageFinance && receivableDraft && JSON.stringify(receivableDraft) !== JSON.stringify(loadReceivableReportDraft(receivableBaseRef.current, receivableRecordsRef.current, ym))) {
+        setReceivableMessage("尚有未保存或未完成 Supabase 同步的應收資料，請先保存，請勿關閉頁面。");
+        return;
+      }
+      setReceivablePreview(false);
+      setReceivableDraft(null);
+    },
     changeBillingPeriod = (kind: "year" | "month", value: string) => {
+      if (receivablePreview || financeSaving) return;
       if (editing && billingChanges.length) {
         setBillingMessage("目前有尚未保存的修改，請先保存或取消修改後再切換月份。");
         return;
@@ -6156,7 +6216,7 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
       if (kind === "year") setY(value); else setM(value);
     };
   return (
-    <div className="panel form billing-print-area">
+    <fieldset disabled={financeSaving} style={{ border: 0, margin: 0, minWidth: 0 }} className="panel form billing-print-area">
       <div className="panel-head">
         <div>
           <h2>月結／計價總表</h2>
@@ -6280,20 +6340,20 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
         <div className="form">
           <div className="export-summary"><span>案場名稱<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>修改戶別數<b>{billingChanges.length}</b></span><span>保存後總額<b>NT$ {previewSubtotal.toLocaleString()}</b></span></div>
           <div className="table-wrap"><table><thead><tr><th>戶別</th><th>單價變更</th><th>狀態變更</th></tr></thead><tbody>{billingChanges.map(({ unit, draft }) => <tr key={unit.id}><td>{unit.building} {unit.floor} {unit.number}</td><td>{safeDraftRate(draft.rate) !== Number(unit.rate || 0) ? `${Number(unit.rate || 0).toLocaleString()} → ${safeDraftRate(draft.rate).toLocaleString()}` : "—"}</td><td>{draft.priced !== (unit.status === "已計價") ? `${unit.status} → ${draft.priced ? "已計價" : "已驗收"}` : "—"}</td></tr>)}</tbody></table></div>
-          <div className="form-actions"><button type="button" className="ghost" onClick={() => setSaveConfirmation(false)}>返回修改</button><button type="button" className="primary" onClick={confirmSave}>確認保存</button></div>
+          <div role="status">{billingMessage}</div><div className="form-actions"><button type="button" className="ghost" onClick={() => setSaveConfirmation(false)}>返回修改</button><button type="button" className="primary" onClick={confirmSave}>確認保存</button></div>
         </div>
       </Modal>}
-      {canExportReceivables && receivablePreview && receivableDraft && <Modal close={() => { setReceivablePreview(false); setReceivableDraft(null); }} title="應收帳款 Excel｜匯出預覽">
+      {canExportReceivables && receivablePreview && receivableDraft && <Modal close={closeReceivablePreview} title="應收帳款 Excel｜匯出預覽">
         <div className="form export-preview">
-          <div className="export-summary"><span>案場<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>實際戶別筆數<b>{billRecords.length}</b></span><span>資料來源<b>目前月結戶別</b></span></div>
+          <div className="export-summary"><span>案場<b>{p.name}</b></span><span>計價月份<b>{ym}</b></span><span>實際戶別筆數<b>{receivableRecordsRef.current.length}</b></span><span>資料來源<b>目前月結戶別</b></span></div>
           <section className="panel form">
-            <div className="panel-head"><div><h3>送貨資料</h3><p>僅套用到這次匯出的 Excel。</p></div></div>
+            <div className="panel-head"><div><h3>送貨資料</h3><p>{canManageFinance ? "編輯後請保存本月應收資料，同步後其他管理裝置可讀取。" : "目前帳號的調整僅用於本次匯出。"}</p></div></div>
             <div className="grid3">
               <Field label="送貨聯絡人" value={receivableDraft.deliveryContact} set={(deliveryContact: string) => setReceivableDraft({ ...receivableDraft, deliveryContact })} />
               <Field label="送貨地址" value={receivableDraft.deliveryAddress} set={(deliveryAddress: string) => setReceivableDraft({ ...receivableDraft, deliveryAddress })} />
             </div>
           </section>
-          <div className="export-preview-table receivable-preview-table"><table><thead><tr><th>日期</th><th>戶別</th><th>型號</th><th>尺寸cm</th><th>數量(坪)</th><th>單價／元</th><th>合計</th><th>備註</th></tr></thead><tbody>{billRecords.map((record, index) => {
+          <div className="export-preview-table receivable-preview-table"><table><thead><tr><th>日期</th><th>戶別</th><th>型號</th><th>尺寸cm</th><th>數量(坪)</th><th>單價／元</th><th>合計</th><th>備註</th></tr></thead><tbody>{receivableRecordsRef.current.map((record, index) => {
             const detail = receivableDraft.details[index];
             const updateDetail = (updates: Partial<typeof detail>) => setReceivableDraft({ ...receivableDraft, details: receivableDraft.details.map((item, detailIndex) => detailIndex === index ? { ...item, ...updates } : item) });
             const amount = receivableDetailAmount(detail);
@@ -6333,7 +6393,9 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
             ["傳真", companyReportConfig.fax],
             ["地址", companyReportConfig.address],
           ]} />
-          <div className="form-actions"><button type="button" className="ghost" onClick={() => { setReceivablePreview(false); setReceivableDraft(null); }}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !billRecords.length || !receivableExportReady} onClick={async () => { if (!receivableExportReady || !financeExportProject) return; setReceivableExporting(true); try { const workbook = createReceivableWorkbook(financeExportProject, billRecords, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${financeExportProject.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
+          {receivableMessage && <div role="status" className="warning">{receivableMessage}</div>}
+          {canManageFinance && <button type="button" className="primary" onClick={saveReceivableSource}>保存本月應收資料</button>}
+          <div className="form-actions"><button type="button" className="ghost" onClick={closeReceivablePreview}>取消／返回</button><button type="button" className="primary" disabled={receivableExporting || !receivableRecordsRef.current.length || !receivableExportReady} onClick={async () => { if (!receivableExportReady || !financeExportProject) return; setReceivableExporting(true); try { const workbook = createReceivableWorkbook(financeExportProject, receivableRecordsRef.current, ym, receivableDraft); saveReceivableWorkbook(workbook, `${ym}-${financeExportProject.name}-SPC應收帳款明細表.xlsx`); } finally { setReceivableExporting(false); } }}>{receivableExporting ? "產生中…" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
       {canExportShipment && shipmentPreview && <Modal close={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setShipmentPreview(false); setShipmentReportMessage(""); }} title="SPC 已出貨明細總表｜匯出預覽">
@@ -6359,7 +6421,7 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
           <div className="form-actions"><button className="ghost" onClick={() => { if (shipmentReportDraft) return setShipmentReportMessage("請先保存或取消報表修改"); setDailyShipmentPreview(false); setShipmentReportMessage(""); }}>返回修改</button><button className="primary" disabled={dailyShipmentExporting || !dailyShipmentRecords.length || !!shipmentReportDraft || !dailyShipmentExportReady} onClick={async () => { if (!dailyShipmentExportReady || !financeExportProject) return; setDailyShipmentExporting(true); try { const workbook = createShipmentWorkbook(financeExportProject, dailyShipmentRecords, dailyShipmentDate.slice(0, 7)); saveShipmentWorkbook(workbook, `${dailyShipmentDate}_${financeExportProject.name}_當日細總表.xlsx`); } finally { setDailyShipmentExporting(false); } }}>{dailyShipmentExporting ? "產生中…" : shipmentReportDraft ? "請先保存或取消修改" : "確認產生 Excel"}</button></div>
         </div>
       </Modal>}
-    </div>
+    </fieldset>
   );
 }
 type CompletionExportDraft = {
