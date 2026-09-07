@@ -8,6 +8,8 @@ const protectedCollections = new Set(["projects", "units", "surveys", "works", "
 const collectionName = (path: string) => path.split(".").at(-1) || "";
 const isDeleted = (value: unknown) => isRecord(value) && value._deleted === true;
 
+export const isProtectedEntityCollection = (path: string): boolean => protectedCollections.has(collectionName(path));
+
 export type EntityTombstone = { id: string; _deleted: true; deletedAt: string; deletedBy: string };
 
 export function tombstoneEntity<T extends { id: string }>(entity: T, deletedBy: string, deletedAt = new Date().toISOString()): T & EntityTombstone {
@@ -26,7 +28,7 @@ function protectedEntityArray(value: unknown): Array<Record<string, unknown> & {
 }
 
 function mergeNode(base: unknown, local: unknown, remote: unknown, path: string, conflicts: string[]): unknown {
-  if (protectedCollections.has(collectionName(path))) {
+  if (isProtectedEntityCollection(path)) {
     const bItems = protectedEntityArray(base), lItems = protectedEntityArray(local), rItems = protectedEntityArray(remote);
     const b = new Map(bItems.map((x) => [x.id, x])), l = new Map(lItems.map((x) => [x.id, x])), r = new Map(rItems.map((x) => [x.id, x]));
     const order = [...new Set([...lItems.map((x) => x.id), ...rItems.map((x) => x.id), ...bItems.map((x) => x.id)])];

@@ -25,6 +25,7 @@ import { buildUnitScopedRecord, buildingNavigationUnits, createFloorReturnContex
 import { planJournalPhotoRows, planJournalPhotoPages, journalPhotoPlacement, positionJournalPhoto, type JournalPhotoDisplaySettings, type JournalPhotoDisplay, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 import { canWriteAcceptanceLifecycle, canWriteWorkLifecycle } from "../lib/unit-lifecycle";
 import { canConfirmUnit, canCreateUnit, canDeleteUnit, canEditUnitMaster, canUsePermissionUnitTab, canUsePermissionView, canViewCustomerDetails, financeUiMode } from "../lib/ui-permissions";
+import { containsWorkspaceChanges, workspaceSyncError } from "../lib/workspace-persistence.ts";
 
 type Status =
   | "待確認"
@@ -1222,9 +1223,10 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         const shared = { projects: normalize(committed.projects as Project[]), catalog: committed.catalog as Product[] };
         const committedFinance = financeSnapshot(shared.projects);
         if (committed.version < nextVersion
+          || !containsWorkspaceChanges(saveBase, { projects: uploaded, catalog: saveState.catalog }, shared)
           || !containsChanges(financeSnapshot(saveBase.projects), financeSnapshot(uploaded), committedFinance)
           || acknowledgements.some((item) => !containsChanges(item.base, item.intended, committedFinance))) {
-          throw new Error(financeSyncError);
+          throw new Error(workspaceSyncError);
         }
         // Only a verified reload can advance the baseline or acknowledge local edits.
         const stillCurrent = JSON.stringify(latestRef.current) === saveInput;

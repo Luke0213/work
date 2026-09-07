@@ -1,5 +1,6 @@
 import { threeWayMerge, isDeletedEntity } from "./three-way-merge.ts";
 import type { AcceptanceExportRecord, AcceptanceReportMetadata, ReceivableDetailDraft } from "./acceptance-exports.ts";
+import { containsWorkspaceChanges } from "./workspace-persistence.ts";
 
 export const updateReportSource = <T extends { acceptances: Array<{ id: string; report?: AcceptanceReportMetadata }> }>(unit: T, draft: AcceptanceReportMetadata & { unitId: string; acceptanceId: string }): T => ({
   ...unit,
@@ -22,24 +23,10 @@ export const updateReportSource = <T extends { acceptances: Array<{ id: string; 
 
 export const financeSyncError = "尚未完成 Supabase 同步／請勿關閉頁面：雲端尚未確認本次修改";
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-const record = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x);
 
 // Verify only intended changed fields; concurrent edits to unrelated fields are valid.
 export function containsChanges(base: unknown, intended: unknown, committed: unknown): boolean {
-  if (equal(base, intended)) return true;
-  if (Array.isArray(intended) && intended.every((x) => record(x) && typeof x.id === "string")) {
-    if (!Array.isArray(committed)) return false;
-    return intended.every((item) => containsChanges(
-      Array.isArray(base) ? base.find((x) => x.id === item.id) : undefined,
-      item, committed.find((x) => x.id === item.id),
-    ));
-  }
-  if (record(intended)) {
-    if (!record(committed) || (committed._deleted === true && intended._deleted !== true)) return false;
-    return [...new Set([...Object.keys(record(base) ? base : {}), ...Object.keys(intended)])]
-      .every((key) => containsChanges(record(base) ? base[key] : undefined, intended[key], committed[key]));
-  }
-  return equal(intended, committed);
+  return containsWorkspaceChanges(base, intended, committed);
 }
 
 type FinanceProject = { id: string; receivableReports?: unknown; units: Array<{
