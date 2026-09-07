@@ -7,6 +7,7 @@ export type AcceptanceExportRecord = {
   address: string;
   contact: string;
   unitId: string;
+  acceptanceId: string;
   unitDisplay: string;
   model: string;
   colorNo: string;
@@ -104,6 +105,7 @@ export function buildAcceptanceExportRecord(project: ExportProject, unit: Export
     address: project.address || "",
     contact: project.contact || "",
     unitId: unit.id,
+    acceptanceId: acceptance?.id || "",
     unitDisplay: [unit.building, unit.floor, unit.number].filter(Boolean).join(" "),
     model: unit.model || "",
     colorNo: unit.colorNo || "",
@@ -195,21 +197,28 @@ export type ReceivableExportDraft = {
 };
 
 export type ReceivableReportMetadata = Omit<ReceivableExportDraft, "details"> & {
-  detailsByUnit: Record<string, ReceivableDetailDraft>;
+  // Older workspaces can contain every detail field here. Only sizeCm is
+  // receivable-only; shared fields are rebuilt from Acceptance.report.
+  detailsByUnit?: Record<string, Partial<ReceivableDetailDraft>>;
 };
 
 export function receivableReportMetadata(draft: ReceivableExportDraft, records: AcceptanceExportRecord[]): ReceivableReportMetadata {
   const { details, ...headerAndSummary } = draft;
-  return { ...headerAndSummary, detailsByUnit: Object.fromEntries(records.map((record, index) => [record.unitId, { ...details[index] }])) };
+  return { ...headerAndSummary, detailsByUnit: Object.fromEntries(records.map((record, index) => [record.unitId, {
+    sizeCm: details[index]?.sizeCm || "",
+  }])) };
 }
 
 export function loadReceivableReportDraft(project: ExportProject, records: AcceptanceExportRecord[], month: string): ReceivableExportDraft {
   const defaults = buildReceivableExportDraft(project, records);
   const saved = project.receivableReports?.[month];
   if (!saved) return defaults;
-  const { detailsByUnit, ...headerAndSummary } = saved;
+  const { detailsByUnit = {}, ...headerAndSummary } = saved;
   return { ...defaults, ...headerAndSummary,
-    details: records.map((record, index) => ({ ...defaults.details[index], ...detailsByUnit[record.unitId] })),
+    details: records.map((record, index) => ({
+      ...defaults.details[index],
+      sizeCm: detailsByUnit[record.unitId]?.sizeCm ?? defaults.details[index].sizeCm,
+    })),
   };
 }
 

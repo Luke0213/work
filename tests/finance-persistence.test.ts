@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { applyBillingChanges, canApplySharedReload, containsChanges, financeSnapshot, rebaseProjectEdit, updateReportSource } from "../lib/finance-persistence.ts";
-import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, loadReceivableReportDraft, receivableReportMetadata, createShipmentWorkbook } from "../lib/acceptance-exports.ts";
+import { applyBillingChanges, applyReceivableSharedFields, canApplySharedReload, containsChanges, financeSnapshot, rebaseProjectEdit, updateReportSource } from "../lib/finance-persistence.ts";
+import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, loadReceivableReportDraft, receivableReportMetadata, createShipmentWorkbook, shipmentDisplayValues } from "../lib/acceptance-exports.ts";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances.ts";
 import { threeWayMerge } from "../lib/three-way-merge.ts";
 
@@ -51,28 +51,110 @@ test("monthly and daily shipments rebuild and export the same persisted report",
   }
 });
 
-test("all receivable custom values survive close/reopen from project + month metadata", () => {
+test("receivable-only metadata survives close/reopen without owning shared detail fields", () => {
   const records = buildAcceptanceExportRecords(project);
   const draft = loadReceivableReportDraft(project, records, "2026-09");
   for (const key of Object.keys(draft).filter((k) => k !== "details")) (draft as any)[key] = `custom-${key}`;
-  for (const key of Object.keys(draft.details[0])) (draft.details[0] as any)[key] = `detail-${key}`;
+  draft.details[0].sizeCm = "18x122";
+  draft.details[0].quantity = "stale-shared-value";
   const saved = reload({ ...project, receivableReports: { "2026-09": receivableReportMetadata(draft, records) } });
-  assert.deepEqual(loadReceivableReportDraft(saved, records, "2026-09"), draft);
+  const reopened = loadReceivableReportDraft(saved, records, "2026-09");
+  for (const key of Object.keys(draft).filter((key) => key !== "details")) {
+    assert.equal((reopened as any)[key], (draft as any)[key], key);
+  }
+  assert.equal(reopened.details[0].sizeCm, "18x122");
+  assert.equal(reopened.details[0].quantity, "10");
   assert.equal(loadReceivableReportDraft(saved, records, "2026-10").deliveryContact, "contact");
   const otherProject = { ...project, id: "p2" };
   assert.equal(loadReceivableReportDraft(otherProject, records, "2026-09").deliveryContact, "contact");
   assert.deepEqual(saved.units, project.units);
 });
 
-test("old projects get current defaults and rows follow unit identity instead of row index", () => {
+test("old projects use shipment defaults and receivable-only size follows unit identity", () => {
   const records = buildAcceptanceExportRecords(project);
   assert.equal(loadReceivableReportDraft(project, records, "2026-09").details[0].unitPrice, "100");
   const draft = loadReceivableReportDraft(project, records, "2026-09");
-  draft.details[0].note = "u1 only";
+  draft.details[0].sizeCm = "u1 size";
   const saved = { ...project, receivableReports: { "2026-09": receivableReportMetadata(draft, records) } };
   const reopened = loadReceivableReportDraft(saved, [{ ...records[0], unitId: "u2" }, ...records], "2026-09");
   assert.equal(reopened.details[0].note, "old");
-  assert.equal(reopened.details[1].note, "u1 only");
+  assert.equal(reopened.details[0].sizeCm, "");
+  assert.equal(reopened.details[1].sizeCm, "u1 size");
+});
+
+test("newer shipment fields win over legacy receivable shared details", () => {
+  const shipped: any = reportEdit();
+  shipped.units[0].acceptances[0].report.pingText = "25";
+  shipped.receivableReports = { "2026-09": {
+    ...receivableReportMetadata(loadReceivableReportDraft(shipped, buildAcceptanceExportRecords(shipped), "2026-09"), buildAcceptanceExportRecords(shipped)),
+    detailsByUnit: { u1: { quantity: "18", unitPrice: "900", note: "legacy", sizeCm: "18x122" } },
+  } };
+  const records = buildAcceptanceExportRecords(shipped);
+  const reopened = loadReceivableReportDraft(shipped, records, "2026-09");
+  assert.equal(reopened.details[0].quantity, "25");
+  assert.equal(reopened.details[0].unitPrice, "100");
+  assert.equal(reopened.details[0].note, "edited");
+  assert.equal(reopened.details[0].sizeCm, "18x122");
+});
+
+test("receivable shared edits update the exact formal Acceptance.report", () => {
+  const source: any = reportEdit();
+  source.units[0].acceptances[0].report.unitPriceText = "1000";
+  const records = buildAcceptanceExportRecords(source);
+  const original = loadReceivableReportDraft(source, records, "2026-09");
+  const edited = reload(original);
+  edited.details[0] = { ...edited.details[0], date: "115.09.07", model: "M2", unitDisplay: "B 2 3",
+    quantity: "20", unitPrice: "1200", note: "應收同步備註", sizeCm: "18x122" };
+  const saved = applyReceivableSharedFields(source, records, original.details, edited.details);
+  const rebuilt = buildAcceptanceExportRecords(saved)[0];
+  const display = shipmentDisplayValues(rebuilt, 0);
+  assert.equal(display.shipmentDateText, "115.09.07");
+  assert.equal(display.productText, "M2");
+  assert.equal(display.unitDisplayText, "B 2 3");
+  assert.equal(display.pingText, "20");
+  assert.equal(display.unitPriceText, "1200");
+  assert.equal(display.noteText, "應收同步備註");
+  assert.equal(rebuilt.amountText, "27500");
+});
+
+test("receivable shared save fails closed and preserves unrelated acceptance data", () => {
+  const protectedProject: any = reload({ ...project, units: [
+    { ...project.units[0], acceptances: [{ ...project.units[0].acceptances[0],
+      items: [{ id: "item", result: "ok" }], completion: { id: "completion" }, photos: [{ id: "photo", data: "spc-storage://same" }],
+    }] },
+    { ...project.units[0], id: "u2" },
+  ] });
+  const records = buildAcceptanceExportRecords(protectedProject).filter((record) => record.unitId === "u1");
+  const original = loadReceivableReportDraft(protectedProject, records, "2026-09");
+  const edited = reload(original);
+  edited.details[0].note = "new note";
+  const saved = applyReceivableSharedFields(protectedProject, records, original.details, edited.details);
+  assert.deepEqual(saved.units[0].acceptances[0].photos, protectedProject.units[0].acceptances[0].photos);
+  assert.deepEqual(saved.units[0].acceptances[0].items, protectedProject.units[0].acceptances[0].items);
+  assert.deepEqual(saved.units[0].acceptances[0].completion, protectedProject.units[0].acceptances[0].completion);
+  assert.deepEqual(saved.units[1], protectedProject.units[1]);
+  assert.deepEqual(saved.units[0].events, protectedProject.units[0].events);
+  assert.throws(() => applyReceivableSharedFields(protectedProject, [{ ...records[0], acceptanceId: "missing" }], original.details, edited.details));
+  assert.throws(() => applyReceivableSharedFields(protectedProject, [{ ...records[0], unitId: "missing" }], original.details, edited.details));
+  assert.throws(() => applyReceivableSharedFields(protectedProject, records, [], edited.details));
+});
+
+test("receivable-only metadata remains scoped by month", () => {
+  const records = buildAcceptanceExportRecords(project);
+  const september = loadReceivableReportDraft(project, records, "2026-09");
+  const october = loadReceivableReportDraft(project, records, "2026-10");
+  september.receivedAmount = "9000";
+  september.receivedDate = "2026-09-30";
+  september.preparedBy = "Amy";
+  october.receivedAmount = "10000";
+  const saved = { ...project, receivableReports: {
+    "2026-09": receivableReportMetadata(september, records),
+    "2026-10": receivableReportMetadata(october, records),
+  } };
+  assert.equal(loadReceivableReportDraft(saved, records, "2026-09").receivedAmount, "9000");
+  assert.equal(loadReceivableReportDraft(saved, records, "2026-09").preparedBy, "Amy");
+  assert.equal(loadReceivableReportDraft(saved, records, "2026-10").receivedAmount, "10000");
+  assert.equal(loadReceivableReportDraft(saved, records, "2026-10").preparedBy, "");
 });
 
 test("a stale project edit preserves concurrent report, other units and history", () => {
@@ -110,6 +192,21 @@ test("version success alone cannot verify missing rate, pricing, event or report
   }
 });
 
+test("verification covers Acceptance.report and receivableReports in one intended save", () => {
+  const records = buildAcceptanceExportRecords(project);
+  const original = loadReceivableReportDraft(project, records, "2026-09");
+  const edited = reload(original);
+  edited.details[0].unitPrice = "1200";
+  edited.receivedAmount = "12000";
+  const withShared = applyReceivableSharedFields(project, records, original.details, edited.details);
+  const intended = { ...withShared, receivableReports: { "2026-09": receivableReportMetadata(edited, records) } };
+  const base = financeSnapshot([project]);
+  const next = financeSnapshot([intended]);
+  assert.equal(containsChanges(base, next, financeSnapshot([reload(intended)])), true);
+  assert.equal(containsChanges(base, next, financeSnapshot([{ ...intended, units: project.units }])), false);
+  assert.equal(containsChanges(base, next, financeSnapshot([{ ...intended, receivableReports: {} }])), false);
+});
+
 test("verification allows unrelated remote edits but rejects tombstoned targets", () => {
   const saved = { ...edit(), name: "remote name" };
   assert.equal(containsChanges(financeSnapshot([project]), financeSnapshot([edit()]), financeSnapshot([saved])), true);
@@ -139,6 +236,8 @@ test("save wiring verifies reload before baseline/outbox acknowledgement and awa
   assert.match(billing, /await persistFinance\(billingBaseRef.current/);
   assert.match(billing, /await persistFinance\(reportBaseRef.current/);
   assert.match(billing, /await persistFinance\(receivableBaseRef.current/);
+  assert.ok(billing.indexOf("applyReceivableSharedFields(") < billing.indexOf("receivableReports: { ...withSharedFields.receivableReports"));
+  assert.ok(billing.indexOf("await persistFinance(receivableBaseRef.current") < billing.indexOf("setReceivableMessage(\"✓ 本月應收資料已與 Supabase 同步並核對\")"));
   assert.doesNotMatch(billing, /patch\(\{ units: p.units/);
   assert.doesNotMatch(billing, /\?{4}/);
 });

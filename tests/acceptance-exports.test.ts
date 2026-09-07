@@ -232,8 +232,8 @@ test("receivable invoice track and date initialize and export independently", ()
 
 test("shipment workbook converts square meters to ping and keeps amount formulas editable", () => {
   const records = [
-    { projectName: "測試案場", address: "", contact: "", unitId: "u6680", unitDisplay: "A2-2", model: "Y5006", colorNo: "伊西斯", vendor: "", workDate: "2026-08-01", acceptanceDate: "", exportDate: "2026-08-01", areaPing: 20.21, areaSquareMeters: 66.8, unitPrice: 2750, amount: 55578, note: "", ...emptyReportFields },
-    { projectName: "測試案場", address: "", contact: "", unitId: "u4110", unitDisplay: "A4-1", model: "Y5006", colorNo: "伊西斯", vendor: "", workDate: "2026-08-02", acceptanceDate: "", exportDate: "2026-08-02", areaPing: 12.43, areaSquareMeters: 41.1, unitPrice: 0, amount: 0, note: "", ...emptyReportFields },
+    { projectName: "測試案場", address: "", contact: "", unitId: "u6680", acceptanceId: "", unitDisplay: "A2-2", model: "Y5006", colorNo: "伊西斯", vendor: "", workDate: "2026-08-01", acceptanceDate: "", exportDate: "2026-08-01", areaPing: 20.21, areaSquareMeters: 66.8, unitPrice: 2750, amount: 55578, note: "", ...emptyReportFields },
+    { projectName: "測試案場", address: "", contact: "", unitId: "u4110", acceptanceId: "", unitDisplay: "A4-1", model: "Y5006", colorNo: "伊西斯", vendor: "", workDate: "2026-08-02", acceptanceDate: "", exportDate: "2026-08-02", areaPing: 12.43, areaSquareMeters: 41.1, unitPrice: 0, amount: 0, note: "", ...emptyReportFields },
   ];
   const workbook = createShipmentWorkbook({ name: "測試案場", units: [] }, records, "2026-08") as {
     Sheets: Record<string, Record<string, { f?: string; v?: string | number; z?: string }>>;

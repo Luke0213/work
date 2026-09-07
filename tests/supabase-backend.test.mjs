@@ -1358,7 +1358,9 @@ test("receivable Excel restores project-month data into its export preview", asy
   const receivableModal = billing.slice(billing.indexOf("{canExportReceivables && receivablePreview && receivableDraft"), billing.indexOf("{canExportShipment && shipmentPreview &&"));
 
   assert.match(billing, /onClick=\{openReceivablePreview\}[\s\S]*<b>應收帳款 Excel<\/b>[\s\S]*<em>預覽 ›<\/em>/);
-  assert.match(receivableFlow, /setReceivableDraft\(loadReceivableReportDraft\(financeExportProject, billRecords, ym\)\)/);
+  assert.match(receivableFlow, /const draft = loadReceivableReportDraft\(financeExportProject, billRecords, ym\);[\s\S]*receivableDraftBaseRef\.current = structuredClone\(draft\);[\s\S]*setReceivableDraft\(draft\)/);
+  assert.match(billing, /applyReceivableSharedFields\([\s\S]*current, receivableRecordsRef\.current, original\.details, receivableDraft\.details/);
+  assert.match(billing, /receivableReports: \{ \.\.\.withSharedFields\.receivableReports, \[ym\]: metadata \}/);
   assert.match(receivableModal, /title="應收帳款 Excel｜匯出預覽"/);
   assert.match(receivableModal, /receivableRecordsRef.current\.map\(\(record, index\)/);
   assert.match(receivableModal, /className="export-preview-table receivable-preview-table"/);

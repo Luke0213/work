@@ -1,5 +1,5 @@
 import { threeWayMerge, isDeletedEntity } from "./three-way-merge.ts";
-import type { AcceptanceReportMetadata } from "./acceptance-exports.ts";
+import type { AcceptanceExportRecord, AcceptanceReportMetadata, ReceivableDetailDraft } from "./acceptance-exports.ts";
 
 export const updateReportSource = <T extends { acceptances: Array<{ id: string; report?: AcceptanceReportMetadata }> }>(unit: T, draft: AcceptanceReportMetadata & { unitId: string; acceptanceId: string }): T => ({
   ...unit,
@@ -82,5 +82,57 @@ export function applyBillingChanges<T extends { units: U[] }, U extends {
       status: change.priced ? "已計價" : "已驗收", pricedAt: change.priced ? date : "",
       events: [change.event, ...unit.events],
     } : {}) };
+  }) };
+}
+
+type ReceivableAcceptance = {
+  id: string;
+  draft?: boolean;
+  report?: AcceptanceReportMetadata;
+};
+type ReceivableUnit = { id: string; acceptances: ReceivableAcceptance[] };
+
+const receivableSharedFields = [
+  ["date", "shipmentDateText"],
+  ["model", "productText"],
+  ["unitDisplay", "unitDisplayText"],
+  ["quantity", "pingText"],
+  ["unitPrice", "unitPriceText"],
+  ["note", "noteText"],
+] as const satisfies ReadonlyArray<readonly [keyof ReceivableDetailDraft, keyof AcceptanceReportMetadata]>;
+
+export function applyReceivableSharedFields<
+  T extends { units: U[] },
+  U extends ReceivableUnit,
+>(project: T, records: AcceptanceExportRecord[], original: ReceivableDetailDraft[], edited: ReceivableDetailDraft[]): T {
+  if (records.length !== original.length || records.length !== edited.length) {
+    throw new Error("應收明細列已變更，未保存任何修改");
+  }
+
+  const targets = records.map((record, index) => {
+    const unit = project.units.find((candidate) => candidate.id === record.unitId && !isDeletedEntity(candidate));
+    const acceptance = unit?.acceptances.find((candidate) =>
+      candidate.id === record.acceptanceId && candidate.draft !== true && !isDeletedEntity(candidate));
+    if (!unit || !acceptance || !record.acceptanceId) {
+      throw new Error("找不到應收明細對應的正式驗收紀錄，未保存任何修改");
+    }
+    const reportUpdates: AcceptanceReportMetadata = {};
+    for (const [detailKey, reportKey] of receivableSharedFields) {
+      if (edited[index][detailKey] !== original[index][detailKey]) {
+        reportUpdates[reportKey] = edited[index][detailKey];
+      }
+    }
+    return { unitId: unit.id, acceptanceId: acceptance.id, reportUpdates };
+  });
+
+  return { ...project, units: project.units.map((unit) => {
+    const unitTargets = targets.filter((target) => target.unitId === unit.id);
+    if (!unitTargets.length) return unit;
+    return { ...unit, acceptances: unit.acceptances.map((acceptance) => {
+      const target = unitTargets.find((candidate) => candidate.acceptanceId === acceptance.id);
+      return target && Object.keys(target.reportUpdates).length
+        ? { ...acceptance, report: { ...acceptance.report, ...target.reportUpdates } }
+        : acceptance;
+    }) };
   }) };
 }

@@ -1,5 +1,5 @@
 "use client";
-import { updateReportSource, applyBillingChanges, canApplySharedReload, containsChanges, financeSnapshot, financeSyncError, rebaseProjectEdit } from "../lib/finance-persistence.ts";
+import { updateReportSource, applyBillingChanges, applyReceivableSharedFields, canApplySharedReload, containsChanges, financeSnapshot, financeSyncError, rebaseProjectEdit } from "../lib/finance-persistence.ts";
 import { loadReceivableReportDraft, receivableReportMetadata, type ReceivableReportMetadata } from "../lib/acceptance-exports.ts";
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
@@ -5983,6 +5983,7 @@ function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFina
   const reportBaseRef = useRef(p);
   const receivableBaseRef = useRef(p);
   const receivableRecordsRef = useRef<AcceptanceExportRecord[]>([]);
+  const receivableDraftBaseRef = useRef<ReceivableExportDraft | null>(null);
   const { canExportReceivables, canExportShipment, canManageFinance } = financeAccess;
   const needsProtectedFinanceData = !canManageFinance && (canExportReceivables || canExportShipment);
   const [protectedFinanceData, setProtectedFinanceData] = useState<FinanceExportData | null>(null);
@@ -6161,10 +6162,30 @@ function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFina
       setReceivableMessage("尚未完成 Supabase 同步／請勿關閉頁面，正在核對資料…");
       const metadata = receivableReportMetadata(receivableDraft, receivableRecordsRef.current);
       try {
-        await persistFinance(receivableBaseRef.current, (current) => ({ ...current,
-          receivableReports: { ...current.receivableReports, [ym]: metadata },
-        }));
-        receivableBaseRef.current = { ...p, receivableReports: { ...p.receivableReports, [ym]: metadata } };
+        const original = receivableDraftBaseRef.current;
+        if (!original) throw new Error("找不到應收明細原始資料，未保存任何修改");
+        let verifiedProject: Project | null = null;
+        await persistFinance(receivableBaseRef.current, (current) => {
+          const withSharedFields = applyReceivableSharedFields(
+            current, receivableRecordsRef.current, original.details, receivableDraft.details,
+          );
+          return { ...withSharedFields,
+            receivableReports: { ...withSharedFields.receivableReports, [ym]: metadata },
+          };
+        }, (next) => {
+          verifiedProject = next;
+          for (const record of receivableRecordsRef.current) {
+            const before = receivableBaseRef.current.units.find((unit) => unit.id === record.unitId)
+              ?.acceptances.find((acceptance) => acceptance.id === record.acceptanceId);
+            const after = next.units.find((unit) => unit.id === record.unitId)
+              ?.acceptances.find((acceptance) => acceptance.id === record.acceptanceId);
+            if (after && JSON.stringify(before?.report) !== JSON.stringify(after.report)) {
+              queueRecordChange(authUserId, "accept", record.unitId, after, "complete");
+            }
+          }
+        });
+        if (verifiedProject) receivableBaseRef.current = verifiedProject;
+        receivableDraftBaseRef.current = structuredClone(receivableDraft);
         setReceivableMessage("✓ 本月應收資料已與 Supabase 同步並核對");
       } catch (error) { setReceivableMessage(error instanceof Error ? error.message : financeSyncError); }
       finally { setFinanceSaving(false); }
@@ -6174,7 +6195,9 @@ function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFina
       receivableBaseRef.current = p;
       receivableRecordsRef.current = billRecords;
       setReceivableMessage("");
-      setReceivableDraft(loadReceivableReportDraft(financeExportProject, billRecords, ym));
+      const draft = loadReceivableReportDraft(financeExportProject, billRecords, ym);
+      receivableDraftBaseRef.current = structuredClone(draft);
+      setReceivableDraft(draft);
       setReceivablePreview(true);
     },
     openShipmentPreview = () => {
@@ -6199,7 +6222,7 @@ function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFina
     },
     closeReceivablePreview = () => {
       if (financeSaving) return;
-      if (canManageFinance && receivableDraft && JSON.stringify(receivableDraft) !== JSON.stringify(loadReceivableReportDraft(receivableBaseRef.current, receivableRecordsRef.current, ym))) {
+      if (canManageFinance && receivableDraft && JSON.stringify(receivableDraft) !== JSON.stringify(receivableDraftBaseRef.current)) {
         setReceivableMessage("尚有未保存或未完成 Supabase 同步的應收資料，請先保存，請勿關閉頁面。");
         return;
       }
