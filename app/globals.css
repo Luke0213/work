@@ -1516,3 +1516,6 @@ img,canvas{max-width:100%}
 .shipment-export-preview.finance-readonly .export-preview-table td:first-child{
   display:none;
 }
+
+/* Export-only journal photo controls; preserve page columns on small screens. */
+.journal-export-page{display:grid;gap:10px}.journal-export-page+.journal-export-page{margin-top:28px;padding-top:24px;border-top:1px dashed #bbb}.journal-export-photo{min-width:0;display:grid;gap:6px;align-content:start}.journal-export-photo-image{display:flex;align-items:center;justify-content:center;min-width:0}.journal-export-photo-image img{object-fit:contain;max-height:none}.journal-export-photo label{display:grid;gap:4px;font-size:12px}.journal-export-photo select,.journal-export-photo input{width:100%;min-width:0;min-height:44px}.word-preview:has(.journal-export-photo) .word-preview-first-row{grid-template-columns:minmax(0,1fr) minmax(0,1.08fr)}.word-preview:has(.journal-export-photo) .word-preview-photo-row{display:flex;gap:4px}.word-preview:has(.journal-export-photo) .word-preview-photo-row>.journal-export-photo{flex:1}.word-preview:has(.journal-export-photo){max-width:720px;margin-inline:auto}.word-preview-meta{overflow-wrap:anywhere}

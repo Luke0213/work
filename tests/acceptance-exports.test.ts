@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDraftTotals } from "../lib/acceptance-exports.ts";
+import { buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDetailAmount, receivableDraftTotals } from "../lib/acceptance-exports.ts";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records.ts";
 
 const project = {
@@ -98,9 +98,9 @@ test("receivable workbook uses exactly one detail row and safe Excel formulas", 
   assert.equal(sheet.H7.v, "完成");
   assert.equal(sheet.A8.v, "");
   assert.equal(sheet.A9.v, "SPC");
-  assert.equal(sheet.G11.f, "SUM(G7:G7)");
-  assert.equal(sheet.G12.f, "ROUND(G11*5%,0)");
-  assert.equal(sheet.G13.f, "G11-G12");
+  assert.equal(sheet.G11.f, "SUMPRODUCT(E7:E7,F7:F7)");
+  assert.equal(sheet.G12.f, "G11*5%");
+  assert.equal(sheet.G13.f, "G11+G12");
   assert.equal(sheet.A14.v, "發票字軌：");
   assert.equal(sheet.A19.v, "匯款帳號如下：");
   assert.equal(sheet.A20.v, "永豐銀行 龍江分行 戶名:神銀建材資訊有限公司 帳號:148-018-0005023-3");
@@ -125,9 +125,9 @@ test("receivable workbook uses six actual detail rows before its summary", () =>
   assert.equal(sheet.G12.f, 'IF(OR(E12="",F12=""),0,E12*F12)');
   assert.equal(sheet.A13.v, "");
   assert.equal(sheet.A14.v, "SPC");
-  assert.equal(sheet.G16.f, "SUM(G7:G12)");
-  assert.equal(sheet.G17.f, "ROUND(G16*5%,0)");
-  assert.equal(sheet.G18.f, "G16-G17");
+  assert.equal(sheet.G16.f, "SUMPRODUCT(E7:E12,F7:F12)");
+  assert.equal(sheet.G17.f, "G16*5%");
+  assert.equal(sheet.G18.f, "G16+G17");
 });
 
 test("receivable workbook expands to twelve actual detail rows", () => {
@@ -140,9 +140,9 @@ test("receivable workbook expands to twelve actual detail rows", () => {
   assert.equal(sheet.G18.f, 'IF(OR(E18="",F18=""),0,E18*F18)');
   assert.equal(sheet.A19.v, "");
   assert.equal(sheet.A20.v, "SPC");
-  assert.equal(sheet.G22.f, "SUM(G7:G18)");
-  assert.equal(sheet.G23.f, "ROUND(G22*5%,0)");
-  assert.equal(sheet.G24.f, "G22-G23");
+  assert.equal(sheet.G22.f, "SUMPRODUCT(E7:E18,F7:F18)");
+  assert.equal(sheet.G23.f, "G22*5%");
+  assert.equal(sheet.G24.f, "G22+G23");
   assert.equal(sheet["!printArea"], "A1:H33");
 });
 
@@ -161,7 +161,7 @@ test("receivable export-only draft overrides editable document fields", () => {
     Sheets: Record<string, Record<string, { f?: string; v?: string | number; z?: string }>>;
   };
   const sheet = workbook.Sheets["應收帳款明細表"];
-  assert.deepEqual(receivableDraftTotals(draft), { subtotal: 49280, tax: 2464, receivable: 46816 });
+  assert.deepEqual(receivableDraftTotals(draft), { subtotal: 49280, tax: 2464, receivable: 51744 });
   assert.equal(sheet.B3.v, "林主任");
   assert.equal(sheet.B4.v, "台北市測試地址");
   assert.deepEqual([sheet.A7.v, sheet.B7.v, sheet.C7.v, sheet.D7.v, sheet.E7.v, sheet.F7.v], ["115.08.31", "", "手動型號", "18x122", 15.4, 3200]);
@@ -179,6 +179,55 @@ test("receivable export-only draft overrides editable document fields", () => {
   assert.equal(sheet.A17.v, "主管：主管甲");
   assert.equal(sheet.C17.v, "會計：會計乙");
   assert.equal(sheet.E17.v, "客戶簽名：");
+});
+
+test("receivable amounts and formula caches recalculate from editable quantities and prices", () => {
+  const source = buildAcceptanceExportRecords(project)[0];
+  const records = [source, { ...source, unitId: "u2" }];
+  const draft = buildReceivableExportDraft(project, records);
+  const close = (actual: unknown, expected: number) => assert.ok(typeof actual === "number" && Math.abs(actual - expected) < 1e-8, `${actual} != ${expected}`);
+  draft.details[0].quantity = "49.87";
+  draft.details[0].unitPrice = "123";
+  draft.details[1].quantity = "2";
+  draft.details[1].unitPrice = "100";
+  for (const price of ["123", "150"]) {
+    draft.details[0].unitPrice = price;
+    const subtotal = 49.87 * Number(price) + 200;
+    const totals = receivableDraftTotals(draft);
+    close(totals.subtotal, subtotal);
+    close(totals.tax, subtotal * 0.05);
+    close(totals.receivable, subtotal + totals.tax);
+    close(totals.receivable, subtotal * 1.05);
+    close(receivableDetailAmount(draft.details[0]), 49.87 * Number(price));
+    const sheet = createReceivableWorkbook(project, records, "2026-04", draft).Sheets["應收帳款明細表"];
+    close(sheet.G7.v, 49.87 * Number(price));
+    close(sheet.G8.v, 200);
+    close(sheet.G12.v, subtotal);
+    close(sheet.G13.v, subtotal * 0.05);
+    close(sheet.G14.v, subtotal * 1.05);
+    assert.equal(sheet.G7.f, 'IF(OR(E7="",F7=""),0,E7*F7)');
+    assert.equal(sheet.G12.f, "SUMPRODUCT(E7:E8,F7:F8)");
+    assert.equal(sheet.G13.f, "G12*5%");
+    assert.equal(sheet.G14.f, "G12+G13");
+  }
+  draft.details[0].quantity = "";
+  draft.details[1].unitPrice = "invalid";
+  assert.deepEqual(receivableDraftTotals(draft), { subtotal: 0, tax: 0, receivable: 0 });
+  assert.equal(receivableDetailAmount(draft.details[0]), 0);
+});
+
+test("receivable invoice track and date initialize and export independently", () => {
+  const source = buildAcceptanceExportRecords(project)[0];
+  for (const track of ["AB12345678", ""]) {
+    const records = [{ ...source, outgoingVoOriginal: track, outgoingVoOriginalDate: "2026-09-01" }];
+    const draft = buildReceivableExportDraft(project, records);
+    assert.equal(draft.invoiceTrack, track);
+    assert.equal(draft.invoiceDate, "2026-09-01");
+    const sheet = createReceivableWorkbook(project, records, "2026-04", draft).Sheets["應收帳款明細表"];
+    assert.equal(sheet.A14.v, `發票字軌：${track}`);
+    assert.equal(sheet.C14.v, "發票日期：2026-09-01");
+    assert.doesNotMatch(String(sheet.A14.v), /2026-09-01/);
+  }
 });
 
 test("shipment workbook converts square meters to ping and keeps amount formulas editable", () => {

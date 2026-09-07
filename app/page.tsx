@@ -8,7 +8,7 @@ import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, t
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
 import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
 import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
-import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDraftTotals, saveReceivableWorkbook, saveShipmentWorkbook, shipmentDisplayValues, type AcceptanceExportRecord, type AcceptanceReportMetadata, type ReceivableExportDraft } from "../lib/acceptance-exports";
+import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDetailAmount, receivableDraftTotals, saveReceivableWorkbook, saveShipmentWorkbook, shipmentDisplayValues, type AcceptanceExportRecord, type AcceptanceReportMetadata, type ReceivableExportDraft } from "../lib/acceptance-exports";
 import { companyReportConfig } from "../lib/company-report-config";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances";
@@ -20,7 +20,7 @@ import { areaInputToPing, areaValueFromPing, convertAreaInput, type AreaUnit } f
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, importedAreaEntry, importedAreaToCanonicalPing, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated, type ImportAreaDetection } from "../lib/unit-import";
 import { buildUnitScopedRecord, buildingNavigationUnits, createFloorReturnContext, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, sortUnitsByNumber, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
-import { planJournalPhotoRows, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
+import { planJournalPhotoRows, planJournalPhotoPages, journalPhotoDisplaySize, type JournalPhotoDisplaySettings, type JournalPhotoDisplay, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 import { canWriteAcceptanceLifecycle, canWriteWorkLifecycle } from "../lib/unit-lifecycle";
 import { canConfirmUnit, canCreateUnit, canDeleteUnit, canEditUnitMaster, canUsePermissionUnitTab, canUsePermissionView, canViewCustomerDetails, financeUiMode } from "../lib/ui-permissions";
 
@@ -4120,7 +4120,7 @@ function FloorBatchExport({ project, units, context, close }: { project: Project
     const draft = buildCompletionExportDraft(project, unit, acceptance, completion);
     return {
       resolved,
-      draft: { ...draft, signatureNames: { ...draft.signatureNames, ...Object.fromEntries(floorSignatureRoles.map((role) => [role, resolved.signatures[role]?.name || draft.signatureNames[role]])) } } as CompletionExportDraft,
+      draft: { ...draft, officePerson: resolved.signatures.office?.name || draft.signatureNames.office, signatureNames: { ...draft.signatureNames, ...Object.fromEntries(floorSignatureRoles.map((role) => [role, resolved.signatures[role]?.name || draft.signatureNames[role]])) } } as CompletionExportDraft,
     };
   };
   const beginEdit = () => {
@@ -5586,12 +5586,10 @@ function loadJournalPhotoDimensions(photo: Photo) {
   });
 }
 
-async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number, dimensions?: { width: number; height: number }) {
+async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number, dimensions?: { width: number; height: number }, setting?: JournalPhotoDisplay) {
   try {
     const intrinsic = dimensions || await loadJournalPhotoDimensions(photo);
-    const scale = Math.min(maxWidth / intrinsic.width, maxHeight / intrinsic.height);
-    const width = Math.max(1, Math.round(intrinsic.width * scale));
-    const height = Math.max(1, Math.round(intrinsic.height * scale));
+    const { width, height } = journalPhotoDisplaySize(intrinsic.width, intrinsic.height, maxWidth, maxHeight, setting);
     const response = await fetch(photo.data);
     const data = await response.arrayBuffer();
     const mime = response.headers.get("content-type") || (photo.data.startsWith("data:image/png") ? "image/png" : "image/jpeg");
@@ -5622,18 +5620,17 @@ async function buildJournalLogoRun() {
   }
 }
 
-async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNote) {
-  const PHOTO_PER_PAGE = 6;
+async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNote, settings: JournalPhotoDisplaySettings = {}) {
   const sourcePhotos = (entry.photos || []).slice();
   const measuredPhotos: MeasuredJournalPhoto[] = await Promise.all(sourcePhotos.map(async (photo) => ({ value: photo, ...await loadJournalPhotoDimensions(photo) })));
-  const photoPages = Array.from({ length: Math.ceil(measuredPhotos.length / PHOTO_PER_PAGE) }, (_, index) => measuredPhotos.slice(index * PHOTO_PER_PAGE, (index + 1) * PHOTO_PER_PAGE));
+  const photoPages = planJournalPhotoPages(measuredPhotos);
   const logo = await buildJournalLogoRun();
   const photoCell = (photo: ImageRun | null, width: number) => new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: width, type: WidthType.DXA }, margins: { top: 30, bottom: 30, left: 30, right: 30 }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: photo ? [photo] : [new TextRun({ text: "圖片無法載入", color: "777777", size: 16, font: "Microsoft JhengHei" })] })] });
   const photoTable = async (rowPhotos: MeasuredJournalPhoto[], maxHeight: number, width = JOURNAL_PAGE_WIDTH) => {
     const columnWidth = Math.floor(width / rowPhotos.length);
     const availableWidth = Math.max(1, Math.floor(columnWidth / 15) - 4);
     const maxPhotoWidth = rowPhotos.length === 1 ? Math.min(440, availableWidth) : availableWidth;
-    const runs = await Promise.all(rowPhotos.map((photo) => buildJournalPhotoRun(photo.value, maxPhotoWidth, maxHeight, photo)));
+    const runs = await Promise.all(rowPhotos.map((photo) => buildJournalPhotoRun(photo.value, maxPhotoWidth, maxHeight, photo, settings[photo.value.id])));
     return new Table({ alignment: AlignmentType.CENTER, borders: JOURNAL_NO_BORDERS, width: { size: width, type: WidthType.DXA }, columnWidths: rowPhotos.map(() => columnWidth), rows: [new TableRow({ cantSplit: true, children: runs.map((run) => photoCell(run, columnWidth)) })] });
   };
   const journalHeader = (pageBreakBefore = false) => new Table({
@@ -5654,7 +5651,7 @@ async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNo
   ];
   const infoChildren = meta.map(([label, value]) => new Paragraph({ spacing: { after: 105 }, children: [new TextRun({ text: `${label}：`, bold: true, size: 24, font: "Microsoft JhengHei" }), new TextRun({ text: value || "—", size: 24, font: "Microsoft JhengHei" })] }));
   const firstPagePhotos = photoPages[0] || [];
-  const firstPhotoRun = firstPagePhotos[0] ? await buildJournalPhotoRun(firstPagePhotos[0].value, 320, 300, firstPagePhotos[0]) : null;
+  const firstPhotoRun = firstPagePhotos[0] ? await buildJournalPhotoRun(firstPagePhotos[0].value, 310, 280, firstPagePhotos[0], settings[firstPagePhotos[0].value.id]) : null;
   const rightTopChildren = firstPhotoRun
     ? [new Paragraph({ alignment: AlignmentType.CENTER, children: [firstPhotoRun] })]
     : [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "無工作照片", color: "777777", font: "Microsoft JhengHei" })] })];
@@ -5667,14 +5664,14 @@ async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNo
     ] })] }),
   ];
   const firstPageRows = planJournalPhotoRows(firstPagePhotos.slice(1));
-  const firstPageRowHeight = Math.min(360, Math.floor(570 / Math.max(1, firstPageRows.length)));
+  const firstPageRowHeight = 250;
   for (const rowPhotos of firstPageRows) {
     children.push(await photoTable(rowPhotos, firstPageRowHeight));
   }
   for (const pagePhotos of photoPages.slice(1)) {
     children.push(journalHeader(true), new Paragraph({ spacing: { after: 100 } }));
     const followingRows = planJournalPhotoRows(pagePhotos);
-    const followingRowHeight = Math.min(520, Math.floor(900 / Math.max(1, followingRows.length)));
+    const followingRowHeight = 400;
     for (const rowPhotos of followingRows) {
       children.push(await photoTable(rowPhotos, followingRowHeight));
     }
@@ -5691,17 +5688,28 @@ async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNo
   revokeObjectUrlLater(url);
 }
 
-function JournalWordPreviewPhotoRows({ photos }: { photos: Photo[] }) {
-  const previewPhotos = photos.slice(1, 6);
-  const [measured, setMeasured] = useState<MeasuredJournalPhoto[]>(() => previewPhotos.map((photo) => ({ value: photo, width: 1, height: 1 })));
+function JournalWordPreviewPhoto({ photo, maxWidth, maxHeight, settings, setSettings }: { photo: Photo; maxWidth: number; maxHeight: number; settings: JournalPhotoDisplaySettings; setSettings: React.Dispatch<React.SetStateAction<JournalPhotoDisplaySettings>> }) {
+  const [dimensions, setDimensions] = useState({ width: 4, height: 3 });
   useEffect(() => {
     let active = true;
-    void Promise.all(previewPhotos.map(async (photo) => ({ value: photo, ...await loadJournalPhotoDimensions(photo) }))).then((next) => {
-      if (active) setMeasured(next);
-    });
+    void loadJournalPhotoDimensions(photo).then((next) => { if (active) setDimensions(next); });
     return () => { active = false; };
-  }, [photos]);
-  return <div className="word-preview-photo-layout">{planJournalPhotoRows(measured).map((row, rowIndex) => <div className="word-preview-photo-row" style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }} key={rowIndex}>{row.map(({ value: photo }) => <ZoomablePhoto key={photo.id} photo={photo} alt={photo.caption || "工作照片"} />)}</div>)}</div>;
+  }, [photo.data]);
+  const setting = settings[photo.id] || { mode: "original", scale: 1 };
+  const size = journalPhotoDisplaySize(dimensions.width, dimensions.height, maxWidth, maxHeight, setting);
+  const update = (value: Partial<JournalPhotoDisplay>) => setSettings((current) => ({ ...current, [photo.id]: { ...setting, ...value } }));
+  return <div className="journal-export-photo">
+    <div className="journal-export-photo-image" style={{ aspectRatio: maxWidth / maxHeight }}><img src={photo.data} alt={photo.caption || "工作照片"} style={{ width: `${size.width / maxWidth * 100}%`, height: "auto", maxHeight: "100%" }} /></div>
+    <label>顯示方式<select aria-label="照片匯出顯示方式" value={setting.mode} onChange={(event) => update({ mode: event.target.value as JournalPhotoDisplay["mode"] })}><option value="original">原比例</option><option value="portrait">直式</option><option value="landscape">橫式</option></select></label>
+    <label>尺寸 {Math.round(setting.scale * 100)}%<input aria-label="照片匯出尺寸" type="range" min="40" max="100" step="5" value={setting.scale * 100} onChange={(event) => update({ scale: Number(event.target.value) / 100 })} /></label>
+  </div>;
+}
+
+function JournalWordPreviewPhotoRows({ photos, settings, setSettings }: { photos: Photo[]; settings: JournalPhotoDisplaySettings; setSettings: React.Dispatch<React.SetStateAction<JournalPhotoDisplaySettings>> }) {
+  return <div className="word-preview-photo-layout">{planJournalPhotoPages(photos).map((page, pageIndex) => <div key={pageIndex} className="journal-export-page">
+    {pageIndex > 0 && <div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span>第 {pageIndex + 1} 頁</span></div>}
+    {planJournalPhotoRows((pageIndex === 0 ? page.slice(1) : page).map((photo) => ({ value: photo, width: 4, height: 3 }))).map((row, rowIndex) => <div className="word-preview-photo-row" style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }} key={rowIndex}>{row.map(({ value: photo }) => <JournalWordPreviewPhoto key={photo.id} photo={photo} maxWidth={row.length === 1 ? 440 : Math.floor(624 / row.length) - 4} maxHeight={pageIndex === 0 ? 250 : 400} settings={settings} setSettings={setSettings} />)}</div>)}
+  </div>)}</div>;
 }
 
 function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>) => void }) {
@@ -5711,6 +5719,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
   const [entry, setEntry] = useState<DailyNote>(() => readDraft(draftKey(authUserId, "unit-journal", u.id), storedDraft || blank()));
   const [saved, setSaved] = useState("");
   const [preview, setPreview] = useState(false);
+  const [journalPhotoSettings, setJournalPhotoSettings] = useState<JournalPhotoDisplaySettings>({});
   const [downloading, setDownloading] = useState(false);
   const skipNextDraftWrite = useRef(false);
   const editingExisting = liveEntities(u.journals).some((item) => item.id === entry.id);
@@ -5746,9 +5755,9 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     <div className="grid3"><Field label="日期／完工日期" type="date" value={entry.date} set={(date) => setEntry({ ...entry, date })} /><Field label="工作內容" value={entry.content} set={(content) => setEntry({ ...entry, content })} /><Field label="後續待處理" value={entry.pending} set={(pending) => setEntry({ ...entry, pending })} /><Field label="備註" value={entry.note} set={(note) => setEntry({ ...entry, note })} /></div>
     <div className="unit-journal-photos"><Photos node="戶別工作日誌" label="工作照片" photos={entry.photos} set={(photos) => setEntry({ ...entry, photos })} /></div>
     <div className="save-success">✓ 輸入內容會先保存在本機；按「暫存」後同步至資料庫</div>
-    <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => setPreview(true)}>預覽／產生 Word</button></div>
+    <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => { setJournalPhotoSettings({}); setPreview(true); }}>預覽／產生 Word</button></div>
     {saved && <div className="save-success">{saved}</div>}
-    {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span aria-hidden="true" /></div><div className="word-preview-first-row"><div className="word-preview-meta"><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span><span><b>工作內容：</b>{entry.content}</span><span><b>備註：</b>{entry.note || "無"}</span></div>{entry.photos[0] ? <ZoomablePhoto photo={entry.photos[0]} alt={entry.photos[0].caption || "工作照片"} /> : <span className="word-preview-empty">無工作照片</span>}</div><JournalWordPreviewPhotoRows photos={entry.photos} /></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); await downloadWorkJournalDocx(project, u, entry); setDownloading(false); }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
+    {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span aria-hidden="true" /></div><div className="word-preview-first-row"><div className="word-preview-meta"><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span><span><b>工作內容：</b>{entry.content}</span><span><b>備註：</b>{entry.note || "無"}</span></div>{entry.photos[0] ? <JournalWordPreviewPhoto photo={entry.photos[0]} maxWidth={310} maxHeight={280} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /> : <span className="word-preview-empty">無工作照片</span>}</div><JournalWordPreviewPhotoRows photos={entry.photos} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); try { await downloadWorkJournalDocx(project, u, entry, journalPhotoSettings); } finally { setDownloading(false); } }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
     <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={liveEntities(u.journals).map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
   </div>;
 }
@@ -6315,7 +6324,7 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
           <div className="export-preview-table receivable-preview-table"><table><thead><tr><th>日期</th><th>戶別</th><th>型號</th><th>尺寸cm</th><th>數量(坪)</th><th>單價／元</th><th>合計</th><th>備註</th></tr></thead><tbody>{billRecords.map((record, index) => {
             const detail = receivableDraft.details[index];
             const updateDetail = (updates: Partial<typeof detail>) => setReceivableDraft({ ...receivableDraft, details: receivableDraft.details.map((item, detailIndex) => detailIndex === index ? { ...item, ...updates } : item) });
-            const amount = Number(detail.quantity) * Number(detail.unitPrice);
+            const amount = receivableDetailAmount(detail);
             return <tr key={record.unitId}>
               <td><input value={detail.date} onChange={(event) => updateDetail({ date: event.target.value })} /></td>
               <td><input value={detail.unitDisplay} onChange={(event) => updateDetail({ unitDisplay: event.target.value })} /></td>
@@ -6328,7 +6337,7 @@ function Billing({ p, patch, financeAccess }: { p: Project; patch: any; financeA
             </tr>;
           })}</tbody></table></div>
           <section className="panel form">
-            <div className="panel-head"><div><h3>應收資料</h3><p>銷貨小計、稅金與應收合計由 Excel 公式計算，無法手動覆寫。</p></div></div>
+            <div className="panel-head"><div><h3>應收資料</h3><p>銷貨小計、稅金與應收合計依數量及單價即時計算，無法手動覆寫。</p></div></div>
             <div className="export-summary"><span>銷貨小計<b>{receivableTotals?.subtotal.toLocaleString()}</b></span><span>稅金（{companyReportConfig.receivableTaxRate * 100}%）<b>{receivableTotals?.tax.toLocaleString()}</b></span><span>應收合計<b>{receivableTotals?.receivable.toLocaleString()}</b></span></div>
             <div className="grid3">
               <Field label="發票字軌" value={receivableDraft.invoiceTrack} set={(invoiceTrack: string) => setReceivableDraft({ ...receivableDraft, invoiceTrack })} />
@@ -6393,7 +6402,7 @@ function buildCompletionExportDraft(project: Project, unit: Unit, acceptance: Ac
   const constructionDate = unit.works.map((work) => work.date).filter(Boolean).join("、") || acceptance.date;
   return {
     department: "派工部",
-    officePerson: completion.officePerson || acceptance.person,
+    officePerson: completion.signatures.office?.name || "",
     projectName: project.name,
     projectAddress: project.address,
     order: unit.order,
@@ -6426,7 +6435,7 @@ function CompletionReport({ project, unit, acceptance, completion, signatures, s
   const reportSignatures = signatures || completion.signatures;
   const createDraft = () => {
     const draft = buildCompletionExportDraft(project, unit, acceptance, completion);
-    return { ...draft, signatureNames: { ...draft.signatureNames, ...Object.fromEntries(floorSignatureRoles.map((role) => [role, reportSignatures[role]?.name || draft.signatureNames[role]])) } };
+    return { ...draft, officePerson: reportSignatures.office?.name || draft.signatureNames.office, signatureNames: { ...draft.signatureNames, ...Object.fromEntries(floorSignatureRoles.map((role) => [role, reportSignatures[role]?.name || draft.signatureNames[role]])) } };
   };
   const [exportDraft, setExportDraft] = useState<CompletionExportDraft>(createDraft);
   const [stage, setStage] = useState<"preview" | "edit" | "confirm">("preview");

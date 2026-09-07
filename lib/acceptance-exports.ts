@@ -227,15 +227,21 @@ const receivableNumber = (value: string) => {
   return Number.isFinite(parsed) ? parsed : "";
 };
 
+export function receivableDetailAmount(detail: ReceivableDetailDraft) {
+  return Number(receivableNumber(detail.quantity) || 0) * Number(receivableNumber(detail.unitPrice) || 0);
+}
+
 export function receivableDraftTotals(draft: ReceivableExportDraft) {
   const subtotal = draft.details.reduce((sum, detail) => sum + Number(receivableNumber(detail.quantity) || 0) * Number(receivableNumber(detail.unitPrice) || 0), 0);
-  const tax = Math.round(subtotal * companyReportConfig.receivableTaxRate);
-  return { subtotal, tax, receivable: subtotal - tax };
+  const tax = subtotal * companyReportConfig.receivableTaxRate;
+  return { subtotal, tax, receivable: subtotal + tax };
 }
 
 export function createReceivableWorkbook(project: ExportProject, records: AcceptanceExportRecord[], month: string, draft = buildReceivableExportDraft(project, records)) {
   const detailStart = 7;
   const detailCount = records.length;
+  const details = records.map((record, index) => draft.details[index] || buildReceivableExportDraft(project, [record]).details[0]);
+  const totals = receivableDraftTotals({ ...draft, details });
   const detailEnd = detailStart + detailCount - 1;
   const summaryTitle = detailEnd + 2;
   const summarySubtitle = summaryTitle + 1;
@@ -260,7 +266,7 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
   ];
   for (let index = 0; index < detailCount; index += 1) {
     const row = detailStart + index;
-    const detail = draft.details[index] || buildReceivableExportDraft(project, [records[index]]).details[0];
+    const detail = details[index];
     rows.push([
       detail.date,
       detail.unitDisplay,
@@ -268,7 +274,7 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
       detail.sizeCm,
       receivableNumber(detail.quantity),
       receivableNumber(detail.unitPrice),
-      { f: `IF(OR(E${row}=\"\",F${row}=\"\"),0,E${row}*F${row})`, v: 0, t: "n" },
+      { f: `IF(OR(E${row}=\"\",F${row}=\"\"),0,E${row}*F${row})`, v: receivableDetailAmount(detail), t: "n" },
       detail.note,
     ]);
   }
@@ -276,9 +282,9 @@ export function createReceivableWorkbook(project: ExportProject, records: Accept
     ["", "", "", "", "", "", "", ""],
     ["SPC", "", "", "", "", "", "", ""],
     [`${companyReportConfig.companyName} 應收帳款明細表`, "", "", "", "", "", "", ""],
-    ["銷貨小計", "", "", "", "", "", { f: detailCount ? `SUM(G${detailStart}:G${detailEnd})` : "0", v: 0, t: "n" }, ""],
-    [`稅金（${companyReportConfig.receivableTaxRate * 100}%）`, "", "", "", "", "", { f: `ROUND(G${subtotalRow}*${companyReportConfig.receivableTaxRate * 100}%,0)`, v: 0, t: "n" }, ""],
-    ["應收合計", "", "", "", "", "", { f: `G${subtotalRow}-G${taxRow}`, v: 0, t: "n" }, ""],
+    ["銷貨小計", "", "", "", "", "", { f: detailCount ? `SUMPRODUCT(E${detailStart}:E${detailEnd},F${detailStart}:F${detailEnd})` : "0", v: totals.subtotal, t: "n" }, ""],
+    [`稅金（${companyReportConfig.receivableTaxRate * 100}%）`, "", "", "", "", "", { f: `G${subtotalRow}*${companyReportConfig.receivableTaxRate * 100}%`, v: totals.tax, t: "n" }, ""],
+    ["應收合計", "", "", "", "", "", { f: `G${subtotalRow}+G${taxRow}`, v: totals.receivable, t: "n" }, ""],
     [`發票字軌：${draft.invoiceTrack}`, "", `發票日期：${draft.invoiceDate}`, "", "", "", ""],
     [`已收款金額：${draft.receivedAmount}`, "", `收款日期：${draft.receivedDate}`, "", `製表：${draft.preparedBy}`, "", ""],
     [`支付方式：${draft.paymentMethod}`, "", `送單日期：${draft.deliveryDate}`, "", `承辦人：${draft.handler}`, "", ""],
