@@ -406,6 +406,16 @@ export function shipmentDisplayValues(record: AcceptanceExportRecord, index: num
   };
 }
 
+export function parseReportNumericText(value: string | undefined, units: readonly string[] = []): number | null {
+  if (value === undefined) return null;
+  let normalized = value.trim();
+  const unit = units.find((candidate) => normalized.endsWith(candidate));
+  if (unit) normalized = normalized.slice(0, -unit.length).trim();
+  if (!/^[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)$/.test(normalized)) return null;
+  const parsed = Number(normalized.replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function createShipmentWorkbook(project: ExportProject, records: AcceptanceExportRecord[], month: string) {
   const headers = ["出貨日期", "序號", "客戶名稱", "商品", "戶別", "m²", "片／件\n*0.3025", "單價／元", "合計", "廠商", "進價／元", "備註", "簽單正", "簽單影", "進VO正", "進VO影", "銷VO正", "銷VO影", "送單", "廠商帳單", "級距", "應付", "利潤%", "利潤"];
   const dataStart = 3;
@@ -419,16 +429,28 @@ export function createShipmentWorkbook(project: ExportProject, records: Acceptan
     ...records.map((record, index) => {
       const row = dataStart + index;
       const display = shipmentDisplayValues(record, index);
+      const squareMeters = record.squareMetersText === undefined
+        ? record.areaSquareMeters
+        : parseReportNumericText(record.squareMetersText, ["m²", "㎡", "m2", "平方公尺"]);
+      const ping = record.pingText === undefined
+        ? null
+        : parseReportNumericText(record.pingText, ["坪"]);
+      const unitPrice = parseReportNumericText(record.unitPriceText, ["元"])
+        ?? (record.unitPrice > 0 ? record.unitPrice : null);
+      const formulaPing = record.pingText === undefined;
+      const amountValue = (formulaPing ? record.areaPing : ping) !== null && unitPrice !== null
+        ? Math.round((formulaPing ? record.areaPing : ping!) * unitPrice)
+        : undefined;
       return [
         record.shipmentDateText !== undefined ? display.shipmentDateText : excelDate(record.exportDate),
         record.sequenceText !== undefined ? display.sequenceText : index + 1,
         display.customerNameText,
         display.productText,
         display.unitDisplayText,
-        record.squareMetersText !== undefined ? display.squareMetersText : record.areaSquareMeters,
-        record.pingText !== undefined ? display.pingText : { f: `ROUND(F${row}*0.3025,2)`, v: record.areaPing, t: "n" },
-        record.unitPriceText !== undefined ? display.unitPriceText : record.unitPrice > 0 ? record.unitPrice : "",
-        record.amountText !== undefined ? display.amountText : { f: `IF(OR(G${row}=\"\",H${row}=\"\"),\"\",ROUND(G${row}*H${row},0))`, v: record.unitPrice > 0 ? record.amount : undefined, t: "n" },
+        squareMeters ?? "",
+        formulaPing ? { f: `ROUND(F${row}*0.3025,2)`, v: record.areaPing, t: "n" } : ping ?? "",
+        unitPrice ?? "",
+        { f: `IF(OR(G${row}=\"\",H${row}=\"\"),\"\",ROUND(G${row}*H${row},0))`, v: amountValue, t: "n" },
         display.vendorText, display.purchasePriceText, display.noteText,
         record.signedOriginal ? "✓" : "",
         record.signedCopy ? "✓" : "",
@@ -482,11 +504,11 @@ export function createShipmentWorkbook(project: ExportProject, records: Acceptan
       const detailRecord = row >= dataStart - 1 && row < totalRow - 1 ? records[row - (dataStart - 1)] : undefined;
       target.s = { font: { name: "Microsoft JhengHei", sz: row === 0 ? 16 : 10, bold: row === 0 || row === 1 || row === totalRow - 1 }, alignment: { horizontal: "center", vertical: "center", wrapText: true }, border: excelBorder, fill: row === 0 ? { fgColor: { rgb: "11DDE0" } } : row === 1 ? { fgColor: { rgb: "FFF2CC" } } : row === totalRow - 1 ? { fgColor: { rgb: "FFF200" } } : { fgColor: { rgb: "FFFFFF" } } };
       if (row === totalRow - 1 && (col === 5 || col === 6)) target.z = col === 6 ? '0.00" 坪"' : "0.00";
-      if (detailRecord && col === 5 && detailRecord.squareMetersText === undefined) target.z = "0.00";
-      if (detailRecord && col === 6 && detailRecord.pingText === undefined) target.z = '0.00" 坪"';
-      if (detailRecord && col === 7 && detailRecord.unitPriceText === undefined) target.z = '#,##0.0"元"';
+      if (detailRecord && col === 5) target.z = "0.00";
+      if (detailRecord && col === 6) target.z = '0.00" 坪"';
+      if (detailRecord && col === 7) target.z = '#,##0.0"元"';
       if (detailRecord && col === 10 && detailRecord.purchasePriceText === undefined) target.z = '#,##0.0"元"';
-      if (detailRecord && col === 8 && detailRecord.amountText === undefined) target.z = "#,##0";
+      if (detailRecord && col === 8) target.z = "#,##0";
       if (detailRecord && col === 0 && detailRecord.shipmentDateText === undefined) target.z = "mm/dd";
     }
   }

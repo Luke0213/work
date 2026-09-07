@@ -29,6 +29,62 @@ test("Billing rate, priced status, date and event survive workspace serializatio
   assert.equal(unpriced.units[0].pricedAt, "");
 });
 
+test("Billing rate change updates the exact formal Acceptance.report price", () => {
+  const protectedProject: any = {
+    ...reload(project),
+    units: [{
+      ...reload(project.units[0]),
+      rate: 2750,
+      status: "已計價",
+      pricedAt: "2026-09-01",
+      acceptances: [
+        {
+          id: "a1", date: "2026-09-01", draft: false,
+          report: { unitPriceText: "3000", noteText: "keep note", customText: "keep custom" },
+          photos: [{ id: "photo", data: "spc-storage://same" }],
+          items: [{ id: "item", result: "ok" }],
+          completion: { id: "completion" },
+          signatures: { customer: "signed" },
+        },
+        { id: "a2", date: "2026-08-01", draft: false, report: { unitPriceText: "2600" } },
+      ],
+    }, { ...reload(project.units[0]), id: "u2" }],
+  };
+  const record = buildAcceptanceExportRecords(protectedProject).find((item) => item.unitId === "u1")!;
+  const saved = applyBillingChanges(protectedProject, [{ unitId: "u1", acceptanceId: record.acceptanceId, rate: 2800, priced: true, event: { id: "unused" } }], "2026-09-07");
+  const acceptance = saved.units[0].acceptances[0];
+  assert.equal(saved.units[0].rate, 2800);
+  assert.equal(acceptance.report.unitPriceText, "2800");
+  assert.equal(acceptance.report.noteText, "keep note");
+  assert.equal(acceptance.report.customText, "keep custom");
+  for (const field of ["photos", "items", "completion", "signatures", "date"] as const) {
+    assert.deepEqual(acceptance[field], protectedProject.units[0].acceptances[0][field], field);
+  }
+  assert.deepEqual(saved.units[0].acceptances[1], protectedProject.units[0].acceptances[1]);
+  assert.deepEqual(saved.units[0].events, protectedProject.units[0].events);
+  assert.deepEqual(saved.units[1], protectedProject.units[1]);
+
+  const rebuilt = buildAcceptanceExportRecord(saved, saved.units[0], acceptance, true);
+  assert.equal(shipmentDisplayValues(rebuilt, 0).unitPriceText, "2800");
+  assert.equal(loadReceivableReportDraft(saved, [rebuilt], "2026-09").details[0].unitPrice, "2800");
+});
+
+test("Billing status-only changes preserve the report price text", () => {
+  const source: any = reload(project);
+  source.units[0].rate = 2750;
+  source.units[0].acceptances[0].report.unitPriceText = "3000";
+  const saved = applyBillingChanges(source, [{ unitId: "u1", acceptanceId: "a1", rate: 2750, priced: true, event: { id: "status" } }], "2026-09-07");
+  assert.equal(saved.units[0].acceptances[0].report.unitPriceText, "3000");
+});
+
+test("Billing permits work-only units without an acceptance and rejects a stale acceptance id", () => {
+  const source: any = { ...reload(project), units: [{ ...reload(project.units[0]), acceptances: [] }] };
+  const saved = applyBillingChanges(source, [{ unitId: "u1", acceptanceId: "", rate: 2800, priced: true, event: { id: "priced" } }], "2026-09-07");
+  assert.equal(saved.units[0].rate, 2800);
+  assert.deepEqual(saved.units[0].acceptances, []);
+  assert.throws(() => applyBillingChanges(source, [{ unitId: "u1", acceptanceId: "missing", rate: 2800, priced: true, event: { id: "priced" } }], "2026-09-07"));
+});
+
 test("report is persisted only in Acceptance.report and preserves photos and other acceptances", () => {
   const unit = { ...project.units[0], acceptances: [...project.units[0].acceptances, { ...project.units[0].acceptances[0], id: "a2" }] };
   const edited = updateReportSource(unit, reportDraft);

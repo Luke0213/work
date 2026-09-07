@@ -1142,10 +1142,12 @@ test("billing edits await one verified project save", async () => {
   assert.match(billing, /確認保存/);
   assert.equal((confirmSave.match(/await persistFinance\(/g) || []).length, 1);
   assert.match(confirmSave, /applyBillingChanges\(current, changes, day\(\)\)/);
+  assert.match(confirmSave, /acceptanceId: row\.record\.acceptanceId/);
   assert.ok(confirmSave.indexOf("await persistFinance") < confirmSave.indexOf("setBillingDrafts({})"));
   assert.match(confirmSave, /catch \(error\)[\s\S]*setBillingMessage/);
   const finance = await read("lib/finance-persistence.ts");
   assert.match(finance, /rate: change.rate/);
+  assert.match(finance, /unitPriceText: String\(change\.rate\)/);
   assert.match(finance, /statusChanged = change.priced !== \(unit.status === "已計價"\)/);
   assert.match(finance, /status: change.priced \? "已計價" : "已驗收"/);
   assert.match(finance, /pricedAt: change.priced \? date : ""/);
@@ -1479,8 +1481,9 @@ test("daily and monthly shipment report edits persist only approved formal sourc
   assert.doesNotMatch(billing, /createShipmentWorkbook\(p, shipmentReportDraft/);
   assert.doesNotMatch(exports, /Array\(12\)\.fill/);
   assert.match(exports, /record\.shipmentDateText !== undefined \? display\.shipmentDateText : excelDate\(record\.exportDate\)/);
-  assert.match(exports, /record\.pingText !== undefined \? display\.pingText : \{ f: `ROUND/);
-  assert.match(exports, /record\.amountText !== undefined \? display\.amountText : \{ f: `IF/);
+  assert.match(exports, /parseReportNumericText\(record\.pingText, \["坪"\]\)/);
+  assert.match(exports, /ROUND\(G\$\{row\}\*H\$\{row\},0\)/);
+  assert.doesNotMatch(exports, /record\.amountText !== undefined \? display\.amountText/);
   assert.match(exports, /records\.map\(\(record\) => \(\{ hpt: estimateShipmentRowHeight\(record\) \}\)\)/);
   assert.match(exports, /wrapText: true/);
 });

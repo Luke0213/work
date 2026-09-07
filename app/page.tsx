@@ -6113,7 +6113,7 @@ function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFina
       if (!canManageFinance || financeSaving) return;
       setFinanceSaving(true);
       setBillingMessage("尚未完成 Supabase 同步／請勿關閉頁面，正在核對資料…");
-      const changes = billingChanges.map((row) => ({ unitId: row.unit.id, rate: safeDraftRate(row.draft.rate), priced: row.draft.priced,
+      const changes = billingChanges.map((row) => ({ unitId: row.unit.id, acceptanceId: row.record.acceptanceId, rate: safeDraftRate(row.draft.rate), priced: row.draft.priced,
         event: { ...(billingEventsRef.current[row.unit.id] ||= { id: id(), at: stamp() }), title: row.draft.priced ? "月結已計價" : "月結取消計價",
           detail: row.draft.priced ? `金額 ${row.record.amount}` : "狀態恢復為已驗收", photos: [] as Photo[] },
       }));

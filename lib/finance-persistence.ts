@@ -70,15 +70,26 @@ export function rebaseProjectEdit<T>(displayed: T, edited: T, latest: T): T {
 
 export function applyBillingChanges<T extends { units: U[] }, U extends {
   id: string; rate?: number; status: string; pricedAt?: string; events: E[];
-}, E>(project: T, changes: Array<{ unitId: string; rate: number; priced: boolean; event: E }>, date: string): T {
+  acceptances?: Array<{ id: string; draft?: boolean; report?: AcceptanceReportMetadata }>;
+}, E>(project: T, changes: Array<{ unitId: string; acceptanceId?: string; rate: number; priced: boolean; event: E }>, date: string): T {
   for (const change of changes) {
     if (!project.units.some((u) => u.id === change.unitId && !isDeletedEntity(u))) throw new Error("找不到原月結戶別，未保存修改");
   }
   return { ...project, units: project.units.map((unit) => {
     const change = changes.find((x) => x.unitId === unit.id);
     if (!change) return unit;
+    const rateChanged = change.rate !== Number(unit.rate || 0);
     const statusChanged = change.priced !== (unit.status === "已計價");
-    return { ...unit, rate: change.rate, ...(statusChanged ? {
+    let acceptances = unit.acceptances;
+    if (rateChanged && change.acceptanceId) {
+      const formalAcceptance = acceptances?.find((acceptance) =>
+        acceptance.id === change.acceptanceId && acceptance.draft !== true && !isDeletedEntity(acceptance));
+      if (!formalAcceptance) throw new Error("找不到月結單價對應的正式驗收紀錄，未保存修改");
+      acceptances = acceptances!.map((acceptance) => acceptance.id === change.acceptanceId
+        ? { ...acceptance, report: { ...acceptance.report, unitPriceText: String(change.rate) } }
+        : acceptance);
+    }
+    return { ...unit, rate: change.rate, ...(acceptances ? { acceptances } : {}), ...(statusChanged ? {
       status: change.priced ? "已計價" : "已驗收", pricedAt: change.priced ? date : "",
       events: [change.event, ...unit.events],
     } : {}) };

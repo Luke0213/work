@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, receivableDetailAmount, receivableDraftTotals } from "../lib/acceptance-exports.ts";
+import { buildAcceptanceExportRecords, buildReceivableExportDraft, createReceivableWorkbook, createShipmentWorkbook, parseReportNumericText, receivableDetailAmount, receivableDraftTotals } from "../lib/acceptance-exports.ts";
 import { getLatestFinalAcceptance } from "../lib/acceptance-records.ts";
 
 const project = {
@@ -320,14 +320,15 @@ test("shipment report metadata is shared by the export record and preserves arbi
   assert.equal(sheet.C3.v, "客戶另註");
   assert.equal(sheet.D3.v, "商品待確認");
   assert.equal(sheet.E3.v, "戶別另註");
-  assert.equal(sheet.F3.v, "面積待確認");
-  assert.equal(sheet.G3.v, "坪數另註");
-  assert.equal(sheet.H3.v, "單價待確認");
-  assert.equal(sheet.I3.v, "金額另註");
+  assert.equal(sheet.F3.v, "");
+  assert.equal(sheet.G3.v, "");
+  assert.equal(sheet.H3.v, 2750);
+  assert.equal(sheet.H3.t, "n");
+  assert.equal(sheet.I3.f, 'IF(OR(G3="",H3=""),"",ROUND(G3*H3,0))');
   assert.equal(sheet.J3.v, "廠商待確認");
   assert.equal(sheet.K3.v, "進價另註");
   assert.equal(sheet.L3.v, "備註另註");
-  for (const cell of ["A3", "F3", "G3", "H3", "I3", "K3"]) assert.equal(sheet[cell].f, undefined);
+  for (const cell of ["A3", "F3", "G3", "H3", "K3"]) assert.equal(sheet[cell].f, undefined);
   assert.equal(sheet.M3.v, "✓");
   assert.equal(sheet.N3.v, "");
   assert.equal(sheet.O3.v, "進件正本待補");
@@ -344,16 +345,63 @@ test("shipment report metadata is shared by the export record and preserves arbi
   assert.equal(sheet.S3.s.alignment.vertical, "center");
 });
 
-test("explicit blank shipment overrides stay blank instead of falling back to formulas", () => {
+test("explicit blank numeric overrides use safe Excel fallbacks", () => {
   const acceptance = { ...project.units[0].acceptances[0], report: { shipmentDateText: "", sequenceText: "", squareMetersText: "", pingText: "", unitPriceText: "", amountText: "" } };
   const exportProject = { ...project, units: [{ ...project.units[0], acceptances: [acceptance] }] };
   const [record] = buildAcceptanceExportRecords(exportProject);
   const workbook = createShipmentWorkbook(exportProject, [record], "2026-05") as { Sheets: Record<string, any> };
   const sheet = workbook.Sheets["已出貨明細總表"];
-  for (const cell of ["A3", "B3", "F3", "G3", "H3", "I3"]) {
+  for (const cell of ["A3", "B3", "F3", "G3"]) {
     assert.equal(sheet[cell].v, "");
     assert.equal(sheet[cell].f, undefined);
   }
+  assert.equal(sheet.H3.v, 2750);
+  assert.equal(sheet.H3.t, "n");
+  assert.equal(sheet.I3.f, 'IF(OR(G3="",H3=""),"",ROUND(G3*H3,0))');
+});
+
+test("shipment numeric parser accepts known formats and rejects trailing text", () => {
+  assert.equal(parseReportNumericText("49.87"), 49.87);
+  assert.equal(parseReportNumericText("12.00 坪", ["坪"]), 12);
+  assert.equal(parseReportNumericText("2,800"), 2800);
+  assert.equal(parseReportNumericText("2800元", ["元"]), 2800);
+  assert.equal(parseReportNumericText("164.86 m²", ["m²", "㎡"]), 164.86);
+  assert.equal(parseReportNumericText("164.86㎡", ["m²", "㎡"]), 164.86);
+  for (const value of ["", "49.87abc", "2,80", "1,000,00", "--12"]) {
+    assert.equal(parseReportNumericText(value, ["坪", "元", "m²", "㎡"]), null, value);
+  }
+});
+
+test("shipment Excel keeps mixed legacy numeric details numeric and totals every detail row", () => {
+  const source = { ...buildAcceptanceExportRecords(project)[0], areaSquareMeters: 164.86, areaPing: 49.87, unitPrice: 2800 };
+  const records = [
+    source,
+    { ...source, unitId: "u2", acceptanceId: "a2", areaSquareMeters: 39.67, areaPing: 12, squareMetersText: "39.67", pingText: "12.00", unitPriceText: "2,800", amountText: "999" },
+    { ...source, unitId: "u3", acceptanceId: "a3", areaSquareMeters: 164.86, areaPing: 49.87, squareMetersText: "164.86 m²", pingText: "49.87 坪", unitPriceText: "2800元", amountText: "人工金額" },
+    { ...source, unitId: "u4", acceptanceId: "a4", areaSquareMeters: 164.86, areaPing: 49.87, unitPrice: 2800 },
+  ];
+  const workbook = createShipmentWorkbook(project, records, "2026-05") as { Sheets: Record<string, any> };
+  const sheet = workbook.Sheets["已出貨明細總表"];
+  for (const row of [3, 4, 5, 6]) {
+    assert.equal(sheet[`F${row}`].t, "n");
+    assert.equal(sheet[`H${row}`].t, "n");
+    assert.equal(sheet[`I${row}`].f, `IF(OR(G${row}="",H${row}=""),"",ROUND(G${row}*H${row},0))`);
+    assert.equal(sheet[`F${row}`].z, "0.00");
+    assert.equal(sheet[`G${row}`].z, '0.00" 坪"');
+    assert.equal(sheet[`H${row}`].z, '#,##0.0"元"');
+    assert.equal(sheet[`I${row}`].z, "#,##0");
+  }
+  assert.equal(sheet.G3.f, "ROUND(F3*0.3025,2)");
+  assert.equal(sheet.G4.t, "n");
+  assert.equal(sheet.G4.v, 12);
+  assert.equal(sheet.G5.t, "n");
+  assert.equal(sheet.G5.v, 49.87);
+  assert.equal(sheet.G6.f, "ROUND(F6*0.3025,2)");
+  assert.equal(sheet.F7.f, "SUM(F3:F6)");
+  assert.equal(sheet.G7.f, "SUM(G3:G6)");
+  assert.equal(sheet.I7.f, "SUM(I3:I6)");
+  assert.equal(Number([3, 4, 5, 6].reduce((sum, row) => sum + sheet[`F${row}`].v, 0).toFixed(2)), 534.25);
+  assert.equal(Number([3, 4, 5, 6].reduce((sum, row) => sum + sheet[`G${row}`].v, 0).toFixed(2)), 161.61);
 });
 
 test("shipment detail row height grows conservatively for long printable text", () => {
