@@ -10,8 +10,19 @@ export function journalPhotoOrientation(width: number, height: number): JournalP
   return height > width ? "portrait" : "landscape";
 }
 
-export type JournalPhotoDisplay = { mode: "original" | "portrait" | "landscape"; scale: number };
+export type JournalPhotoDisplay = { mode: "original" | "portrait" | "landscape"; scale: number; offsetX?: number; offsetY?: number };
 export type JournalPhotoDisplaySettings = Record<string, JournalPhotoDisplay>;
+
+export function positionJournalPhoto(setting: JournalPhotoDisplay, offsetX = 0, offsetY = 0): JournalPhotoDisplay {
+  const clamp = (value: number) => Number.isFinite(value) ? Math.max(-0.5, Math.min(0.5, value)) : 0;
+  return { ...setting, offsetX: clamp(offsetX), offsetY: clamp(offsetY) };
+}
+
+export function journalPhotoPlacement(width: number, height: number, frameWidth: number, frameHeight: number, setting?: JournalPhotoDisplay) {
+  const size = journalPhotoDisplaySize(width, height, frameWidth, frameHeight, setting);
+  const position = positionJournalPhoto(setting || { mode: "original", scale: 1 }, setting?.offsetX, setting?.offsetY);
+  return { ...size, x: (frameWidth - size.width) / 2 + position.offsetX! * frameWidth, y: (frameHeight - size.height) / 2 + position.offsetY! * frameHeight };
+}
 
 export function journalPhotoDisplaySize(width: number, height: number, maxWidth: number, maxHeight: number, setting?: JournalPhotoDisplay) {
   const scale = Math.min(1, Math.max(0.4, Number.isFinite(setting?.scale) ? setting!.scale : 1));

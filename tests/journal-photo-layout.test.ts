@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { journalPhotoOrientation, planJournalPhotoRows, planJournalPhotoPages, journalPhotoDisplaySize, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout.ts";
+import { journalPhotoOrientation, planJournalPhotoRows, planJournalPhotoPages, journalPhotoDisplaySize, journalPhotoPlacement, positionJournalPhoto, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout.ts";
+
+test("photo offsets default to center and move within a fixed clipping frame", () => {
+  assert.deepEqual(journalPhotoPlacement(100, 100, 300, 200), { width: 200, height: 200, x: 50, y: 0 });
+  const setting = { mode: "original" as const, scale: 0.5, offsetX: 0.25, offsetY: -0.5 };
+  assert.deepEqual(journalPhotoPlacement(100, 100, 300, 200, setting), { width: 100, height: 100, x: 175, y: -50 });
+  assert.deepEqual(journalPhotoPlacement(100, 100, 600, 400, setting), { width: 200, height: 200, x: 350, y: -100 });
+});
+
+test("moving and centering preserve mode and scale without mutating settings", () => {
+  const original = Object.freeze({ mode: "portrait" as const, scale: 0.65, offsetX: 0.2, offsetY: -0.1 });
+  const moved = positionJournalPhoto(original, 0.3, -0.4);
+  assert.deepEqual(moved, { ...original, offsetX: 0.3, offsetY: -0.4 });
+  assert.deepEqual(positionJournalPhoto(moved), { ...original, offsetX: 0, offsetY: 0 });
+  assert.deepEqual(positionJournalPhoto(original, 10, -10), { ...original, offsetX: 0.5, offsetY: -0.5 });
+  assert.equal(original.offsetX, 0.2);
+  assert.equal(original.offsetY, -0.1);
+});
 
 const items = (orientations: Array<"portrait" | "landscape">): JournalPhotoLayoutItem<number>[] =>
   orientations.map((orientation, value) => ({ value, width: orientation === "portrait" ? 900 : 1600, height: orientation === "portrait" ? 1600 : 900 }));

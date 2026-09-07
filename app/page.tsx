@@ -20,7 +20,7 @@ import { areaInputToPing, areaValueFromPing, convertAreaInput, type AreaUnit } f
 import { shouldUseEnvironmentCapture } from "../lib/photo-capture";
 import { detectImportAreaBatch, findExactUnitProduct, importableUnitRows, importedAreaEntry, importedAreaToCanonicalPing, importProductKey, onboardingUnitRowIsValid, safeImportedEstimated, type ImportAreaDetection } from "../lib/unit-import";
 import { buildUnitScopedRecord, buildingNavigationUnits, createFloorReturnContext, floorBatchSelectableIds, floorIdentity, floorSignatureRoles, floorUnitAcceptanceState, floorUnitNeedsAction, floorUnitSignatureCount, floorUnitSignatures, floorUnitsFor, floorWorkbenchSummary, nextPendingFloorUnitId, sortUnitsByNumber, updateLatestFormalAcceptanceSignature, updateUnitScopedRecord, type FloorAcceptanceRecord, type FloorReturnContext, type FloorSignatureRole, type ResolvedFloorSignatures } from "../lib/floor-acceptance";
-import { planJournalPhotoRows, planJournalPhotoPages, journalPhotoDisplaySize, type JournalPhotoDisplaySettings, type JournalPhotoDisplay, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
+import { planJournalPhotoRows, planJournalPhotoPages, journalPhotoPlacement, positionJournalPhoto, type JournalPhotoDisplaySettings, type JournalPhotoDisplay, type JournalPhotoLayoutItem } from "../lib/journal-photo-layout";
 import { canWriteAcceptanceLifecycle, canWriteWorkLifecycle } from "../lib/unit-lifecycle";
 import { canConfirmUnit, canCreateUnit, canDeleteUnit, canEditUnitMaster, canUsePermissionUnitTab, canUsePermissionView, canViewCustomerDetails, financeUiMode } from "../lib/ui-permissions";
 
@@ -5589,12 +5589,25 @@ function loadJournalPhotoDimensions(photo: Photo) {
 async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number, dimensions?: { width: number; height: number }, setting?: JournalPhotoDisplay) {
   try {
     const intrinsic = dimensions || await loadJournalPhotoDimensions(photo);
-    const { width, height } = journalPhotoDisplaySize(intrinsic.width, intrinsic.height, maxWidth, maxHeight, setting);
     const response = await fetch(photo.data);
-    const data = await response.arrayBuffer();
-    const mime = response.headers.get("content-type") || (photo.data.startsWith("data:image/png") ? "image/png" : "image/jpeg");
-    const type = mime.includes("png") ? "png" : "jpg";
-    return new ImageRun({ data, type, transformation: { width, height }, altText: { title: photo.caption || "工作照片", description: photo.caption || "工作日誌照片", name: "工作照片" } });
+    if (!response.ok) throw new Error("Photo download failed");
+    const bitmap = await createImageBitmap(await response.blob());
+    try {
+      const placement = journalPhotoPlacement(intrinsic.width, intrinsic.height, maxWidth, maxHeight, setting);
+      const canvas = document.createElement("canvas");
+      canvas.width = maxWidth * 3;
+      canvas.height = maxHeight * 3;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Canvas unavailable");
+      context.scale(3, 3);
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, maxWidth, maxHeight);
+      context.drawImage(bitmap, placement.x, placement.y, placement.width, placement.height);
+      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Photo export failed")), "image/png"));
+      return new ImageRun({ data: await blob.arrayBuffer(), type: "png", transformation: { width: maxWidth, height: maxHeight }, altText: { title: photo.caption || "工作照片", description: photo.caption || "工作日誌照片", name: "工作照片" } });
+    } finally {
+      bitmap.close();
+    }
   } catch {
     return null;
   }
@@ -5696,10 +5709,29 @@ function JournalWordPreviewPhoto({ photo, maxWidth, maxHeight, settings, setSett
     return () => { active = false; };
   }, [photo.data]);
   const setting = settings[photo.id] || { mode: "original", scale: 1 };
-  const size = journalPhotoDisplaySize(dimensions.width, dimensions.height, maxWidth, maxHeight, setting);
+  const size = journalPhotoPlacement(dimensions.width, dimensions.height, maxWidth, maxHeight, setting);
+  const drag = useRef<{ id: number; x: number; y: number; width: number; height: number; setting: JournalPhotoDisplay } | null>(null);
   const update = (value: Partial<JournalPhotoDisplay>) => setSettings((current) => ({ ...current, [photo.id]: { ...setting, ...value } }));
   return <div className="journal-export-photo">
-    <div className="journal-export-photo-image" style={{ aspectRatio: maxWidth / maxHeight }}><img src={photo.data} alt={photo.caption || "工作照片"} style={{ width: `${size.width / maxWidth * 100}%`, height: "auto", maxHeight: "100%" }} /></div>
+    <div className="journal-export-photo-image" style={{ aspectRatio: maxWidth / maxHeight, position: "relative", overflow: "hidden" }}><img src={photo.data} alt={photo.caption || "工作照片"} draggable={false}
+      onPointerDown={(event) => {
+        if (!event.isPrimary || event.button !== 0) return;
+        const frame = event.currentTarget.parentElement!.getBoundingClientRect();
+        if (!frame.width || !frame.height) return;
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        drag.current = { id: event.pointerId, x: event.clientX, y: event.clientY, width: frame.width, height: frame.height, setting };
+      }}
+      onPointerMove={(event) => {
+        const active = drag.current;
+        if (!active || active.id !== event.pointerId) return;
+        event.preventDefault();
+        update(positionJournalPhoto(active.setting, (active.setting.offsetX || 0) + (event.clientX - active.x) / active.width, (active.setting.offsetY || 0) + (event.clientY - active.y) / active.height));
+      }}
+      onPointerUp={(event) => { if (drag.current?.id === event.pointerId) { drag.current = null; event.currentTarget.releasePointerCapture(event.pointerId); } }}
+      onPointerCancel={() => { drag.current = null; }} onLostPointerCapture={() => { drag.current = null; }}
+      style={{ position: "absolute", left: `${size.x / maxWidth * 100}%`, top: `${size.y / maxHeight * 100}%`, width: `${size.width / maxWidth * 100}%`, height: `${size.height / maxHeight * 100}%`, maxHeight: "none", maxWidth: "none", touchAction: "none", userSelect: "none", cursor: "grab" }} /></div>
+    <button type="button" className="ghost" onClick={() => update(positionJournalPhoto(setting))}>置中</button>
     <label>顯示方式<select aria-label="照片匯出顯示方式" value={setting.mode} onChange={(event) => update({ mode: event.target.value as JournalPhotoDisplay["mode"] })}><option value="original">原比例</option><option value="portrait">直式</option><option value="landscape">橫式</option></select></label>
     <label>尺寸 {Math.round(setting.scale * 100)}%<input aria-label="照片匯出尺寸" type="range" min="40" max="100" step="5" value={setting.scale * 100} onChange={(event) => update({ scale: Number(event.target.value) / 100 })} /></label>
   </div>;
