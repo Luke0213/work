@@ -1,7 +1,7 @@
 "use client";
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
-import { AlignmentType, BorderStyle, Document, ImageRun, Packer, PageOrientation, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
+import { saveUnitJournal } from "../lib/unit-journal-save";
 import { createProject, loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
 import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
@@ -1349,11 +1349,14 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     setFloorContext(null);
     setView("dashboard");
   }, [pid, projects]);
-  const setProjectsDurably = (update: (current: Project[]) => Project[]) =>
+  const setProjectsDurably = (update: (current: Project[]) => Project[], onDurable?: (error?: Error) => void) =>
     setProjects((current) => {
       const next = update(current);
       latestRef.current = { projects: next, catalog: latestRef.current.catalog };
-      writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true);
+      const storage = writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true);
+      if (onDurable) void storage.indexedDb.then((result) => {
+        onDurable(result === true || (typeof result === "object" && result.ok) ? undefined : new Error("工作區未能寫入本機儲存空間"));
+      }, (error) => onDurable(error instanceof Error ? error : new Error(String(error))));
       return next;
     });
   const updateCatalog = (products: Product[]) => {
@@ -1378,7 +1381,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
       return { ...p, ...x, ...(x.units ? { units: retainEntityTombstones(p.units, x.units) } : {}) };
     }));
   };
-  const patchUnit = (x: Partial<Unit>) =>
+  const patchUnit = (x: Partial<Unit>, onDurable?: (error?: Error) => void) =>
     setProjectsDurably((ps) =>
       ps.map((p) =>
         p.id !== pid || isDeletedEntity(p)
@@ -1387,7 +1390,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
               ...p,
               units: p.units.map((u) => (u.id !== uid || isDeletedEntity(u) ? u : { ...u, ...x })),
             },
-      ),
+      ), onDurable,
     );
   const patchUnitById = (unitId: string, updater: (current: Unit) => Unit) =>
     setProjectsDurably((ps) =>
@@ -4195,7 +4198,7 @@ function UnitDetail({
   role: AppRole;
   permissions: RolePermissions;
   activity?: EntityActivity;
-  patch: (x: Partial<Unit>) => void;
+  patch: (x: Partial<Unit>, onDurable?: (error?: Error) => void) => void;
   addEvent: (a: string, b: string, p?: Photo[]) => void;
   back: () => void;
   floorContext: FloorReturnContext | null;
@@ -4284,7 +4287,7 @@ function UnitDetail({
         {tab === "accept" && canUseUnitTab(role, permissions, "accept") && (
           <AcceptTab key={unit.id} project={project} u={unit} patch={patch} add={addEvent} />
         )}{" "}
-        {tab === "journal" && canUseUnitTab(role, permissions, "journal") && <UnitJournalTab project={project} u={unit} patch={patch} />}{" "}
+        {tab === "journal" && canUseUnitTab(role, permissions, "journal") && <UnitJournalTab key={unit.id} project={project} u={unit} patch={patch} />}{" "}
         {tab === "defect" && canUseUnitTab(role, permissions, "defect") && (
           <DefectsTab u={unit} patch={patch} add={addEvent} />
         )}{" "}
@@ -5586,122 +5589,19 @@ function loadJournalPhotoDimensions(photo: Photo) {
   });
 }
 
-async function buildJournalPhotoRun(photo: Photo, maxWidth: number, maxHeight: number, dimensions?: { width: number; height: number }, setting?: JournalPhotoDisplay) {
-  try {
-    const intrinsic = dimensions || await loadJournalPhotoDimensions(photo);
-    const response = await fetch(photo.data);
-    if (!response.ok) throw new Error("Photo download failed");
-    const bitmap = await createImageBitmap(await response.blob());
-    try {
-      const placement = journalPhotoPlacement(intrinsic.width, intrinsic.height, maxWidth, maxHeight, setting);
-      const canvas = document.createElement("canvas");
-      canvas.width = maxWidth * 3;
-      canvas.height = maxHeight * 3;
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Canvas unavailable");
-      context.scale(3, 3);
-      context.fillStyle = "#ffffff";
-      context.fillRect(0, 0, maxWidth, maxHeight);
-      context.drawImage(bitmap, placement.x, placement.y, placement.width, placement.height);
-      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Photo export failed")), "image/png"));
-      return new ImageRun({ data: await blob.arrayBuffer(), type: "png", transformation: { width: maxWidth, height: maxHeight }, altText: { title: photo.caption || "工作照片", description: photo.caption || "工作日誌照片", name: "工作照片" } });
-    } finally {
-      bitmap.close();
-    }
-  } catch {
-    return null;
-  }
-}
-
-const JOURNAL_PAGE_WIDTH = 9360;
-const JOURNAL_NO_BORDERS = {
-  top: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
-  bottom: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
-  left: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
-  right: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
-  insideHorizontal: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
-  insideVertical: { style: BorderStyle.NIL, size: 0, color: "FFFFFF" },
-};
-type MeasuredJournalPhoto = JournalPhotoLayoutItem<Photo>;
-
-async function buildJournalLogoRun() {
-  try {
-    const response = await fetch("/shen-yin-logo.png");
-    return new ImageRun({ data: await response.arrayBuffer(), type: "png", transformation: { width: 120, height: 44 }, altText: { title: "神銀建材 Logo", description: "神銀建材 Logo", name: "神銀建材 Logo" } });
-  } catch {
-    return null;
-  }
-}
-
-async function downloadWorkJournalDocx(project: Project, u: Unit, entry: DailyNote, settings: JournalPhotoDisplaySettings = {}) {
-  const sourcePhotos = (entry.photos || []).slice();
-  const measuredPhotos: MeasuredJournalPhoto[] = await Promise.all(sourcePhotos.map(async (photo) => ({ value: photo, ...await loadJournalPhotoDimensions(photo) })));
-  const photoPages = planJournalPhotoPages(measuredPhotos);
-  const logo = await buildJournalLogoRun();
-  const photoCell = (photo: ImageRun | null, width: number) => new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: width, type: WidthType.DXA }, margins: { top: 30, bottom: 30, left: 30, right: 30 }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: photo ? [photo] : [new TextRun({ text: "圖片無法載入", color: "777777", size: 16, font: "Microsoft JhengHei" })] })] });
-  const photoTable = async (rowPhotos: MeasuredJournalPhoto[], maxHeight: number, width = JOURNAL_PAGE_WIDTH) => {
-    const columnWidth = Math.floor(width / rowPhotos.length);
-    const availableWidth = Math.max(1, Math.floor(columnWidth / 15) - 4);
-    const maxPhotoWidth = rowPhotos.length === 1 ? Math.min(440, availableWidth) : availableWidth;
-    const runs = await Promise.all(rowPhotos.map((photo) => buildJournalPhotoRun(photo.value, maxPhotoWidth, maxHeight, photo, settings[photo.value.id])));
-    return new Table({ alignment: AlignmentType.CENTER, borders: JOURNAL_NO_BORDERS, width: { size: width, type: WidthType.DXA }, columnWidths: rowPhotos.map(() => columnWidth), rows: [new TableRow({ cantSplit: true, children: runs.map((run) => photoCell(run, columnWidth)) })] });
-  };
-  const journalHeader = (pageBreakBefore = false) => new Table({
-    alignment: AlignmentType.CENTER,
-    borders: JOURNAL_NO_BORDERS,
-    width: { size: JOURNAL_PAGE_WIDTH, type: WidthType.DXA },
-    columnWidths: [3120, 3120, 3120],
-    rows: [new TableRow({ cantSplit: true, children: [
-      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 3120, type: WidthType.DXA }, children: [new Paragraph({ pageBreakBefore, alignment: AlignmentType.LEFT, children: logo ? [logo] : [] })] }),
-      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 3120, type: WidthType.DXA }, children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "SPC 工程工作日誌", bold: true, size: 34, font: "Microsoft JhengHei" })] })] }),
-      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 3120, type: WidthType.DXA }, children: [new Paragraph({})] }),
-    ] })],
-  });
-  const meta = [
-    ["案場名稱", project.name], ["完工日期", entry.date], ["戶別", `${u.building} ${u.floor}-${u.number}`],
-    ["SPC 型號／色號", `${u.model}${u.colorNo ? `／${u.colorNo}` : ""}`], ["坪數", `${u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪`],
-    ["工作內容", entry.content || "—"], ["備註", entry.note || "無"],
-  ];
-  const infoChildren = meta.map(([label, value]) => new Paragraph({ spacing: { after: 105 }, children: [new TextRun({ text: `${label}：`, bold: true, size: 24, font: "Microsoft JhengHei" }), new TextRun({ text: value || "—", size: 24, font: "Microsoft JhengHei" })] }));
-  const firstPagePhotos = photoPages[0] || [];
-  const firstPhotoRun = firstPagePhotos[0] ? await buildJournalPhotoRun(firstPagePhotos[0].value, 310, 280, firstPagePhotos[0], settings[firstPagePhotos[0].value.id]) : null;
-  const rightTopChildren = firstPhotoRun
-    ? [new Paragraph({ alignment: AlignmentType.CENTER, children: [firstPhotoRun] })]
-    : [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: "無工作照片", color: "777777", font: "Microsoft JhengHei" })] })];
-  const children: Array<Paragraph | Table> = [
-    journalHeader(),
-    new Paragraph({ spacing: { after: 40 } }),
-    new Table({ alignment: AlignmentType.CENTER, borders: JOURNAL_NO_BORDERS, width: { size: JOURNAL_PAGE_WIDTH, type: WidthType.DXA }, columnWidths: [4540, 4820], rows: [new TableRow({ cantSplit: true, children: [
-      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 4540, type: WidthType.DXA }, margins: { top: 40, bottom: 40, left: 30, right: 90 }, children: infoChildren }),
-      new TableCell({ borders: JOURNAL_NO_BORDERS, width: { size: 4820, type: WidthType.DXA }, margins: { top: 40, bottom: 40, left: 90, right: 30 }, children: rightTopChildren }),
-    ] })] }),
-  ];
-  const firstPageRows = planJournalPhotoRows(firstPagePhotos.slice(1));
-  const firstPageRowHeight = 250;
-  for (const rowPhotos of firstPageRows) {
-    children.push(await photoTable(rowPhotos, firstPageRowHeight));
-  }
-  for (const pagePhotos of photoPages.slice(1)) {
-    children.push(journalHeader(true), new Paragraph({ spacing: { after: 100 } }));
-    const followingRows = planJournalPhotoRows(pagePhotos);
-    const followingRowHeight = 400;
-    for (const rowPhotos of followingRows) {
-      children.push(await photoTable(rowPhotos, followingRowHeight));
-    }
-  }
-  const doc = new Document({ sections: [{ properties: { page: { size: { width: 11906, height: 16838, orientation: PageOrientation.PORTRAIT }, margin: { top: 720, right: 720, bottom: 720, left: 720 } } }, children }] });
-  const blob = await Packer.toBlob(doc);
+async function downloadWorkJournalPdf(project: Project, u: Unit, entry: DailyNote, settings: JournalPhotoDisplaySettings = {}) {
+  const { createJournalPdf } = await import("../lib/journal-pdf");
+  const metadata = [`案場名稱：${project.name}`, `完工日期：${entry.date}`, `戶別：${u.building} ${u.floor}-${u.number}`, `型號／色號：${u.model}／${u.colorNo}`, `坪數：${u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪`, `工作內容：${entry.content}`, `備註：${entry.note || "無"}`, `後續待處理：${entry.pending || "無"}`];
+  const blob = await createJournalPdf(metadata, entry.photos || [], settings);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${project.name}_${u.number}_${entry.date}_驗收日誌.docx`.replace(/[\\/:*?"<>|]/g, "_");
+  link.download = [project.name, u.number, entry.date].join("_").replace(/[\\/:*?"<>|]/g, "_") + ".pdf";
   document.body.appendChild(link);
-  link.click();
-  link.remove();
-  revokeObjectUrlLater(url);
+  link.click(); link.remove(); revokeObjectUrlLater(url);
 }
 
-function JournalWordPreviewPhoto({ photo, maxWidth, maxHeight, settings, setSettings }: { photo: Photo; maxWidth: number; maxHeight: number; settings: JournalPhotoDisplaySettings; setSettings: React.Dispatch<React.SetStateAction<JournalPhotoDisplaySettings>> }) {
+function JournalPDFPreviewPhoto({ photo, maxWidth, maxHeight, settings, setSettings }: { photo: Photo; maxWidth: number; maxHeight: number; settings: JournalPhotoDisplaySettings; setSettings: React.Dispatch<React.SetStateAction<JournalPhotoDisplaySettings>> }) {
   const [dimensions, setDimensions] = useState({ width: 4, height: 3 });
   useEffect(() => {
     let active = true;
@@ -5737,60 +5637,90 @@ function JournalWordPreviewPhoto({ photo, maxWidth, maxHeight, settings, setSett
   </div>;
 }
 
-function JournalWordPreviewPhotoRows({ photos, settings, setSettings }: { photos: Photo[]; settings: JournalPhotoDisplaySettings; setSettings: React.Dispatch<React.SetStateAction<JournalPhotoDisplaySettings>> }) {
+function JournalPDFPreviewPhotoRows({ photos, settings, setSettings }: { photos: Photo[]; settings: JournalPhotoDisplaySettings; setSettings: React.Dispatch<React.SetStateAction<JournalPhotoDisplaySettings>> }) {
   return <div className="word-preview-photo-layout">{planJournalPhotoPages(photos).map((page, pageIndex) => <div key={pageIndex} className="journal-export-page">
     {pageIndex > 0 && <div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span>第 {pageIndex + 1} 頁</span></div>}
-    {planJournalPhotoRows((pageIndex === 0 ? page.slice(1) : page).map((photo) => ({ value: photo, width: 4, height: 3 }))).map((row, rowIndex) => <div className="word-preview-photo-row" style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }} key={rowIndex}>{row.map(({ value: photo }) => <JournalWordPreviewPhoto key={photo.id} photo={photo} maxWidth={row.length === 1 ? 440 : Math.floor(624 / row.length) - 4} maxHeight={pageIndex === 0 ? 250 : 400} settings={settings} setSettings={setSettings} />)}</div>)}
+    {planJournalPhotoRows((pageIndex === 0 ? page.slice(1) : page).map((photo) => ({ value: photo, width: 4, height: 3 }))).map((row, rowIndex) => <div className="word-preview-photo-row" style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }} key={rowIndex}>{row.map(({ value: photo }) => <JournalPDFPreviewPhoto key={photo.id} photo={photo} maxWidth={row.length === 1 ? 440 : Math.floor(624 / row.length) - 4} maxHeight={pageIndex === 0 ? 250 : 400} settings={settings} setSettings={setSettings} />)}</div>)}
   </div>)}</div>;
 }
 
-function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>) => void }) {
+function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>, onDurable?: (error?: Error) => void) => void }) {
   const authUserId = useAuthOwner();
   const blank = (): DailyNote => ({ id: id(), date: day(), content: "", pending: "", note: "", photos: [], createdAt: "", updatedAt: "", createdBy: "", draft: true });
   const storedDraft = liveEntities(u.journals).find((item) => item.draft);
   const [entry, setEntry] = useState<DailyNote>(() => readDraft(draftKey(authUserId, "unit-journal", u.id), storedDraft || blank()));
   const [saved, setSaved] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const savingRef = useRef(false);
+  const draftWrites = useRef<Promise<unknown>>(Promise.resolve());
+  const saveJournalDraft = (record: DailyNote) => {
+    const key = draftKey(authUserId, "unit-journal", u.id);
+    const pending = draftWrites.current.catch(() => undefined).then(async () => {
+      await saveOfflineDraft({ key, owner: authUserId, kind: "unit-journal", recordId: record.id, unitId: u.id, payload: record, baseVersion: 0, updatedBy: authUserId });
+      try { localStorage.setItem(key, localDraftValue(record)); }
+      catch (error) { logStorageException("localStorage", "write", error); }
+    });
+    draftWrites.current = pending;
+    return pending;
+  };
   const [preview, setPreview] = useState(false);
   const [journalPhotoSettings, setJournalPhotoSettings] = useState<JournalPhotoDisplaySettings>({});
   const [downloading, setDownloading] = useState(false);
   const skipNextDraftWrite = useRef(false);
   const editingExisting = liveEntities(u.journals).some((item) => item.id === entry.id);
-  useOfflineDraftRestore(draftKey(authUserId, "unit-journal", u.id), setEntry);
+  const [journalReady, setJournalReady] = useState(false);
   useEffect(() => {
+    let active = true;
+    void loadOfflineDraft<DailyNote>(draftKey(authUserId, "unit-journal", u.id)).then((draft) => {
+      if (!active) return;
+      if (draft) setEntry(draft.payload);
+      setJournalReady(true);
+    });
+    return () => { active = false; };
+  }, [authUserId, u.id]);
+  useEffect(() => {
+    if (!journalReady) return;
     if (skipNextDraftWrite.current) { skipNextDraftWrite.current = false; return; }
-    writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), entry, authUserId);
-  }, [entry, u.id, authUserId]);
+    void saveJournalDraft(entry).catch(() => { setSaved(""); setSaveError("本機草稿寫入失敗，請保留此頁並重試儲存。"); });
+  }, [entry, u.id, authUserId, journalReady]);
   const persist = async (draft: boolean) => {
-    const { data } = await supabase.auth.getUser();
-    const now = stamp();
-    const record: DailyNote = { ...entry, draft, createdAt: entry.createdAt || now, updatedAt: now, createdBy: entry.createdBy || data.user?.email || "目前登入帳號" };
-    patch({ journals: [record, ...u.journals.filter((item) => item.id !== entry.id)] });
-    if (!draft) skipNextDraftWrite.current = true;
-    setEntry(record);
-    if (draft) writeLocalDraft(draftKey(authUserId, "unit-journal", u.id), record, authUserId);
-    else {
-      removeDurableDraft(draftKey(authUserId, "unit-journal", u.id));
+    if (savingRef.current || !journalReady) return;
+    savingRef.current = true;
+    setSaving(true); setSaved(""); setSaveError("");
+    try {
+      const record = await saveUnitJournal({ entry, journals: u.journals, draft, owner: authUserId, now: stamp(),
+        saveDraft: saveJournalDraft,
+        queue: (record) => queueOfflineWrite({ owner: authUserId, kind: "unit-journal", recordId: record.id, unitId: u.id, operation: draft ? "upsert" : "complete", baseVersion: 0, updatedBy: authUserId, payload: record }),
+        patch: (journals) => new Promise<void>((resolve, reject) => patch({ journals }, (error) => error ? reject(error) : resolve())),
+        removeDraft: () => removeDurableDraft(draftKey(authUserId, "unit-journal", u.id)),
+      });
+      skipNextDraftWrite.current = true;
+      setEntry(record);
+      setSaved(draft ? "✓ 日誌已暫存於本機，雲端同步狀態請見頁面提示" : "✓ 日誌已完成並保存於本機，雲端同步狀態請見頁面提示");
+    } catch {
+      setSaved("");
+      setSaveError("日誌儲存未完成，內容仍保留於此頁；請勿關閉，確認本機儲存空間後重試。");
+    } finally {
+      savingRef.current = false; setSaving(false);
     }
-    queueRecordChange(authUserId, "unit-journal", u.id, record, draft ? "upsert" : "complete");
-    setSaved(draft ? "✓ 驗收日誌已暫存，可稍後或換裝置繼續" : editingExisting ? "✓ 既有驗收日誌已更新" : "✓ 驗收日誌已完成並儲存");
   };
   const startNew = () => {
     const next = blank();
     setEntry(next);
     setSaved("");
-    removeDurableDraft(draftKey(authUserId, "unit-journal", u.id));
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   return <div className="panel form">
-    <div className="panel-head"><div><h2>驗收日誌</h2><p>流程：新增 → 暫存 → 查看 → 修改 → 完成；照片可產生 Word 報告。</p></div>{editingExisting && <button className="ghost" type="button" onClick={startNew}>新增驗收日誌</button>}</div>
+    <div className="panel-head"><div><h2>驗收日誌</h2><p>流程：新增 → 暫存 → 查看 → 修改 → 完成；照片可產生 PDF 報告。</p></div>{editingExisting && <button className="ghost" type="button" disabled={saving || !journalReady} onClick={startNew}>新增驗收日誌</button>}</div>
     {editingExisting && <div className="warning">正在修改 {entry.date} 的既有驗收日誌；儲存會更新原紀錄。</div>}
-    <div className="grid3"><Field label="日期／完工日期" type="date" value={entry.date} set={(date) => setEntry({ ...entry, date })} /><Field label="工作內容" value={entry.content} set={(content) => setEntry({ ...entry, content })} /><Field label="後續待處理" value={entry.pending} set={(pending) => setEntry({ ...entry, pending })} /><Field label="備註" value={entry.note} set={(note) => setEntry({ ...entry, note })} /></div>
+    <fieldset disabled={saving || !journalReady} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="grid3"><Field label="日期／完工日期" type="date" value={entry.date} set={(date) => setEntry({ ...entry, date })} /><Field label="工作內容" value={entry.content} set={(content) => setEntry({ ...entry, content })} /><Field label="後續待處理" value={entry.pending} set={(pending) => setEntry({ ...entry, pending })} /><Field label="備註" value={entry.note} set={(note) => setEntry({ ...entry, note })} /></div>
     <div className="unit-journal-photos"><Photos node="戶別工作日誌" label="工作照片" photos={entry.photos} set={(photos) => setEntry({ ...entry, photos })} /></div>
-    <div className="save-success">✓ 輸入內容會先保存在本機；按「暫存」後同步至資料庫</div>
-    <div className="form-actions"><button className="ghost" onClick={() => persist(true)}>暫存</button><button className="primary" disabled={!entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={!entry.content.trim()} onClick={() => { setJournalPhotoSettings({}); setPreview(true); }}>預覽／產生 Word</button></div>
-    {saved && <div className="save-success">{saved}</div>}
-    {preview && <Modal close={() => setPreview(false)} title="Word 列印預覽"><div className="word-preview"><div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span aria-hidden="true" /></div><div className="word-preview-first-row"><div className="word-preview-meta"><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span><span><b>工作內容：</b>{entry.content}</span><span><b>備註：</b>{entry.note || "無"}</span></div>{entry.photos[0] ? <JournalWordPreviewPhoto photo={entry.photos[0]} maxWidth={310} maxHeight={280} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /> : <span className="word-preview-empty">無工作照片</span>}</div><JournalWordPreviewPhotoRows photos={entry.photos} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /></div><div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setDownloading(true); try { await downloadWorkJournalDocx(project, u, entry, journalPhotoSettings); } finally { setDownloading(false); } }}>{downloading ? "產生中…" : "確認產生 Word"}</button></div></Modal>}
-    <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={liveEntities(u.journals).map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { setEntry(item); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 Word"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
+    <div className="muted">輸入內容會嘗試保存在本機；按「暫存」或「完成日誌」後進入既有雲端同步。</div>
+    </fieldset><div className="form-actions"><button className="ghost" disabled={saving || !journalReady} onClick={() => persist(true)}>暫存</button><button className="primary" disabled={saving || !journalReady || !entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={saving || !journalReady || !entry.content.trim()} onClick={() => { setSaveError(""); setJournalPhotoSettings({}); setPreview(true); }}>預覽／產生 PDF</button></div>
+    {saving && <div role="status">儲存中…</div>}{saveError && <div className="warning" role="alert">{saveError}</div>}{saved && <div className="save-success">{saved}</div>}
+    {preview && <Modal close={() => setPreview(false)} title="PDF 匯出預覽"><div className="word-preview"><div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span aria-hidden="true" /></div><div className="word-preview-first-row"><div className="word-preview-meta"><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span><span><b>工作內容：</b>{entry.content}</span><span><b>備註：</b>{entry.note || "無"}</span></div>{entry.photos[0] ? <JournalPDFPreviewPhoto photo={entry.photos[0]} maxWidth={310} maxHeight={280} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /> : <span className="word-preview-empty">無工作照片</span>}</div><JournalPDFPreviewPhotoRows photos={entry.photos} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /></div>{saveError && <div role="alert" className="warning">{saveError}</div>}<div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setSaveError(""); setDownloading(true); try { await downloadWorkJournalPdf(project, u, entry, journalPhotoSettings); } catch (error) { setSaveError(error instanceof Error ? error.message : "PDF 產生失敗，請檢查網路後重試"); } finally { setDownloading(false); } }}>{downloading ? "產生中…" : "確認產生 PDF"}</button></div></Modal>}
+    <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={liveEntities(u.journals).map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { if (savingRef.current) return; setEntry(item); setSaveError(""); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 PDF"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
   </div>;
 }
 

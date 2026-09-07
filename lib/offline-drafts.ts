@@ -74,13 +74,19 @@ async function transact<T>(storeName: "drafts" | "outbox", mode: IDBTransactionM
       reject(error);
       return;
     }
-    request.onsuccess = () => resolve(request.result);
+    // A successful request can still be rolled back by its transaction.
     request.onerror = () => {
       const error = request.error || new Error("INDEXED_DB_REQUEST_FAILED");
       logStorageException("IndexedDB", mode === "readonly" ? "read" : "write", error);
       reject(error);
     };
-    transaction.oncomplete = () => db.close();
+    transaction.oncomplete = () => { db.close(); resolve(request.result); };
+    transaction.onabort = () => {
+      const error = transaction.error || new Error("INDEXED_DB_TRANSACTION_ABORTED");
+      db.close();
+      logStorageException("IndexedDB", "transaction", error);
+      reject(error);
+    };
     transaction.onerror = () => {
       const error = transaction.error || new Error("INDEXED_DB_TRANSACTION_FAILED");
       db.close();
