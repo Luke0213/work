@@ -5324,11 +5324,14 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
         set={(items) => setA({ ...a, items })}
       />
       <div className="grid3">
-        <Field
-          label="驗收人"
-          value={a.person}
-          set={(person: string) => setA({ ...a, person })}
-        />
+        <label className="field">
+          <span>驗收人</span>
+          <input
+            type="text"
+            readOnly
+            value={a.completion?.signatures?.office?.name || a.signature?.name || a.person || ""}
+          />
+        </label>
         <label className="field">
           <span>驗收結果</span>
           <select
@@ -5396,7 +5399,7 @@ function AcceptTab({ project, u, patch, add }: { project: Project; u: Unit; patc
           close={() => setSignRole(null)}
           save={(signature) => {
             const completion = completionDefaults(a, u);
-            setA({ ...a, signature: signRole === "office" ? signature : a.signature, completion: { ...completion, signatures: { ...completion.signatures, [signRole]: signature } } });
+            setA({ ...a, person: signRole === "office" ? signature.name : a.person, signature: signRole === "office" ? signature : a.signature, completion: { ...completion, signatures: { ...completion.signatures, [signRole]: signature } } });
             setSignRole(null);
           }}
         />
@@ -5646,7 +5649,7 @@ function JournalPDFPreviewPhotoRows({ photos, settings, setSettings }: { photos:
 
 function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patch: (x: Partial<Unit>, onDurable?: (error?: Error) => void) => void }) {
   const authUserId = useAuthOwner();
-  const blank = (): DailyNote => ({ id: id(), date: day(), content: "", pending: "", note: "", photos: [], createdAt: "", updatedAt: "", createdBy: "", draft: true });
+  const blank = (): DailyNote => ({ id: id(), date: day(), content: "無", pending: "", note: "無", photos: [], createdAt: "", updatedAt: "", createdBy: "", draft: true });
   const storedDraft = liveEntities(u.journals).find((item) => item.draft);
   const [entry, setEntry] = useState<DailyNote>(() => readDraft(draftKey(authUserId, "unit-journal", u.id), storedDraft || blank()));
   const [saved, setSaved] = useState("");
@@ -5682,8 +5685,15 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
   useEffect(() => {
     if (!journalReady) return;
     if (skipNextDraftWrite.current) { skipNextDraftWrite.current = false; return; }
+    const untouchedDefault =
+      !editingExisting &&
+      entry.content.trim() === "無" &&
+      !entry.pending.trim() &&
+      entry.note.trim() === "無" &&
+      entry.photos.length === 0;
+    if (untouchedDefault) return;
     void saveJournalDraft(entry).catch(() => { setSaved(""); setSaveError("本機草稿寫入失敗，請保留此頁並重試儲存。"); });
-  }, [entry, u.id, authUserId, journalReady]);
+  }, [entry, u.id, authUserId, journalReady, editingExisting]);
   const persist = async (draft: boolean) => {
     if (savingRef.current || !journalReady) return;
     savingRef.current = true;
@@ -5717,7 +5727,7 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
     <fieldset disabled={saving || !journalReady} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="grid3"><Field label="日期／完工日期" type="date" value={entry.date} set={(date) => setEntry({ ...entry, date })} /><Field label="工作內容" value={entry.content} set={(content) => setEntry({ ...entry, content })} /><Field label="後續待處理" value={entry.pending} set={(pending) => setEntry({ ...entry, pending })} /><Field label="備註" value={entry.note} set={(note) => setEntry({ ...entry, note })} /></div>
     <div className="unit-journal-photos"><Photos node="戶別工作日誌" label="工作照片" photos={entry.photos} set={(photos) => setEntry({ ...entry, photos })} /></div>
     <div className="muted">輸入內容會嘗試保存在本機；按「暫存」或「完成日誌」後進入既有雲端同步。</div>
-    </fieldset><div className="form-actions"><button className="ghost" disabled={saving || !journalReady} onClick={() => persist(true)}>暫存</button><button className="primary" disabled={saving || !journalReady || !entry.content.trim()} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={saving || !journalReady || !entry.content.trim()} onClick={() => { setSaveError(""); setJournalPhotoSettings({}); setPreview(true); }}>預覽／產生 PDF</button></div>
+    </fieldset><div className="form-actions"><button className="ghost" disabled={saving || !journalReady} onClick={() => persist(true)}>暫存</button><button className="primary" disabled={saving || !journalReady} onClick={() => persist(false)}>完成日誌</button><button className="ghost" disabled={saving || !journalReady} onClick={() => { setSaveError(""); setJournalPhotoSettings({}); setPreview(true); }}>預覽／產生 PDF</button></div>
     {saving && <div role="status">儲存中…</div>}{saveError && <div className="warning" role="alert">{saveError}</div>}{saved && <div className="save-success">{saved}</div>}
     {preview && <Modal close={() => setPreview(false)} title="PDF 匯出預覽"><div className="word-preview"><div className="word-preview-header"><CompanyLogo /><b>SPC 工程工作日誌</b><span aria-hidden="true" /></div><div className="word-preview-first-row"><div className="word-preview-meta"><b>案場名稱：{project.name}</b><span>完工日期：{entry.date}</span><span>戶別：{u.building} {u.floor}-{u.number}</span><span>型號：{u.model}／{u.colorNo}</span><span>坪數：{u.works.reduce((sum, work) => sum + Number(work.area || 0), 0) || u.estimated} 坪</span><span><b>工作內容：</b>{entry.content}</span><span><b>備註：</b>{entry.note || "無"}</span></div>{entry.photos[0] ? <JournalPDFPreviewPhoto photo={entry.photos[0]} maxWidth={310} maxHeight={280} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /> : <span className="word-preview-empty">無工作照片</span>}</div><JournalPDFPreviewPhotoRows photos={entry.photos} settings={journalPhotoSettings} setSettings={setJournalPhotoSettings} /></div>{saveError && <div role="alert" className="warning">{saveError}</div>}<div className="form-actions"><button className="ghost" onClick={() => setPreview(false)}>返回修改</button><button className="primary" disabled={downloading} onClick={async () => { setSaveError(""); setDownloading(true); try { await downloadWorkJournalPdf(project, u, entry, journalPhotoSettings); } catch (error) { setSaveError(error instanceof Error ? error.message : "PDF 產生失敗，請檢查網路後重試"); } finally { setDownloading(false); } }}>{downloading ? "產生中…" : "確認產生 PDF"}</button></div></Modal>}
     <History actionLabel="查看／修改" title="驗收日誌紀錄" rows={liveEntities(u.journals).map((item) => ({ a: item.date, b: item.createdBy || "—", c: `${item.draft ? "暫存" : "完成"} · 最後修改 ${item.updatedAt || item.createdAt || "—"}`, onOpen: () => { if (savingRef.current) return; setEntry(item); setSaveError(""); setSaved("已開啟既有驗收日誌，可查看、修改或再次產生 PDF"); window.scrollTo({ top: 0, behavior: "smooth" }); } }))} />
@@ -6373,9 +6383,9 @@ function buildCompletionExportDraft(project: Project, unit: Unit, acceptance: Ac
     area: String(acceptance.area || unit.estimated || ""),
     unitDisplay: `${unit.building}${unit.floor}${unit.number}`,
     floorAbnormal: completion.floorAbnormal,
-    abnormalUnit: completion.abnormalUnit,
+    abnormalUnit: completion.abnormalUnit?.trim() || "無",
     boardDamaged: completion.boardDamaged,
-    damagedMaterialType: completion.damagedMaterialType,
+    damagedMaterialType: completion.damagedMaterialType?.trim() || "無",
     trashCleared: completion.trashCleared,
     materialModel: completion.materialModel || unit.model,
     signatureNames: {

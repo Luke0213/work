@@ -33,6 +33,48 @@ test("normal workspace sync never invokes physical photo cleanup", async () => {
   assert.match(backend, /storage\.from\("spc-photos"\)\.remove/);
 });
 
+test("AcceptTab derives readonly acceptance person from office signature", async () => {
+  const page = await read("app/page.tsx");
+  const start = page.indexOf("function AcceptTab(");
+  const acceptance = page.slice(start, page.indexOf("\nfunction ", start + 1));
+  assert.match(acceptance, /<span>\u9a57\u6536\u4eba<\/span>\s*<input\b[^>]*\breadOnly\s+value=\{a\.completion\?\.signatures\?\.office\?\.name \|\| a\.signature\?\.name \|\| a\.person \|\| ""\}\s*\/>/);
+  assert.doesNotMatch(acceptance, /set=\{\s*\(\s*person\s*(?::\s*string\s*)?\)\s*=>\s*setA\(/);
+  const signSave = acceptance.match(/<Sign\b[\s\S]*?save=\{\(signature\) => \{([\s\S]*?)\}\}/)?.[1] || "";
+  assert.match(signSave, /person: signRole === "office" \? signature\.name : a\.person/);
+  assert.match(signSave, /signature: signRole === "office" \? signature : a\.signature/);
+  assert.match(signSave, /completion: \{ \.\.\.completion, signatures: \{ \.\.\.completion\.signatures, \[signRole\]: signature \} \}/);
+});
+
+test("buildCompletionExportDraft defaults empty supplementary fields and preserves content", async () => {
+  const page = await read("app/page.tsx");
+  const start = page.indexOf("function buildCompletionExportDraft(");
+  const draft = page.slice(start, page.indexOf("\nfunction ", start + 1));
+  for (const field of ["abnormalUnit", "damagedMaterialType"]) {
+    const expression = draft.match(new RegExp(field + ": ([^\\r\\n]+),"))?.[1];
+    assert.equal(expression, 'completion.' + field + '?.trim() || "\u7121"');
+    const evaluate = new Function("completion", "return (" + expression + ");");
+    for (const value of [undefined, "", "   "]) {
+      assert.equal(evaluate({ [field]: value }), "\u7121", field);
+    }
+    assert.equal(evaluate({ [field]: "original content" }), "original content", field);
+    assert.equal(evaluate({ [field]: "  original content  " }), "original content", field);
+  }
+});
+
+test("UnitJournalTab skips untouched default autosave and allows completion and preview", async () => {
+  const page = await read("app/page.tsx");
+  const start = page.indexOf("function UnitJournalTab(");
+  const journal = page.slice(start, page.indexOf("\nfunction ", start + 1));
+  assert.match(journal, /const blank = \(\): DailyNote => \(\{[^\r\n]*content: "\u7121", pending: "", note: "\u7121"/);
+  assert.match(journal, /useEffect\(\(\) => \{\s*if \(!journalReady\) return;\s*if \(skipNextDraftWrite\.current\) \{ skipNextDraftWrite\.current = false; return; \}\s*const untouchedDefault =\s*!editingExisting &&\s*entry\.content\.trim\(\) === "\u7121" &&\s*!entry\.pending\.trim\(\) &&\s*entry\.note\.trim\(\) === "\u7121" &&\s*entry\.photos\.length === 0;\s*if \(untouchedDefault\) return;\s*void saveJournalDraft\(entry\)/);
+  const buttons = journal.match(/<button\b(?:(?!<\/button>)[\s\S])*<\/button>/g) || [];
+  for (const label of ["\u5b8c\u6210\u65e5\u8a8c", "\u9810\u89bd\uff0f\u7522\u751f PDF"]) {
+    const button = buttons.find((item) => item.endsWith(">" + label + "</button>")) || "";
+    assert.match(button, /disabled=\{saving \|\| !journalReady\}/, label);
+    assert.doesNotMatch(button, /!entry\.content\.trim\(\)/, label);
+  }
+});
+
 test("completed acceptance cannot restore or rewrite a stale durable draft", async () => {
   const page = await read("app/page.tsx");
   const acceptance = page.slice(page.indexOf("function AcceptTab"), page.indexOf("function CompletionCopy"));
@@ -878,10 +920,10 @@ test("divider note stays visible and optional for every needed state", async () 
 test("records share notes, photos, optional measurements, confirmation, reopen, and unit journals", async () => {
   const page = await read("app/page.tsx");
   const pkg = JSON.parse(await read("package.json"));
-  for (const value of ["數值（需要時填寫）", "最後確認｜場勘", "最後確認｜", "返回修改", "確認送出", "查看／修改", "暫存未完成場勘", "暫存未完成施工", "戶別工作日誌", "預覽／產生 Word", "確認產生 Word", "createdBy", "updatedAt"]) assert.match(page, new RegExp(value));
+  for (const value of ["數值（需要時填寫）", "最後確認｜場勘", "最後確認｜", "返回修改", "確認送出", "查看／修改", "暫存未完成場勘", "暫存未完成施工", "戶別工作日誌", "預覽／產生 PDF", "確認產生 PDF", "PDF 匯出預覽", "createdBy", "updatedAt"]) assert.match(page, new RegExp(value));
   assert.match(page, /journals: DailyNote\[\]/);
-  assert.match(page, /downloadWorkJournalDocx/);
-  assert.equal(pkg.dependencies.docx, "^9.7.1");
+  assert.match(page, /downloadWorkJournalPdf/);
+  assert.equal(pkg.dependencies.jspdf, "^4.2.1");
 });
 
 test("photo picker keeps separate camera and gallery inputs on one resilient handler", async () => {
@@ -1031,39 +1073,48 @@ test("electronic acceptance excludes drafts after billing CSV export removal", a
   assert.doesNotMatch(page, /const a = u\.acceptances\[0\]/);
 });
 
-test("work journal Word export uses adaptive borderless six-photo pages", async () => {
+test("work journal PDF export uses adaptive borderless six-photo pages", async () => {
   const page = await read("app/page.tsx");
   const css = await read("app/globals.css");
-  const exporter = page.slice(page.indexOf("async function buildJournalPhotoRun"), page.indexOf("function UnitJournalTab"));
-  assert.match(exporter, /const PHOTO_PER_PAGE = 6/);
-  assert.match(exporter, /planJournalPhotoRows\(firstPagePhotos\.slice\(1\)\)/);
-  assert.match(exporter, /planJournalPhotoRows\(pagePhotos\)/);
-  assert.match(exporter, /measuredPhotos\.slice\(index \* PHOTO_PER_PAGE, \(index \+ 1\) \* PHOTO_PER_PAGE\)/);
-  assert.match(exporter, /photoPages\.slice\(1\)/);
-  assert.match(exporter, /Math\.min\(maxWidth \/ intrinsic\.width, maxHeight \/ intrinsic\.height\)/);
-  assert.match(exporter, /Math\.floor\(columnWidth \/ 15\) - 4/);
-  assert.match(exporter, /buildJournalPhotoRun\(firstPagePhotos\[0\]\.value, 320, 300, firstPagePhotos\[0\]\)/);
-  assert.match(exporter, /Math\.floor\(570 \/ Math\.max\(1, firstPageRows\.length\)\)/);
-  assert.match(exporter, /Math\.floor\(900 \/ Math\.max\(1, followingRows\.length\)\)/);
-  assert.match(exporter, /Math\.min\(440, availableWidth\)/);
-  assert.match(exporter, /margins: \{ top: 30, bottom: 30, left: 30, right: 30 \}/);
-  assert.match(exporter, /spacing: \{ after: 105 \}[\s\S]*bold: true, size: 24[\s\S]*text: value \|\| "—", size: 24/);
-  assert.match(exporter, /cantSplit: true/);
-  assert.match(exporter, /JOURNAL_NO_BORDERS[\s\S]*BorderStyle\.NIL/);
-  assert.match(exporter, /borders: JOURNAL_NO_BORDERS/);
-  assert.match(exporter, /fetch\("\/shen-yin-logo\.png"\)/);
-  assert.doesNotMatch(exporter, /dist\/client\/shen-yin-logo/);
-  assert.match(exporter, /columnWidths: \[3120, 3120, 3120\]/);
-  assert.match(exporter, /journalHeader[\s\S]*alignment: AlignmentType\.CENTER/);
-  assert.match(exporter, /photoTable[\s\S]*alignment: AlignmentType\.CENTER/);
-  assert.match(exporter, /columnWidths: \[4540, 4820\][\s\S]*alignment: AlignmentType\.CENTER|alignment: AlignmentType\.CENTER[\s\S]*columnWidths: \[4540, 4820\]/);
-  assert.match(exporter, /size: \{ width: 11906, height: 16838, orientation: PageOrientation\.PORTRAIT \}/);
-  assert.match(exporter, /margin: \{ top: 720, right: 720, bottom: 720, left: 720 \}/);
-  assert.match(exporter, /text: "SPC 工程工作日誌"/);
-  assert.match(exporter, /"無工作照片"/);
-  assert.doesNotMatch(exporter, /工作照片", bold|圖一|圖二|cleanupRemovedPhotos|uploadEmbeddedPhotos|entry\.photos\s*=/);
-  assert.match(page, /word-preview-first-row[\s\S]*entry\.photos\[0\][\s\S]*JournalWordPreviewPhotoRows photos=\{entry\.photos\}/);
-  assert.match(page, /function JournalWordPreviewPhotoRows[\s\S]*planJournalPhotoRows\(measured\)/);
+  const pdf = await read("lib/journal-pdf.ts");
+  const { planJournalPhotoPages, planJournalPhotoRows, journalPhotoDisplaySize } = await import("../lib/journal-photo-layout.ts");
+  const exporter = page.slice(page.indexOf("async function downloadWorkJournalPdf"), page.indexOf("function JournalPDFPreviewPhoto("));
+  const preview = page.slice(page.indexOf("function JournalPDFPreviewPhoto("), page.indexOf("function UnitJournalTab"));
+  for (const count of [0, 1, 6, 7, 13]) {
+    const photos = Array.from({ length: count }, (_, id) => ({ id }));
+    const pages = planJournalPhotoPages(photos);
+    assert.equal(pages.length, Math.ceil(count / 6));
+    assert.deepEqual(pages.flat(), photos);
+    assert.ok(pages.every((items) => items.length <= 6));
+    const rows = planJournalPhotoRows(photos);
+    assert.equal(rows.length, Math.ceil(count / 3));
+    assert.deepEqual(rows.flat(), photos);
+    assert.ok(rows.every((items) => items.length <= 3));
+  }
+  assert.deepEqual(journalPhotoDisplaySize(800, 400, 300, 300), { width: 300, height: 150 });
+  assert.deepEqual(journalPhotoDisplaySize(400, 800, 300, 300), { width: 150, height: 300 });
+  assert.match(exporter, /import\("\.\.\/lib\/journal-pdf"\)/);
+  assert.match(exporter, /createJournalPdf\(metadata, entry\.photos \|\| \[\], settings\)/);
+  assert.match(exporter, /link\.download =[^\r\n]*"\.pdf"/);
+  assert.match(pdf, /new jsPDF\(\{ orientation: "portrait", unit: "mm", format: "a4"/);
+  assert.match(pdf, /imageBitmap\("\/shen-yin-logo\.png"\)/);
+  assert.match(pdf, /textAlign = "center"; context\.fillText\("SPC 工程工作日誌"/);
+  assert.match(pdf, /const pages = planJournalPhotoPages\(photos\);\s*if \(!pages\.length\) pages\.push\(\[\]\)/);
+  assert.match(pdf, /if \(pageCount\+\+\) pdf\.addPage\("a4", "portrait"\)/);
+  assert.match(pdf, /firstPage && count\) frames\.push\(\{ index: 0, x: 362, y: 100, width: 310, height: 280 \}\)/);
+  assert.match(pdf, /planJournalPhotoRows\(firstPage \? photos\.slice\(1\) : photos\)/);
+  assert.match(pdf, /row\.length === 1 \? 440 : Math\.floor\(cellWidth\) - 4/);
+  assert.match(pdf, /height: firstPage \? 250 : 400/);
+  assert.match(pdf, /journalPdfPhotoFrames\(pages\[pageIndex\]\.length, pageIndex === 0\)/);
+  assert.match(pdf, /journalPhotoPlacement\(bitmap\.width, bitmap\.height, frame\.width, frame\.height, settings\[photo\.id\]\)/);
+  assert.match(pdf, /context\.drawImage\(bitmap, frame\.x \+ placement\.x, frame\.y \+ placement\.y, placement\.width, placement\.height\)/);
+  assert.doesNotMatch(pdf, /\.stroke(?:Rect)?\(/);
+  assert.doesNotMatch(exporter + pdf, /cleanupRemovedPhotos|uploadEmbeddedPhotos|entry\.photos\s*=|dist\/client\/shen-yin-logo/);
+  assert.match(page, /JournalPDFPreviewPhotoRows photos=\{entry\.photos\} settings=\{journalPhotoSettings\}/);
+  assert.match(page, /downloadWorkJournalPdf\(project, u, entry, journalPhotoSettings\)/);
+  assert.match(page, /<span className="word-preview-empty">無工作照片<\/span>/);
+  assert.match(preview, /planJournalPhotoPages\(photos\)/);
+  assert.match(preview, /planJournalPhotoRows\(\(pageIndex === 0 \? page\.slice\(1\) : page\)/);
   assert.match(css, /\.word-preview-first-row\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1\.08fr\)/);
 });
 
@@ -1198,7 +1249,8 @@ test("PhotoGrid thumbnails share one non-mutating lightbox while editing control
   assert.match(grid, /includeReport: e\.target\.checked/);
   assert.match(grid, /set\(photos\.filter\(\(p\) => p\.id !== x\.id\)\)/);
   assert.doesNotMatch(grid, /localStorage|indexedDB|fetch\(|compress\(/);
-  assert.match(page, /word-preview-photo-row[\s\S]*ZoomablePhoto key=\{photo\.id\} photo=\{photo\}/);
+  const journalPreview = page.slice(page.indexOf("function JournalPDFPreviewPhotoRows"), page.indexOf("function UnitJournalTab"));
+  assert.match(journalPreview, /<JournalPDFPreviewPhoto key=\{photo\.id\} photo=\{photo\}/);
   assert.match(css, /\.photo-lightbox \.photo-lightbox-image\{[^}]*max-width:[^;]+!important;[^}]*max-height:[^;]+!important;[^}]*object-fit:contain!important/);
   assert.match(css, /\.photo-zoom-trigger\{cursor:zoom-in\}/);
 });
@@ -1218,7 +1270,10 @@ test("unit acceptance journal alone uses larger frameless responsive photos", as
   assert.match(page, /function PhotoGrid[\s\S]*<ZoomablePhoto photo=\{x\}/);
   assert.match(page, /function ZoomablePhoto[\s\S]*photo-lightbox/);
   assert.match(unitJournal, /word-preview-first-row/);
-  assert.match(page, /async function downloadWorkJournalDocx/);
+  assert.match(page, /async function downloadWorkJournalPdf/);
+  assert.match(unitJournal, /<JournalPDFPreviewPhoto photo=\{entry\.photos\[0\]\} maxWidth=\{310\} maxHeight=\{280\} settings=\{journalPhotoSettings\}/);
+  assert.match(unitJournal, /<JournalPDFPreviewPhotoRows photos=\{entry\.photos\} settings=\{journalPhotoSettings\}/);
+  assert.match(unitJournal, /downloadWorkJournalPdf\(project, u, entry, journalPhotoSettings\)/);
 });
 
 test("storage cache failures are classified and do not block Supabase saving", async () => {
@@ -1240,12 +1295,16 @@ test("unit and project journals reopen and update the same record without duplic
   const page = await read("app/page.tsx");
   const unitJournal = page.slice(page.indexOf("function UnitJournalTab"), page.indexOf("function Journal("));
   const projectJournal = page.slice(page.indexOf("function Journal("), page.indexOf("function Billing("));
-  const wordExporter = page.slice(page.indexOf("async function buildJournalPhotoRun"), page.indexOf("function UnitJournalTab"));
+  const journalSave = await read("lib/unit-journal-save.ts");
+  const pdfExporter = page.slice(page.indexOf("async function downloadWorkJournalPdf"), page.indexOf("function JournalPDFPreviewPhoto("));
 
-  assert.match(unitJournal, /journals: \[record, \.\.\.u\.journals\.filter\(\(item\) => item\.id !== entry\.id\)\]/);
-  assert.match(unitJournal, /createdAt: entry\.createdAt \|\| now/);
-  assert.match(unitJournal, /updatedAt: now/);
-  assert.match(unitJournal, /createdBy: entry\.createdBy \|\|/);
+  assert.match(unitJournal, /const record = await saveUnitJournal\(\{ entry, journals: u\.journals, draft, owner: authUserId, now: stamp\(\)/);
+  assert.match(unitJournal, /patch: \(journals\) =>[^\r\n]*patch\(\{ journals \}/);
+  assert.match(journalSave, /const record = \{ \.\.\.input\.entry, draft: input\.draft/);
+  assert.match(journalSave, /await input\.patch\(\[record, \.\.\.input\.journals\.filter\(\(item\) => item\.id !== record\.id\)\]\)/);
+  assert.match(journalSave, /createdAt: input\.entry\.createdAt \|\| input\.now/);
+  assert.match(journalSave, /updatedAt: input\.now/);
+  assert.match(journalSave, /createdBy: input\.entry\.createdBy \|\| input\.owner/);
   assert.match(unitJournal, /actionLabel="查看／修改"/);
   assert.match(unitJournal, /新增驗收日誌/);
 
@@ -1263,8 +1322,8 @@ test("unit and project journals reopen and update the same record without duplic
   assert.match(projectJournal, /confirm\("刪除此筆當日日誌？"\)/);
   assert.match(projectJournal, /removeDurableDraft\(draftKey\(authUserId, "journal", p\.id\)\)/);
 
-  assert.match(wordExporter, /columnWidths: \[4540, 4820\]/);
-  assert.doesNotMatch(wordExporter, /正在修改|新增今日日誌|新增驗收日誌/);
+  assert.match(pdfExporter, /createJournalPdf\(metadata, entry\.photos \|\| \[\], settings\)/);
+  assert.doesNotMatch(pdfExporter, /正在修改|新增今日日誌|新增驗收日誌/);
 });
 
 test("daily acceptance keeps formal history without an export entry and billing owns the daily shipment export", async () => {
@@ -1333,9 +1392,9 @@ test("receivable Excel uses a local billRecords preview draft before export", as
   assert.match(exports, /col === 4\) cell\.z = "0\.00"/);
   assert.doesNotMatch(exports, /Math\.max\(records\.length,\s*10\)/);
   assert.match(exports, /IF\(OR\(E\$\{row\}=\\"\\",F\$\{row\}=\\"\\"\),0,E\$\{row\}\*F\$\{row\}\)/);
-  assert.match(exports, /SUM\(G\$\{detailStart\}:G\$\{detailEnd\}\)/);
-  assert.match(exports, /ROUND\(G\$\{subtotalRow\}/);
-  assert.match(exports, /G\$\{subtotalRow\}-G\$\{taxRow\}/);
+  assert.match(exports, /SUMPRODUCT\(E\$\{detailStart\}:E\$\{detailEnd\},F\$\{detailStart\}:F\$\{detailEnd\}\)[^\r\n]*v: totals\.subtotal/);
+  assert.match(exports, /G\$\{subtotalRow\}\*\$\{companyReportConfig\.receivableTaxRate \* 100\}%[^\r\n]*v: totals\.tax/);
+  assert.match(exports, /G\$\{subtotalRow\}\+G\$\{taxRow\}[^\r\n]*v: totals\.receivable/);
   assert.match(exports, /date: receivableDate\(record\.shipmentDateText \|\| record\.exportDate\)/);
   for (const mapping of [
     /unitDisplay: record\.unitDisplayText \?\? record\.unitDisplay/,
@@ -1594,8 +1653,15 @@ test("billing shipment previews expose the same company summary fields without c
 
 test("overlapping saves keep the newest local state pending until Supabase confirms it", async () => {
   const page = await read("app/page.tsx");
-  for (const value of ["retrySyncRef", "stillCurrent", "正在接續同步最新修改", "latestRef.current.projects"]) assert.match(page, new RegExp(value));
-  assert.doesNotMatch(page, /if \(savingRef\.current\) return;/);
+  const start = page.indexOf("timer = window.setTimeout(async () => {");
+  const end = page.indexOf("}, [projects, catalog, ready, syncTick]);", start);
+  assert.ok(start >= 0 && end > start);
+  const autosave = page.slice(start, end);
+  for (const value of ["retrySyncRef", "stillCurrent", "正在接續同步最新修改", "latestRef.current.projects"]) assert.match(autosave, new RegExp(value));
+  assert.match(autosave, /if \(savingRef\.current\) \{\s*retrySyncRef\.current = true;\s*return;\s*\}/);
+  assert.match(autosave, /finally \{\s*savingRef\.current = false;\s*if \(retrySyncRef\.current\) \{\s*retrySyncRef\.current = false;\s*window\.setTimeout\(\(\) => setSyncTick\(\(value\) => value \+ 1\), 0\);\s*\}/);
+  assert.match(autosave, /const stillCurrent = JSON\.stringify\(latestRef\.current\) === saveInput/);
+  assert.match(autosave, /else \{\s*writeWorkspaceDraft\(authUserId,[^\r\n]*latestRef\.current\.projects[^\r\n]*latestRef\.current\.catalog, nextVersion, true\);\s*retrySyncRef\.current = true/);
 });
 
 test("tablet and phone layouts use drawers, stacked forms, and safe scrolling", async () => {
