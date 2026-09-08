@@ -1,5 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+
+test("photo URL renewal is not a three-way conflict or an intended photo change", () => {
+  const base = { photos: [{ id: "photo", data: "https://x/storage/v1/object/sign/spc-photos/spc/p.jpg?token=old" }] };
+  const local = { photos: [{ id: "photo", data: "spc-storage://spc/p.jpg" }] };
+  const remote = { photos: [{ id: "photo", data: "https://x/storage/v1/object/sign/spc-photos/spc/p.jpg?token=new" }] };
+  assert.deepEqual(threeWayMerge(base, local, remote).conflicts, []);
+  const changedRemote = { photos: [{ id: "photo", data: "spc-storage://spc/new-photo.jpg" }] };
+  assert.deepEqual(threeWayMerge(base, local, changedRemote).value, changedRemote);
+  assert.deepEqual(threeWayMerge(base, changedRemote, remote).value, changedRemote);
+});
 import { liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge.ts";
 
 test("merges changes made to different records", () => {

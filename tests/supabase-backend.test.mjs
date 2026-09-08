@@ -1360,9 +1360,9 @@ test("receivable Excel restores project-month data into its export preview", asy
   const receivableModal = billing.slice(billing.indexOf("{canExportReceivables && receivablePreview && receivableDraft"), billing.indexOf("{canExportShipment && shipmentPreview &&"));
 
   assert.match(billing, /onClick=\{openReceivablePreview\}[\s\S]*<b>應收帳款 Excel<\/b>[\s\S]*<em>預覽 ›<\/em>/);
-  assert.match(receivableFlow, /const draft = loadReceivableReportDraft\(financeExportProject, billRecords, ym\);[\s\S]*receivableDraftBaseRef\.current = structuredClone\(draft\);[\s\S]*setReceivableDraft\(draft\)/);
-  assert.match(billing, /applyReceivableSharedFields\([\s\S]*current, receivableRecordsRef\.current, original\.details, receivableDraft\.details/);
-  assert.match(billing, /receivableReports: \{ \.\.\.withSharedFields\.receivableReports, \[ym\]: metadata \}/);
+  assert.match(receivableFlow, /const fallback = loadReceivableReportDraft\(financeExportProject, billRecords, ym\);[\s\S]*loadOfflineDraft<[\s\S]*projectId === p\.id[\s\S]*yearMonth === ym[\s\S]*receivableDraftBaseRef\.current = structuredClone\(fallback\);[\s\S]*setReceivableDraft\(draft\)/);
+  assert.match(billing, /buildReceivableAcceptanceUpdates\([\s\S]*receivableRecordsRef\.current, original\.details, receivableDraft\.details/);
+  assert.match(billing, /await saveReceivable\(p\.id, ym, metadata, acceptanceUpdates\)/);
   assert.match(receivableModal, /title="應收帳款 Excel｜匯出預覽"/);
   assert.match(receivableModal, /receivableRecordsRef.current\.map\(\(record, index\)/);
   assert.match(receivableModal, /className="export-preview-table receivable-preview-table"/);
@@ -1667,14 +1667,14 @@ test("billing shipment previews expose the same company summary fields without c
 test("overlapping saves keep the newest local state pending until Supabase confirms it", async () => {
   const page = await read("app/page.tsx");
   const start = page.indexOf("timer = window.setTimeout(async () => {");
-  const end = page.indexOf("}, [projects, catalog, ready, syncTick]);", start);
+  const end = page.indexOf("}, [projects, catalog, ready, syncTick, conflictPaths]);", start);
   assert.ok(start >= 0 && end > start);
   const autosave = page.slice(start, end);
   for (const value of ["retrySyncRef", "stillCurrent", "正在接續同步最新修改", "latestRef.current.projects"]) assert.match(autosave, new RegExp(value));
-  assert.match(autosave, /if \(savingRef\.current\) \{\s*retrySyncRef\.current = true;\s*return;\s*\}/);
-  assert.match(autosave, /finally \{\s*savingRef\.current = false;\s*if \(retrySyncRef\.current\) \{\s*retrySyncRef\.current = false;\s*window\.setTimeout\(\(\) => setSyncTick\(\(value\) => value \+ 1\), 0\);\s*\}/);
-  assert.match(autosave, /const stillCurrent = JSON\.stringify\(latestRef\.current\) === saveInput/);
-  assert.match(autosave, /else \{\s*writeWorkspaceDraft\(authUserId,[^\r\n]*latestRef\.current\.projects[^\r\n]*latestRef\.current\.catalog, committed.version, true\);\s*retrySyncRef\.current = true/);
+  assert.match(autosave, /if \(savingRef\.current \|\| receivableSavingRef\.current\) \{\s*retrySyncRef\.current = true;\s*return;\s*\}/);
+  assert.match(autosave, /finally \{\s*savingRef\.current = false;\s*if \(retrySyncRef\.current\) \{\s*retrySyncRef\.current = false;\s*window\.setTimeout\(\(\) => setSyncTick\(\(value\) => value \+ 1\), Math\.max\(600, coordinatorRef\.current\.nextRetryAt - Date\.now\(\)\)\);\s*\}/);
+  assert.match(autosave, /const stillCurrent = intendedFingerprint\(latestRef\.current\)/);
+  assert.match(autosave, /else \{\s*writeWorkspaceDraft\(authUserId,[^\r\n]*latestRef\.current\.projects[^\r\n]*latestRef\.current\.catalog, committed.version, true, baselineRef\.current\);\s*retrySyncRef\.current = true/);
 });
 
 test("tablet and phone layouts use drawers, stacked forms, and safe scrolling", async () => {
@@ -1723,7 +1723,7 @@ test("unit master keeps customer contacts visible above collapsible engineering 
 test("every unfinished data-entry flow has durable drafts and notes", async () => {
   const page = await read("app/page.tsx");
   for (const value of ["project-onboarding", "unit-create", "global-product", "project-product", "riskDraftKey", "logStorageException", "停車備註", "改善備註"]) assert.match(page, new RegExp(value));
-  assert.match(page, /readWorkspaceDraft\(authUserId\) \|\| indexedWorkspace\?\.payload/);
+  assert.match(page, /indexedWorkspace\?\.payload \|\| readWorkspaceDraft\(authUserId\)/);
   assert.match(page, /saveOfflineDraft\(\{ key: scopedKey\(workspaceDraftKey, owner\)/);
 });
 
@@ -1883,13 +1883,13 @@ test("temporary admin-only project isolation is fail-closed across reads, financ
   assert.match(workspaceLoad, /const legacy = appRole === "admin" && !snapshot\.projects\.length \? await loadLegacyWorkspace\(\) : null/);
   assert.equal((workspaceLoad.match(/const localProjects = normalize\(JSON\.parse\(readLocal/g) || []).length, 2);
   assert.equal((workspaceLoad.match(/hiddenProjectDraftRef\.current = appRole === "admin" \? \[\] : structuredClone\(normalize\(\(durableDraft\?\.projects\?\.length \? durableDraft\.projects : localProjects\) as Project\[\]\)\)/g) || []).length, 2);
-  assert.match(workspaceLoad, /const loadedProjects = normalize\(appRole === "admin"[\s\S]*durableDraft\.projects[\s\S]*legacy\?\.projects[\s\S]*localProjects[\s\S]*: snapshot\.projects as Project\[\]\)/);
+  assert.match(workspaceLoad, /let loadedProjects = normalize\(appRole === "admin"[\s\S]*durableDraft\.projects[\s\S]*legacy\?\.projects[\s\S]*localProjects[\s\S]*: snapshot\.projects as Project\[\]\)/);
   assert.match(workspaceLoad, /if \(appRole === "admin" && !snapshot\.projects\.length && loadedProjects\.length/);
   assert.match(workspaceLoad, /const recoveredProjects = appRole === "admin" \? normalize\([\s\S]*\) : \[\]/);
   assert.match(workspaceLoad, /const visibleProjects = appRole === "admin" \? recoveredProjects : \[\];\s*setProjects\(visibleProjects\)/);
   assert.doesNotMatch(workspaceLoad, /setProjects\(recoveredProjects\)/);
   assert.match(page, /const hiddenProjectDraftRef = useRef<Project\[]>\(\[\]\)/);
-  assert.match(page, /const durableProjects = appRole === "admin" \? projects : hiddenProjectDraftRef\.current/);
+  assert.match(page, /const durableProjects = projects/);
   assert.doesNotMatch(page, /const durableProjects =[^;]*readWorkspaceDraft/);
 
   assert.doesNotMatch(page, /localStorage\.clear\(\)|indexedDB\.deleteDatabase\(/);
@@ -1999,7 +1999,7 @@ test("all approved frontend roles create through the authenticated RPC and wait 
   assert.doesNotMatch(createCompletion, /setCatalog\(products\)|canManageProjects \? products : catalog/);
   assert.match(admin, /\{canCreateProject && <button[\s\S]*＋ 新增專案/);
   assert.match(backend, /export async function createProject<T>\(project: T\)[\s\S]*supabase\.rpc\("spc_create_project"[\s\S]*serializePrivatePhotos\(project\)[\s\S]*hydratePrivatePhotos/);
-  assert.match(backend, /if \(error\.code !== "42883" && error\.code !== "PGRST202"\) throw error/);
+  assert.match(backend, /if \(error\.code !== "42883" && error\.code !== "PGRST202"\) throw withSupabaseErrorContext\(error, \{ action: "workspace-save", phase: "save", rpc: "spc_merge_workspace" \}\)/);
   assert.match(onboarding, /complete: \(project: Project, products: Product\[\]\) => Promise<void>/);
   const finish = onboarding.slice(onboarding.indexOf("const finish = async"), onboarding.indexOf("return ("));
   assert.match(finish, /try \{[\s\S]*await complete\([\s\S]*removeDurableDraft\(onboardingKey\)[\s\S]*await removeOfflineDraft\(onboardingKey\)[\s\S]*\} catch \(error\) \{[\s\S]*setError/);
@@ -2012,10 +2012,57 @@ test("owned-project frontend state trusts server visibility and never resurrects
   const admin = page.slice(page.indexOf("function AdminApp"), page.indexOf("function SystemEntry"));
   const load = admin.slice(admin.indexOf("const load = async () =>"), admin.indexOf("useEffect(() => {", admin.indexOf("const load = async () =>") + 1));
 
-  assert.match(load, /const loadedProjects = normalize\(appRole === "admin"[\s\S]*: snapshot\.projects as Project\[\]\)/);
+  assert.match(load, /let loadedProjects = normalize\(appRole === "admin"[\s\S]*: snapshot\.projects as Project\[\]\)/);
   assert.match(load, /const recoveredProjects = appRole === "admin" \? normalize\([\s\S]*\) : \[\]/);
   assert.match(load, /const visibleProjects = appRole === "admin" \? recoveredProjects : \[\]/);
   assert.match(admin, /const hiddenProjectDraftRef = useRef<Project\[]>\(\[\]\)/);
-  assert.match(admin, /const durableProjects = appRole === "admin" \? projects : hiddenProjectDraftRef\.current/);
+  assert.match(admin, /const durableProjects = projects/);
   assert.doesNotMatch(page, /localStorage\.clear\(\)|indexedDB\.deleteDatabase\(/);
+});
+
+test("monthly receivable save uses one narrow RPC with explicit authorization and no full-workspace fallback", async () => {
+  const sql = await read("supabase/migrations/202609080001_targeted_receivable_save.sql");
+  const backend = await read("lib/spc-backend.ts");
+  const page = await read("app/page.tsx");
+  const backendStart = backend.indexOf("export async function saveReceivableReport");
+  const backendEnd = backend.indexOf("export async function uploadEmbeddedPhotos", backendStart);
+  const targetedBackend = backend.slice(backendStart, backendEnd);
+  const handlerStart = page.indexOf("saveReceivableSource = async");
+  const handlerEnd = page.indexOf("openReceivablePreview = async", handlerStart);
+  const handler = page.slice(handlerStart, handlerEnd);
+  const persistenceStart = page.indexOf("const persistReceivable: ReceivableSave");
+  const persistenceEnd = page.indexOf("const updateCatalog", persistenceStart);
+  const persistence = page.slice(persistenceStart, persistenceEnd);
+
+  assert.match(targetedBackend, /supabase\.rpc\("spc_save_receivable_report", \{[\s\S]*p_expected_version:[\s\S]*p_project_id:[\s\S]*p_year_month:[\s\S]*p_report:[\s\S]*p_acceptance_updates:/);
+  assert.doesNotMatch(targetedBackend, /p_projects|p_catalog|spc_merge_workspace|spc_save_workspace|loadWorkspace|\.storage\./);
+  assert.match(handler, /buildReceivableAcceptanceUpdates\([\s\S]*await saveOfflineDraft\([\s\S]*await saveReceivable\(p.id, ym, metadata, acceptanceUpdates\)/);
+  assert.match(handler, /await removeOfflineDraft\(recoveryKey\)/);
+  assert.doesNotMatch(handler, /persistFinance|saveWorkspace|loadWorkspace|spc_merge_workspace|queueRecordChange|uploadEmbeddedPhotos/);
+  assert.match(persistence, /receivableSaveIsCommitted\(input, committed\)/);
+  assert.match(persistence, /applyCommittedReceivableSave\(currentProject, committed\)/);
+  assert.doesNotMatch(persistence, /loadWorkspace|saveWorkspace|spc_merge_workspace|projects: input|catalog: input/);
+
+  assert.match(sql, /create or replace function public\.spc_save_receivable_report\([\s\S]*p_expected_version bigint[\s\S]*p_project_id text[\s\S]*p_year_month text[\s\S]*p_report jsonb[\s\S]*p_acceptance_updates jsonb/);
+  assert.match(sql, /security definer\s*set search_path = pg_catalog, public/);
+  assert.match(sql, /auth\.uid\(\) is null or approved_role not in \('admin', 'shenyin'\)/);
+  assert.match(sql, /approved_role <> 'admin' and current_project_data->>'ownerUserId' is distinct from owner_id/);
+  assert.match(sql, /jsonb_object_keys\(p_report->'detailsByUnit'\)[\s\S]*unit\.project_id = p_project_id[\s\S]*unit\.id is null[\s\S]*SPC_RECEIVABLE_DETAIL_UNIT_NOT_FOUND/);
+  assert.match(sql, /from public\.spc_workspaces[\s\S]*for update[\s\S]*current_version <> p_expected_version[\s\S]*errcode = '40001'/);
+  assert.match(sql, /update public\.spc_acceptances set data = updated_acceptance/);
+  assert.match(sql, /update public\.spc_projects set data = next_project_data/);
+  assert.match(sql, /update public\.spc_workspaces[\s\S]*set version = current_version \+ 1/);
+  assert.match(sql, /insert into public\.spc_audit_logs/);
+  assert.match(sql, /return jsonb_build_object\([\s\S]*'version'[\s\S]*'projectId'[\s\S]*'yearMonth'[\s\S]*'report'[\s\S]*'acceptances'/);
+  assert.match(sql, /revoke all on function public\.spc_save_receivable_report[\s\S]*from public, anon/);
+  assert.match(sql, /grant execute on function public\.spc_save_receivable_report[\s\S]*to authenticated/);
+  assert.doesNotMatch(sql, /\bdelete\s+from\b|\btruncate\b|\bdrop\s+(?:table|function|schema)\b|storage\.|spc_backups|spc_load_workspace|spc_merge_workspace/i);
+});
+
+test("sync monitoring identifies action, phase, and RPC for save and verification failures", async () => {
+  const backend = await read("lib/spc-backend.ts");
+  const page = await read("app/page.tsx");
+  assert.match(backend, /withSupabaseErrorContext\(error, \{ action: "receivable-save", phase: "save", rpc: "spc_save_receivable_report" \}\)/);
+  assert.match(page, /loadWorkspace\(\{ action: "workspace-save", phase: phase \|\| "verification" \}\)/);
+  assert.match(page, /reportClientError\(error, "supabase-sync", \{[\s\S]*action: "receivable-save", phase: details\.phase \|\| "save", rpc: details\.rpc \|\| "spc_save_receivable_report"/);
 });

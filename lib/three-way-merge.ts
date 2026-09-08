@@ -1,3 +1,5 @@
+import { photoReference } from "./photo-reference.ts";
+
 export type MergeResult<T> = { value: T; conflicts: string[] };
 
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -76,6 +78,12 @@ function mergeNode(base: unknown, local: unknown, remote: unknown, path: string,
     return result;
   }
 
+  if (path.endsWith(".data")) {
+    const b = photoReference(base), l = photoReference(local), r = photoReference(remote);
+    if (l !== null && l === r) return remote;
+    if (l !== null && l === b) return remote;
+    if (r !== null && r === b) return local;
+  }
   if (equal(local, remote)) return local;
   if (equal(local, base)) return remote;
   if (equal(remote, base)) return local;

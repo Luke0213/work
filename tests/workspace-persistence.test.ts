@@ -133,5 +133,5 @@ test("autosave wires general verification after reload and before acknowledgemen
   assert.ok(save.indexOf("await loadWorkspace()") < save.indexOf("containsWorkspaceChanges("));
   assert.ok(save.indexOf("containsWorkspaceChanges(") < save.indexOf("baselineRef.current = structuredClone(shared)"));
   assert.ok(save.indexOf("containsWorkspaceChanges(") < save.indexOf("completeSyncedOutbox"));
-  assert.match(save, /containsWorkspaceChanges\(saveBase, \{ projects: uploaded, catalog: saveState\.catalog \}, shared\)/);
+  assert.match(save, /containsWorkspaceChanges\(result\.attempt\.base, result\.attempt\.intended, shared\)/);
 });

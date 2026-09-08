@@ -1,14 +1,16 @@
 "use client";
-import { updateReportSource, applyBillingChanges, applyReceivableSharedFields, canApplySharedReload, containsChanges, financeSnapshot, financeSyncError, rebaseProjectEdit } from "../lib/finance-persistence.ts";
+import { SyncCoordinator, intendedFingerprint, type SyncAttempt } from "../lib/sync-coordinator";
+import { formatSupabaseError, supabaseErrorDetails, withSupabaseErrorContext } from "../lib/supabase-error";
+import { updateReportSource, applyBillingChanges, applyCommittedReceivableSave, buildReceivableAcceptanceUpdates, canApplySharedReload, containsChanges, financeSnapshot, financeSyncError, receivableSaveIsCommitted, rebaseProjectEdit, type ReceivableAcceptanceUpdate } from "../lib/finance-persistence.ts";
 import { loadReceivableReportDraft, receivableReportMetadata, type ReceivableReportMetadata } from "../lib/acceptance-exports.ts";
 import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 import { saveUnitJournal } from "../lib/unit-journal-save";
-import { createProject, loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
+import { createProject, hydratePrivatePhotos, loadWorkspaceVersion, type WorkspaceSnapshot, loadFinanceExportData, loadLegacyWorkspace, loadWorkspace, saveReceivableReport, saveWorkspace, uploadEmbeddedPhotos, type EntityActivity, type FinanceExportData, type FinanceExportProject } from "../lib/spc-backend";
 import { supabase } from "../lib/supabase";
 import { isDeletedEntity, liveEntities, retainEntityTombstones, threeWayMerge, tombstoneEntity } from "../lib/three-way-merge";
 import { getSystemHealth, healthWarnings, reportClientError, type SystemHealth } from "../lib/monitoring";
-import { completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
+import { checkpointDraftPhotos, completeSyncedOutbox, loadOfflineDraft, offlineSummary, queueOfflineWrite, removeOfflineDraft, saveOfflineDraft, storageDiagnostics } from "../lib/offline-drafts";
 import { durableStorageState, isIndexedDbMarker, localDraftValue, logStorageException, shouldAttemptCloudSave, shouldRestoreIndexedDbDraft, type StorageErrorDetails } from "../lib/storage-durability";
 import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, createReceivableWorkbook, createShipmentWorkbook, receivableDetailAmount, receivableDraftTotals, saveReceivableWorkbook, saveShipmentWorkbook, shipmentDisplayValues, type AcceptanceExportRecord, type AcceptanceReportMetadata, type ReceivableExportDraft } from "../lib/acceptance-exports";
 import { companyReportConfig } from "../lib/company-report-config";
@@ -238,6 +240,7 @@ type DailyNote = {
   deletedBy?: string;
 };
 type FinanceSave = (displayed: Project, update: (current: Project) => Project, onPending?: (next: Project) => void) => Promise<void>;
+type ReceivableSave = (projectId: string, yearMonth: string, report: ReceivableReportMetadata, acceptances: ReceivableAcceptanceUpdate[]) => Promise<Project>;
 type Project = {
   receivableReports?: Record<string, ReceivableReportMetadata>;
   id: string;
@@ -266,6 +269,7 @@ type LocalWorkspaceSnapshot = {
   savedAt: string;
   version: number;
   pending: boolean;
+  base?: { projects: Project[]; catalog: Product[] };
   projects: Project[];
   catalog: Product[];
 };
@@ -449,29 +453,26 @@ const readWorkspaceDraft = (owner: string): LocalWorkspaceSnapshot | null => {
     catalog: Product[],
     version: number,
     pending: boolean,
+    base?: { projects: Project[]; catalog: Product[] },
   ) => {
-    if (typeof window === "undefined") return { local: true, indexedDb: Promise.resolve(true) };
+    if (typeof window === "undefined") return { local: false, localError: null, indexedDb: Promise.resolve({ ok: false as const, error: null }) };
     const snapshot: LocalWorkspaceSnapshot = {
       savedAt: new Date().toISOString(),
       version,
       pending,
+      base,
       projects,
       catalog,
     };
     const indexedDb = saveOfflineDraft({ key: scopedKey(workspaceDraftKey, owner), owner, kind: "workspace", recordId: "workspace", unitId: "", payload: snapshot, baseVersion: version, updatedBy: owner })
       .then(() => {
-        try {
-          if (!local) localStorage.removeItem(scopedKey(workspaceDraftKey, owner));
-          localStorage.removeItem(scopedKey(key, owner));
-          localStorage.removeItem(scopedKey(productKey, owner));
-        } catch (error) { logStorageException("localStorage", "delete", error); }
         return { ok: true as const, error: null };
       })
       .catch((error) => ({ ok: false as const, error: logStorageException("IndexedDB", "write", error) }));
     let local = false;
     let localError: StorageErrorDetails | null = null;
     try {
-      localStorage.setItem(scopedKey(workspaceDraftKey, owner), localDraftValue({ id: "workspace", savedAt: snapshot.savedAt, version, pending }));
+      localStorage.setItem(scopedKey(workspaceDraftKey, owner), JSON.stringify(snapshot));
       local = true;
     } catch (error) {
       localError = logStorageException("localStorage", "write", error);
@@ -1053,7 +1054,9 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
   const canUseAcceptance = canUseUnitTab(appRole, permissions, "accept");
   const versionRef = useRef(0);
   const savingRef = useRef(false);
+  const receivableSavingRef = useRef(false);
   const financeWaitersRef = useRef<Array<{ base: ReturnType<typeof financeSnapshot>; intended: ReturnType<typeof financeSnapshot>; finish: (error?: Error) => void }>>([]);
+  const coordinatorRef = useRef(new SyncCoordinator<{ projects: Project[]; catalog: Product[] }, WorkspaceSnapshot>(authUserId));
   const retrySyncRef = useRef(false);
   const baselineRef = useRef<{ projects: Project[]; catalog: Product[] }>({ projects: [], catalog: [] });
   const latestRef = useRef<{ projects: Project[]; catalog: Product[] }>({ projects: [], catalog: [] });
@@ -1114,12 +1117,15 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
   }, [floorContext, canUseAcceptance]);
   useEffect(() => {
     let active = true;
+    let initialized = false;
     const load = async () => {
       setReady(false);
       setStorageWarning("正在從 Supabase 載入…");
       try {
-        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
-        const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
+        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId), true);
+        const durableDraft = indexedWorkspace?.payload || readWorkspaceDraft(authUserId) || null;
+        const recoveredAttempt = await loadOfflineDraft<SyncAttempt<{ projects: Project[]; catalog: Product[] }> | null>(scopedKey("spc-sync-attempt-v1", authUserId), true);
+        coordinatorRef.current.restore(recoveredAttempt?.payload || null);
         const snapshot = await loadWorkspace();
         const legacy = appRole === "admin" && !snapshot.projects.length ? await loadLegacyWorkspace() : null;
         if (!active) return;
@@ -1127,35 +1133,50 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
         hiddenProjectDraftRef.current = appRole === "admin" ? [] : structuredClone(normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]));
         const useDurableDraft = durableDraft?.pending || (!snapshot.projects.length && durableDraft?.projects.length);
-        const loadedProjects = normalize(appRole === "admin"
+        let loadedProjects = normalize(appRole === "admin"
           ? (useDurableDraft
             ? durableDraft.projects
             : snapshot.projects.length
               ? snapshot.projects
               : legacy?.projects || durableDraft?.projects || localProjects) as Project[]
           : snapshot.projects as Project[]);
-        const loadedCatalog = (useDurableDraft
+        let loadedCatalog = (useDurableDraft
           ? durableDraft.catalog
           : snapshot.catalog.length
             ? snapshot.catalog
             : legacy?.catalog || durableDraft?.catalog || localCatalog) as Product[];
+        if (durableDraft && (useDurableDraft || (appRole !== "admin" && durableDraft.projects.some((p) => !(snapshot.projects as Project[]).some((remote) => remote.id === p.id))))) {
+          await saveOfflineDraft({ key: scopedKey(`spc-workspace-recovery-v1:${durableDraft.savedAt}`, authUserId), owner: authUserId, kind: "workspace-recovery", recordId: "workspace", unitId: "", payload: durableDraft, baseVersion: durableDraft.version, updatedBy: authUserId });
+        }
+        if (useDurableDraft) {
+          const visibleIds = new Set((snapshot.projects as Project[]).map((p) => p.id));
+          const local = { projects: normalize(durableDraft.projects.filter((p) => appRole === "admin" || visibleIds.has(p.id))), catalog: loadedCatalog };
+          const remote = { projects: normalize(snapshot.projects as Project[]), catalog: snapshot.catalog as Product[] };
+          const recovered = durableDraft.base ? threeWayMerge({ ...durableDraft.base, projects: durableDraft.base.projects.filter((p) => appRole === "admin" || visibleIds.has(p.id)) }, local, remote) : { value: local, conflicts: ["legacy-draft-base-missing"] };
+          loadedProjects = recovered.value.projects; loadedCatalog = recovered.value.catalog;
+          if (recovered.conflicts.length) {
+            remoteConflictRef.current = remote; setConflictPaths(recovered.conflicts);
+            coordinatorRef.current.state = "conflict";
+          }
+        }
         versionRef.current = snapshot.version;
         setActivity(snapshot.activity || []);
         setProjects(loadedProjects);
         setCatalog(loadedCatalog);
         setPid(liveProjectViews(loadedProjects)[0]?.id || "");
         if (appRole === "admin" && !snapshot.projects.length && loadedProjects.length && !durableDraft?.pending) {
-          versionRef.current = await saveWorkspace(snapshot.version, loadedProjects, loadedCatalog, snapshot.projects, snapshot.catalog);
+          baselineRef.current = { projects: normalize(snapshot.projects as Project[]), catalog: snapshot.catalog as Product[] };
         }
-        baselineRef.current = useDurableDraft
-          ? { projects: [], catalog: [] }
+        baselineRef.current = useDurableDraft || (!snapshot.projects.length && loadedProjects.length)
+          ? { projects: normalize(snapshot.projects as Project[]), catalog: snapshot.catalog as Product[] }
           : { projects: structuredClone(loadedProjects), catalog: structuredClone(loadedCatalog) };
+        initialized = true;
         setReady(true);
-        if (appRole === "admin") writeWorkspaceDraft(authUserId, loadedProjects, loadedCatalog, versionRef.current, !!useDurableDraft);
+        writeWorkspaceDraft(authUserId, loadedProjects, loadedCatalog, versionRef.current, !!useDurableDraft, baselineRef.current);
         setStorageWarning(useDurableDraft ? "尚未同步：已恢復本機暫存" : "已儲存：已與 Supabase 同步");
       } catch (error) {
-        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId));
-        const durableDraft = readWorkspaceDraft(authUserId) || indexedWorkspace?.payload || null;
+        const indexedWorkspace = await loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId)).catch(() => null);
+        const durableDraft = indexedWorkspace?.payload || readWorkspaceDraft(authUserId) || null;
         const localProjects = normalize(JSON.parse(readLocal(scopedKey(key, authUserId)) || "[]"));
         const localCatalog = JSON.parse(readLocal(scopedKey(productKey, authUserId)) || "[]") as Product[];
         hiddenProjectDraftRef.current = appRole === "admin" ? [] : structuredClone(normalize((durableDraft?.projects?.length ? durableDraft.projects : localProjects) as Project[]));
@@ -1167,27 +1188,30 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
           setCatalog(recoveredCatalog);
           setPid(appRole === "admin" ? liveProjectViews(recoveredProjects)[0]?.id || "" : "");
           baselineRef.current = { projects: [], catalog: [] };
-          setReady(true);
-          if (appRole === "admin") writeWorkspaceDraft(authUserId, recoveredProjects, recoveredCatalog, versionRef.current, true);
+          setReady(false);
+          coordinatorRef.current.state = "offline";
           setStorageWarning(appRole === "admin" ? "尚未同步：網路或資料庫暫時連不上，已載入本機暫存" : "資料初始化失敗：目前無法連線至案場資料");
         } else {
-          setStorageWarning(`資料初始化失敗：${error instanceof Error ? error.message : "請執行新版 migration"}`);
+          setStorageWarning(`資料初始化失敗：${formatSupabaseError(error)}`);
         }
       }
     };
     void load();
-    return () => { active = false; };
+    const reconnect = () => { if (!initialized) void load(); };
+    window.addEventListener("online", reconnect);
+    return () => { active = false; window.removeEventListener("online", reconnect); };
   }, [authUserId, appRole]);
   useEffect(() => {
     if (!ready) return;
     let active = true;
     let timer: number | undefined;
-    const pendingDraft = !!readWorkspaceDraft(authUserId)?.pending;
+    const pendingDraft = !!coordinatorRef.current.attempt;
     const current = { projects, catalog },
       baseline = baselineRef.current,
       changed = JSON.stringify(current) !== JSON.stringify(baseline);
-    const durableProjects = appRole === "admin" ? projects : hiddenProjectDraftRef.current;
-    const storage = writeWorkspaceDraft(authUserId, durableProjects, catalog, versionRef.current, changed || pendingDraft);
+    coordinatorRef.current.observe(changed, navigator.onLine);
+    const durableProjects = projects;
+    const storage = writeWorkspaceDraft(authUserId, durableProjects, catalog, versionRef.current, changed || pendingDraft, baselineRef.current);
     void storage.indexedDb.then((indexedDb) => {
       if (!active) return;
       const errors = [storage.localError, indexedDb.error].filter((error): error is StorageErrorDetails => !!error);
@@ -1199,11 +1223,18 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
       }
       setStorageWarning(durable.saved
         ? (navigator.onLine ? `儲存中：${durable.message}，正在同步…` : `尚未同步：${durable.message}，網路離線`)
-        : (navigator.onLine ? `${durable.message}；正在直接同步雲端…` : `${durable.message}；目前離線，請勿關閉此頁`));
+        : (navigator.onLine ? `${durable.message}；同步已暫停，需先成功寫入本機草稿` : `${durable.message}；目前離線，請勿關閉此頁`));
       if (!durable.saved) void storageDiagnostics(authUserId).then((diagnostics) => console.warn("SPC storage diagnostics", diagnostics));
-      if (!shouldAttemptCloudSave(changed, pendingDraft, navigator.onLine)) return;
+      if (!shouldAttemptCloudSave(changed, pendingDraft, navigator.onLine) || !coordinatorRef.current.canRetry() || conflictPaths.length || !indexedDb.ok) {
+        if (!indexedDb.ok) setStorageWarning(`尚未同步：${durable.message}；本機離線儲存尚未就緒，已暫停雲端提交`);
+        else if (conflictPaths.length) setStorageWarning("尚未同步：草稿已保留，請先確認衝突");
+        else if (coordinatorRef.current.failures >= 5) setStorageWarning("尚未同步：自動重試已停止，草稿仍保留；請確認錯誤後點擊重新同步");
+        else if (!navigator.onLine) setStorageWarning("尚未同步：網路離線，草稿已保留");
+        else if (!savingRef.current) setStorageWarning("尚未同步：草稿已保留，等待退避後重新核對雲端");
+        return;
+      }
       timer = window.setTimeout(async () => {
-      if (savingRef.current) {
+      if (savingRef.current || receivableSavingRef.current) {
         retrySyncRef.current = true;
         return;
       }
@@ -1212,25 +1243,31 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
       const saveState = structuredClone(latestRef.current);
       const saveBase = structuredClone(baselineRef.current);
       const saveVersion = versionRef.current;
-      const saveInput = JSON.stringify(saveState);
+
       const acknowledgements = [...financeWaitersRef.current];
       try {
-        const uploaded = await uploadEmbeddedPhotos(saveState.projects);
-        const nextVersion = await saveWorkspace(
-          saveVersion, uploaded, saveState.catalog, saveBase.projects, saveBase.catalog,
-        );
-        const committed = await loadWorkspace();
+        const coordinator = coordinatorRef.current;
+        const result = await coordinator.run(saveBase, saveState, saveVersion, {
+          durable: async (attempt) => {
+            await saveOfflineDraft({ key: scopedKey("spc-sync-attempt-v1", authUserId), owner: authUserId, kind: "sync-attempt", recordId: "workspace", unitId: "", payload: attempt, baseVersion: attempt.version, updatedBy: authUserId });
+            await checkpointDraftPhotos(authUserId, attempt.source, attempt.intended);
+          },
+          upload: async (value, checkpoint) => ({ ...value, projects: await uploadEmbeddedPhotos(value.projects, (projects) => checkpoint({ ...value, projects })) }),
+          save: (attempt) => saveWorkspace(attempt.version, attempt.intended.projects, attempt.intended.catalog, attempt.base.projects, attempt.base.catalog),
+          load: async (phase) => await loadWorkspace({ action: "workspace-save", phase: phase || "verification" }),
+          value: (committed) => ({ projects: normalize(committed.projects as Project[]), catalog: committed.catalog as Product[] }),
+          verify: (attempt, committed) => containsChanges(financeSnapshot(attempt.base.projects), financeSnapshot(attempt.intended.projects), financeSnapshot(normalize(committed.projects as Project[]))),
+          conflict: (paths, remote) => {
+            remoteConflictRef.current = { projects: normalize(remote.projects as Project[]), catalog: remote.catalog as Product[] };
+            setConflictPaths(paths);
+          },
+        });
+        const committed = result.remote;
         const shared = { projects: normalize(committed.projects as Project[]), catalog: committed.catalog as Product[] };
-        const committedFinance = financeSnapshot(shared.projects);
-        if (committed.version < nextVersion
-          || !containsWorkspaceChanges(saveBase, { projects: uploaded, catalog: saveState.catalog }, shared)
-          || !containsChanges(financeSnapshot(saveBase.projects), financeSnapshot(uploaded), committedFinance)
-          || acknowledgements.some((item) => !containsChanges(item.base, item.intended, committedFinance))) {
-          throw new Error(workspaceSyncError);
-        }
+        if (!containsWorkspaceChanges(result.attempt.base, result.attempt.intended, shared)) throw new Error(workspaceSyncError);
         // Only a verified reload can advance the baseline or acknowledge local edits.
-        const stillCurrent = JSON.stringify(latestRef.current) === saveInput;
-        const merged = threeWayMerge(saveState, latestRef.current, shared);
+        const stillCurrent = intendedFingerprint(latestRef.current) === intendedFingerprint(result.attempt.source) || intendedFingerprint(latestRef.current) === intendedFingerprint(result.attempt.intended);
+        const merged = threeWayMerge(result.attempt.source, latestRef.current, shared);
         versionRef.current = committed.version;
         baselineRef.current = structuredClone(shared);
         latestRef.current = stillCurrent ? shared : merged.value;
@@ -1241,94 +1278,79 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
           remoteConflictRef.current = shared;
           setConflictPaths(merged.conflicts);
         }
-        acknowledgements.forEach((item) => item.finish());
+        acknowledgements.filter((item) => containsChanges(item.base, item.intended, financeSnapshot(shared.projects))).forEach((item) => item.finish());
+        await saveOfflineDraft({ key: scopedKey("spc-sync-attempt-v1", authUserId), owner: authUserId, kind: "sync-attempt", recordId: "workspace", unitId: "", payload: null, baseVersion: committed.version, updatedBy: authUserId });
+        coordinator.acknowledge();
         if (stillCurrent) {
           const cacheInput = JSON.stringify(latestRef.current);
-          const committedCache = writeWorkspaceDraft(authUserId, appRole === "admin" ? shared.projects : durableProjects, shared.catalog, committed.version, false);
+          const committedCache = writeWorkspaceDraft(authUserId, shared.projects, shared.catalog, committed.version, false);
           const indexedCache = await committedCache.indexedDb;
           const cacheErrors = [committedCache.localError, indexedCache.error].filter((error): error is StorageErrorDetails => !!error);
           const cacheState = durableStorageState(indexedCache.ok, committedCache.local, cacheErrors);
           if (JSON.stringify(latestRef.current) === cacheInput) {
-            try { await completeSyncedOutbox(authUserId); } catch (error) { logStorageException("IndexedDB", "delete", error); }
+            try { await completeSyncedOutbox(authUserId, shared); } catch (error) { logStorageException("IndexedDB", "delete", error); }
             setStorageWarning(cacheState.saved
               ? `已儲存：已與 Supabase 同步 · 版本 ${committed.version}`
               : "雲端已同步，但本機離線暫存不可用");
           } else {
-            writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, committed.version, true);
+            writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, committed.version, true, baselineRef.current);
             retrySyncRef.current = true;
           }
         } else {
-          writeWorkspaceDraft(authUserId, appRole === "admin" ? latestRef.current.projects : durableProjects, latestRef.current.catalog, committed.version, true);
+          writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, committed.version, true, baselineRef.current);
           retrySyncRef.current = true;
           setStorageWarning("儲存中：上一筆已同步，正在接續同步最新修改…");
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (message.includes("SPC_VERSION_CONFLICT") || message.includes("40001")) {
-          const latest = await loadWorkspace();
-          const remote = { projects: normalize(latest.projects as Project[]), catalog: latest.catalog as Product[] };
-          const merged = threeWayMerge(saveBase, latestRef.current, remote);
-          remoteConflictRef.current = remote;
-          versionRef.current = latest.version;
-          baselineRef.current = structuredClone(remote);
-          latestRef.current = merged.value;
-          setProjects(merged.value.projects);
-          setCatalog(merged.value.catalog);
-          setConflictPaths(merged.conflicts);
-          setStorageWarning(merged.conflicts.length
-            ? `已合併其他電腦的更新；${merged.conflicts.length} 個同欄位衝突保留這台電腦的內容，正在重新同步…`
-            : "已自動合併其他電腦的更新，正在重新同步…");
-        } else {
+        const message = formatSupabaseError(error);
         acknowledgements.forEach((item) => item.finish(new Error(`${financeSyncError}；${message}`)));
-        const fallback = writeWorkspaceDraft(authUserId, appRole === "admin" ? latestRef.current.projects : durableProjects, latestRef.current.catalog, versionRef.current, true);
+        const fallback = writeWorkspaceDraft(authUserId, latestRef.current.projects, latestRef.current.catalog, versionRef.current, true, baselineRef.current);
           const indexedFallback = await fallback.indexedDb;
           const fallbackErrors = [fallback.localError, indexedFallback.error].filter((storageError): storageError is StorageErrorDetails => !!storageError);
           const durable = durableStorageState(indexedFallback.ok, fallback.local, fallbackErrors);
           setStorageWarning(durable.saved ? `尚未同步：${durable.message}，${message}` : durable.message);
           if (!durable.saved) void storageDiagnostics(authUserId).then((diagnostics) => console.warn("SPC storage diagnostics", diagnostics));
-          void reportClientError(message, "supabase-sync", { version: versionRef.current });
-        }
+          void reportClientError(error, "supabase-sync", { version: versionRef.current });
       } finally {
         savingRef.current = false;
         if (retrySyncRef.current) {
           retrySyncRef.current = false;
-          window.setTimeout(() => setSyncTick((value) => value + 1), 0);
+          window.setTimeout(() => setSyncTick((value) => value + 1), Math.max(600, coordinatorRef.current.nextRetryAt - Date.now()));
         }
       }
       }, 600);
     });
     return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [projects, catalog, ready, syncTick]);
+  }, [projects, catalog, ready, syncTick, conflictPaths]);
   useEffect(() => {
     if (!ready) return;
     const refreshSharedData = async () => {
-      if (!canApplySharedReload(savingRef.current, latestRef.current, baselineRef.current, !!readWorkspaceDraft(authUserId)?.pending)) return;
       try {
-        const snapshot = await loadWorkspace();
-        // Recheck after await: a local edit or save may have started during the request.
-        if (!canApplySharedReload(savingRef.current, latestRef.current, baselineRef.current, !!readWorkspaceDraft(authUserId)?.pending)) return;
-        setActivity(snapshot.activity || []);
-        if (snapshot.version <= versionRef.current) return;
-        const shared = { projects: normalize(snapshot.projects as Project[]), catalog: snapshot.catalog as Product[] };
-        versionRef.current = snapshot.version;
-        baselineRef.current = structuredClone(shared);
-        latestRef.current = shared;
-        setProjects(shared.projects);
-        setCatalog(shared.catalog);
-        setStorageWarning(`已收到其他使用者的更新 · 版本 ${snapshot.version}`);
-      } catch { /* keep the current screen and retry later */ }
+        await coordinatorRef.current.refresh(versionRef.current,
+          () => navigator.onLine && !remoteConflictRef.current && canApplySharedReload(savingRef.current, latestRef.current, baselineRef.current, !!readWorkspaceDraft(authUserId)?.pending),
+          loadWorkspaceVersion, loadWorkspace, (snapshot) => {
+            const shared = { projects: normalize(snapshot.projects as Project[]), catalog: snapshot.catalog as Product[] };
+            versionRef.current = snapshot.version;
+            baselineRef.current = structuredClone(shared);
+            latestRef.current = shared;
+            setProjects(shared.projects); setCatalog(shared.catalog);
+            setActivity(snapshot.activity || []);
+            setStorageWarning(`已收到其他使用者的更新 · 版本 ${snapshot.version}`);
+          });
+      } catch (error) { console.warn("SPC version check", supabaseErrorDetails(error)); }
+
     };
-    const timer = window.setInterval(() => void refreshSharedData(), 8000);
+    const timer = window.setInterval(() => void refreshSharedData(), 30000);
     return () => window.clearInterval(timer);
   }, [ready]);
   useEffect(() => {
     if (!ready) return;
-    const retry = () => setSyncTick((x) => x + 1);
+    const retry = () => { if (coordinatorRef.current.canRetry()) setSyncTick((x) => x + 1); };
     window.addEventListener("online", retry);
     const timer = window.setInterval(() => {
       if (!navigator.onLine) return;
       void loadOfflineDraft<LocalWorkspaceSnapshot>(scopedKey(workspaceDraftKey, authUserId))
-        .then((draft) => { if (draft?.payload.pending) retry(); });
+        .then((draft) => { if (draft?.payload.pending || coordinatorRef.current.attempt) retry(); });
     }, 15000);
     return () => {
       window.removeEventListener("online", retry);
@@ -1340,7 +1362,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     if (!ready) return;
     const refresh = async () => {
       try { setSystemHealth(await getSystemHealth()); }
-      catch (error) { void reportClientError(error instanceof Error ? error.message : String(error), "health-check"); }
+      catch (error) { void reportClientError(error, "health-check"); }
     };
     void refresh();
     const timer = window.setInterval(refresh, 5 * 60 * 1000);
@@ -1379,11 +1401,11 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
     // Publish before React renders or an in-flight reload can finish.
     const next = update(latestRef.current.projects);
     latestRef.current = { projects: next, catalog: latestRef.current.catalog };
-    const storage = writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true);
+    const storage = writeWorkspaceDraft(authUserId, next, latestRef.current.catalog, versionRef.current, true, baselineRef.current);
     setProjects(next);
     if (onDurable) void storage.indexedDb.then((result) => {
-      onDurable(result === true || (typeof result === "object" && result.ok) ? undefined : new Error("工作區未能寫入本機儲存空間"));
-    }, (error) => onDurable(error instanceof Error ? error : new Error(String(error))));
+      onDurable(result.ok ? undefined : new Error("工作區未能寫入本機儲存空間"));
+    }, (error) => onDurable(error instanceof Error ? error : new Error(formatSupabaseError(error))));
   };
   const persistFinance: FinanceSave = (displayed, update, onPending) => new Promise((resolve, reject) => {
     try {
@@ -1406,6 +1428,39 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
       setSyncTick((tick) => tick + 1);
     } catch (error) { reject(error); }
   });
+  const persistReceivable: ReceivableSave = async (projectId, yearMonth, report, acceptances) => {
+    const currentWorkspace = latestRef.current;
+    if (savingRef.current || receivableSavingRef.current || coordinatorRef.current.attempt
+      || intendedFingerprint(currentWorkspace) !== intendedFingerprint(baselineRef.current)) {
+      throw new Error("工作區另有尚未同步的修改，請先等待同步完成；本月應收資料尚未送出");
+    }
+    receivableSavingRef.current = true;
+    try {
+      const input = { expectedVersion: versionRef.current, projectId, yearMonth, report, acceptances };
+      const committed = await saveReceivableReport(input);
+      if (!receivableSaveIsCommitted(input, committed)) {
+        throw withSupabaseErrorContext(new Error("本月應收資料回傳內容無法核對，草稿仍保留"), {
+          action: "receivable-save", phase: "verification", rpc: "spc_save_receivable_report",
+        });
+      }
+      const currentProject = latestRef.current.projects.find((candidate) => candidate.id === projectId && !isDeletedEntity(candidate));
+      const baselineProject = baselineRef.current.projects.find((candidate) => candidate.id === projectId && !isDeletedEntity(candidate));
+      if (!currentProject || !baselineProject) throw new Error("找不到本月應收資料所屬案場，草稿仍保留");
+      const nextCurrentProject = applyCommittedReceivableSave(currentProject, committed);
+      const nextBaselineProject = applyCommittedReceivableSave(baselineProject, committed);
+      const nextCurrent = { ...latestRef.current, projects: latestRef.current.projects.map((candidate) => candidate.id === projectId ? nextCurrentProject : candidate) };
+      const nextBaseline = { ...baselineRef.current, projects: baselineRef.current.projects.map((candidate) => candidate.id === projectId ? nextBaselineProject : candidate) };
+      versionRef.current = committed.version;
+      latestRef.current = nextCurrent;
+      baselineRef.current = nextBaseline;
+      setProjects(nextCurrent.projects);
+      const stillDirty = intendedFingerprint(nextCurrent) !== intendedFingerprint(nextBaseline);
+      writeWorkspaceDraft(authUserId, nextCurrent.projects, nextCurrent.catalog, committed.version, stillDirty, nextBaseline);
+      return nextCurrentProject;
+    } finally {
+      receivableSavingRef.current = false;
+    }
+  };
   const updateCatalog = (products: Product[]) => {
     setCatalog(products);
     latestRef.current.catalog = products;
@@ -1554,7 +1609,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
           </div>
         </div>
         <div className="header-actions">
-          <button type="button" className={`sync sync-button ${!online || offlineState.pending || offlineState.failed ? "storage-alert" : ""}`} onClick={() => setSyncTick((value) => value + 1)} title="點擊重新同步">
+          <button type="button" className={`sync sync-button ${!online || offlineState.pending || offlineState.failed ? "storage-alert" : ""}`} onClick={() => { coordinatorRef.current.requestVerification(); setSyncTick((value) => value + 1); }} title="點擊重新同步">
             {online ? "●" : "○"} {storageWarning || "已與 Supabase 同步"}{offlineState.pending ? ` · ${offlineState.pending} 筆待同步` : ""}{offlineState.photos ? ` · ${offlineState.photos} 張照片` : ""}
           </button>
           {canManageProjects && <><button className="ghost" onClick={exportBackup}>下載備份</button>
@@ -1573,7 +1628,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
         </div>
       </header>
           {showQuickStart && <div className="quick-start"><div><b>第一次使用，照這 5 步即可</b><span>① 選案場　→　② 選戶別　→　③ 開始檢查　→　④ 📷 拍照　→　⑤ 💾 暫存／✓ 完成</span></div><button onClick={() => { localStorage.setItem(scopedKey("spc-quick-start-seen", authUserId), "1"); setShowQuickStart(false); }}>知道了</button></div>}
-      {!!conflictPaths.length && <Modal close={() => undefined} title="偵測到同一筆資料被兩人修改"><div className="form"><div className="warning">系統沒有直接覆蓋資料。共有 {conflictPaths.length} 個相同欄位發生衝突，請選擇要保留哪一版。</div><div className="conflict-list">{conflictPaths.slice(0, 8).map((path) => <code key={path}>{path}</code>)}{conflictPaths.length > 8 && <small>另有 {conflictPaths.length - 8} 個欄位</small>}</div><div className="form-actions"><button className="ghost" onClick={() => { const remote = remoteConflictRef.current; if (remote) { setProjects(remote.projects); setCatalog(remote.catalog); writeWorkspaceDraft(authUserId, remote.projects, remote.catalog, versionRef.current, false); } setConflictPaths([]); }}>使用 Supabase 最新資料</button><button className="primary" onClick={() => { setConflictPaths([]); setSyncTick((value) => value + 1); }}>保留這台電腦內容並重新同步</button></div></div></Modal>}
+      {!!conflictPaths.length && <Modal close={() => undefined} title="偵測到同一筆資料被兩人修改"><div className="form"><div className="warning">系統沒有直接覆蓋資料。共有 {conflictPaths.length} 個相同欄位發生衝突，請選擇要保留哪一版。</div><div className="conflict-list">{conflictPaths.slice(0, 8).map((path) => <code key={path}>{path}</code>)}{conflictPaths.length > 8 && <small>另有 {conflictPaths.length - 8} 個欄位</small>}</div><div className="form-actions"><button className="ghost" onClick={async () => { const remote = remoteConflictRef.current; try { await saveOfflineDraft({ key: scopedKey(`spc-conflict-recovery-${Date.now()}`, authUserId), owner: authUserId, kind: "conflict-recovery", recordId: "workspace", unitId: "", payload: latestRef.current, baseVersion: versionRef.current, updatedBy: authUserId }); } catch (error) { setStorageWarning(formatSupabaseError(error)); return; } if (remote) { latestRef.current = structuredClone(remote); setProjects(remote.projects); setCatalog(remote.catalog); writeWorkspaceDraft(authUserId, remote.projects, remote.catalog, versionRef.current, false); } remoteConflictRef.current = null; coordinatorRef.current.state = "dirty"; setConflictPaths([]); }}>使用 Supabase 最新資料</button><button className="primary" onClick={() => { remoteConflictRef.current = null; coordinatorRef.current.state = "dirty"; setConflictPaths([]); setSyncTick((value) => value + 1); }}>保留這台電腦內容並重新同步</button></div></div></Modal>}
       <div className="shell">
         <aside
           className={menuOpen ? "mobile-open" : ""}
@@ -1731,6 +1786,7 @@ function AdminApp({ authUserId, email, displayName, role, appRole, permissions }
               permissions={permissions}
               patch={patchProject}
               persistFinance={persistFinance}
+              saveReceivable={persistReceivable}
               open={(unitId) => { setFloorContext(null); setUid(unitId); }}
               openFloor={(building, floor) => { if (canUseAcceptance) setFloorContext(createFloorReturnContext(building, floor)); }}
               remove={removeProject}
@@ -2052,6 +2108,7 @@ function Empty() {
 }
 function ProjectArea({
   persistFinance,
+  saveReceivable,
   project,
   view,
   setView,
@@ -2063,6 +2120,7 @@ function ProjectArea({
   remove,
 }: {
   persistFinance: FinanceSave;
+  saveReceivable: ReceivableSave;
   project: Project;
   view: string;
   setView: (x: string) => void;
@@ -2121,7 +2179,7 @@ function ProjectArea({
       {safeView === "daily-acceptance" && <DailyAcceptanceView p={project} patch={patch} canManageFinance={financeAccess.canManageFinance} />}{" "}
       {safeView === "products" && <Products p={project} patch={patch} />}{" "}
       {safeView === "journal" && <Journal p={project} patch={patch} />}{" "}
-      {safeView === "billing" && <Billing key={project.id} p={project} persistFinance={persistFinance} financeAccess={financeAccess} />}{" "}
+      {safeView === "billing" && <Billing key={project.id} p={project} persistFinance={persistFinance} saveReceivable={saveReceivable} financeAccess={financeAccess} />}{" "}
       {safeView === "project" && <ProjectForm p={project} patch={patch} />}
     </>
   );
@@ -5706,11 +5764,15 @@ function UnitJournalTab({ project, u, patch }: { project: Project; u: Unit; patc
   const [journalReady, setJournalReady] = useState(false);
   useEffect(() => {
     let active = true;
-    void loadOfflineDraft<DailyNote>(draftKey(authUserId, "unit-journal", u.id)).then((draft) => {
+    void loadOfflineDraft<DailyNote>(draftKey(authUserId, "unit-journal", u.id), true).then(async (draft) => {
       if (!active) return;
-      if (draft) setEntry(draft.payload);
+      if (draft) {
+        const recovered = await hydratePrivatePhotos(draft.payload).catch(() => { setSaveError("照片暫時無法載入；草稿內容仍可編輯並暫存"); return draft.payload; });
+        if (!active) return;
+        setEntry(recovered);
+      }
       setJournalReady(true);
-    });
+    }).catch((error) => { if (active) setSaveError(`草稿恢復未完成，已保留原始草稿：${formatSupabaseError(error)}`); });
     return () => { active = false; };
   }, [authUserId, u.id]);
   useEffect(() => {
@@ -5976,7 +6038,7 @@ function Journal({
 }
 type BillingUnitDraft = { rate: string; priced: boolean };
 
-function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFinance: FinanceSave; financeAccess: ReturnType<typeof financeUiMode> }) {
+function Billing({ p, persistFinance, saveReceivable, financeAccess }: { p: Project; persistFinance: FinanceSave; saveReceivable: ReceivableSave; financeAccess: ReturnType<typeof financeUiMode> }) {
   const authUserId = useAuthOwner();
   const [financeSaving, setFinanceSaving] = useState(false);
   const [receivableMessage, setReceivableMessage] = useState("");
@@ -6163,42 +6225,51 @@ function Billing({ p, persistFinance, financeAccess }: { p: Project; persistFina
       setFinanceSaving(true);
       setReceivableMessage("尚未完成 Supabase 同步／請勿關閉頁面，正在核對資料…");
       const metadata = receivableReportMetadata(receivableDraft, receivableRecordsRef.current);
+      const recoveryKey = scopedKey(`spc-receivable-save-draft-v1:${p.id}:${ym}`, authUserId);
       try {
         const original = receivableDraftBaseRef.current;
         if (!original) throw new Error("找不到應收明細原始資料，未保存任何修改");
-        let verifiedProject: Project | null = null;
-        await persistFinance(receivableBaseRef.current, (current) => {
-          const withSharedFields = applyReceivableSharedFields(
-            current, receivableRecordsRef.current, original.details, receivableDraft.details,
-          );
-          return { ...withSharedFields,
-            receivableReports: { ...withSharedFields.receivableReports, [ym]: metadata },
-          };
-        }, (next) => {
-          verifiedProject = next;
-          for (const record of receivableRecordsRef.current) {
-            const before = receivableBaseRef.current.units.find((unit) => unit.id === record.unitId)
-              ?.acceptances.find((acceptance) => acceptance.id === record.acceptanceId);
-            const after = next.units.find((unit) => unit.id === record.unitId)
-              ?.acceptances.find((acceptance) => acceptance.id === record.acceptanceId);
-            if (after && JSON.stringify(before?.report) !== JSON.stringify(after.report)) {
-              queueRecordChange(authUserId, "accept", record.unitId, after, "complete");
-            }
-          }
-        });
-        if (verifiedProject) receivableBaseRef.current = verifiedProject;
+        const acceptanceUpdates = buildReceivableAcceptanceUpdates(
+          receivableRecordsRef.current, original.details, receivableDraft.details,
+        );
+        try {
+          await saveOfflineDraft({
+            key: recoveryKey, owner: authUserId, kind: "receivable-save", recordId: `${p.id}:${ym}`, unitId: "",
+            payload: { projectId: p.id, yearMonth: ym, draft: receivableDraft }, baseVersion: 0, updatedBy: authUserId,
+          });
+        } catch (error) {
+          throw withSupabaseErrorContext(error, { action: "receivable-save", phase: "durable", rpc: "indexeddb" });
+        }
+        const verifiedProject = await saveReceivable(p.id, ym, metadata, acceptanceUpdates);
+        receivableBaseRef.current = verifiedProject;
         receivableDraftBaseRef.current = structuredClone(receivableDraft);
+        try { await removeOfflineDraft(recoveryKey); }
+        catch (error) { logStorageException("IndexedDB", "delete", error); }
         setReceivableMessage("✓ 本月應收資料已與 Supabase 同步並核對");
-      } catch (error) { setReceivableMessage(error instanceof Error ? error.message : financeSyncError); }
+      } catch (error) {
+        const details = supabaseErrorDetails(error);
+        void reportClientError(error, "supabase-sync", {
+          action: "receivable-save", phase: details.phase || "save", rpc: details.rpc || "spc_save_receivable_report",
+        });
+        setReceivableMessage(`${financeSyncError}；${formatSupabaseError(error)}`);
+      }
       finally { setFinanceSaving(false); }
     },
-    openReceivablePreview = () => {
+    openReceivablePreview = async () => {
       if (!receivableExportReady || !financeExportProject) return;
       receivableBaseRef.current = p;
       receivableRecordsRef.current = billRecords;
       setReceivableMessage("");
-      const draft = loadReceivableReportDraft(financeExportProject, billRecords, ym);
-      receivableDraftBaseRef.current = structuredClone(draft);
+      const fallback = loadReceivableReportDraft(financeExportProject, billRecords, ym);
+      const recovery = await loadOfflineDraft<{ projectId: string; yearMonth: string; draft: ReceivableExportDraft }>(
+        scopedKey(`spc-receivable-save-draft-v1:${p.id}:${ym}`, authUserId), true,
+      ).catch(() => null);
+      const draft = recovery?.payload.projectId === p.id && recovery.payload.yearMonth === ym
+        ? recovery.payload.draft
+        : fallback;
+      // A recovered draft is still unsaved. Keep the server-backed fallback as
+      // the comparison base so shared acceptance fields are sent on manual retry.
+      receivableDraftBaseRef.current = structuredClone(fallback);
       setReceivableDraft(draft);
       setReceivablePreview(true);
     },

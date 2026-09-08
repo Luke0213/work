@@ -9,10 +9,9 @@ export async function saveUnitJournal<T extends Journal>(input: {
 }) {
   const record = { ...input.entry, draft: input.draft, createdAt: input.entry.createdAt || input.now,
     updatedAt: input.now, createdBy: input.entry.createdBy || input.owner };
-  // Keep recovery data until both the outbox and workspace are durable.
+  // patch only acknowledges LOCAL durability. Cloud verification owns cleanup.
   await input.saveDraft(record);
   await input.queue(record);
   await input.patch([record, ...input.journals.filter((item) => item.id !== record.id)]);
-  if (!input.draft) await input.removeDraft();
   return record;
 }

@@ -4,7 +4,7 @@ import { saveUnitJournal } from "../lib/unit-journal-save.ts";
 import { readFileSync } from "node:fs";
 
 const entry = { id: "j1", content: "驗收內容", photos: [{ id: "p1", data: "unchanged" }], draft: true, createdBy: "", createdAt: "" };
-test("draft and completion upsert one id and wait for durable workspace before removing recovery", async () => {
+test("draft and completion upsert one id and retain recovery after local workspace acknowledgement", async () => {
   let journals: typeof entry[] = [];
   const events: string[] = [];
   for (const draft of [true, true, false]) {
@@ -14,7 +14,7 @@ test("draft and completion upsert one id and wait for durable workspace before r
     assert.equal(journals.length, 1); assert.equal(journals[0].draft, draft);
     assert.equal(result.createdBy, "known-owner"); assert.equal(result.photos, entry.photos);
   }
-  assert.deepEqual(events, ["draft", "queue", "patch", "draft", "queue", "patch", "draft", "queue", "patch", "remove"]);
+  assert.deepEqual(events, ["draft", "queue", "patch", "draft", "queue", "patch", "draft", "queue", "patch"]);
   assert.equal(entry.draft, true);
 });
 

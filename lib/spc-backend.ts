@@ -1,7 +1,10 @@
+import { uploadUnresolvedPhotos } from "./photo-persistence.ts";
 import { supabase } from "./supabase";
 import { readPhotoCleanupQueue, scopedStorageKey, writePhotoCleanupQueue } from "./auth-storage";
 import { logStorageException } from "./storage-durability.ts";
-import type { ExportProject } from "./acceptance-exports";
+import type { ExportProject, ReceivableReportMetadata } from "./acceptance-exports";
+import type { ReceivableAcceptanceUpdate, ReceivableSaveResult } from "./finance-persistence.ts";
+import { withSupabaseErrorContext, type SupabaseOperationContext } from "./supabase-error.ts";
 
 export type EntityActivity = {
   entityType: string;
@@ -36,7 +39,7 @@ function photoPath(value: string): string | null {
   return null;
 }
 
-async function hydratePrivatePhotos<T>(value: T): Promise<T> {
+export async function hydratePrivatePhotos<T>(value: T): Promise<T> {
   const cloned = structuredClone(value) as unknown;
   const records: Array<Record<string, unknown>> = [];
   const paths = new Set<string>();
@@ -78,13 +81,22 @@ function serializePrivatePhotos<T>(value: T): T {
   return cloned as T;
 }
 
-export async function loadWorkspace(): Promise<WorkspaceSnapshot> {
+export async function loadWorkspace(context: Pick<SupabaseOperationContext, "action" | "phase"> = { action: "workspace-load", phase: "load" }): Promise<WorkspaceSnapshot> {
   const { data, error } = await supabase.rpc("spc_load_workspace");
-  if (error) throw error;
+  if (error) throw withSupabaseErrorContext(error, { ...context, rpc: "spc_load_workspace" });
   const snapshot = (data || { version: 0, projects: [], catalog: [] }) as WorkspaceSnapshot;
-  const { data: activity } = await supabase.rpc("spc_load_entity_activity");
-  snapshot.activity = (activity || []) as EntityActivity[];
-  return hydratePrivatePhotos(snapshot);
+  const activityResult = await supabase.rpc("spc_load_entity_activity");
+  if (activityResult.error) throw withSupabaseErrorContext(activityResult.error, { ...context, rpc: "spc_load_entity_activity" });
+  snapshot.activity = (activityResult.data || []) as EntityActivity[];
+  try { return await hydratePrivatePhotos(snapshot); }
+  catch (error) { throw withSupabaseErrorContext(error, { ...context, rpc: "storage.createSignedUrls" }); }
+}
+
+export async function loadWorkspaceVersion(): Promise<number> {
+  const { data, error } = await supabase.rpc("spc_workspace_version");
+  if (error) throw error; // Never fall back to downloading the workspace in a poll.
+  if (!Number.isSafeInteger(Number(data)) || data === null) throw new Error("SPC_INVALID_WORKSPACE_VERSION");
+  return Number(data);
 }
 
 export async function loadFinanceExportData(): Promise<FinanceExportData> {
@@ -126,38 +138,42 @@ export async function saveWorkspace(
   };
   const { data, error } = await supabase.rpc("spc_merge_workspace", payload);
   if (!error) return Number((data as { version?: number } | null)?.version ?? data);
-  if (error.code !== "42883" && error.code !== "PGRST202") throw error;
+  if (error.code !== "42883" && error.code !== "PGRST202") throw withSupabaseErrorContext(error, { action: "workspace-save", phase: "save", rpc: "spc_merge_workspace" });
   const legacy = await supabase.rpc("spc_save_workspace", {
     p_expected_version: expectedVersion, p_projects: serializePrivatePhotos(projects), p_catalog: catalog,
   });
-  if (legacy.error) throw legacy.error;
+  if (legacy.error) throw withSupabaseErrorContext(legacy.error, { action: "workspace-save", phase: "save", rpc: "spc_save_workspace" });
   return Number(legacy.data);
 }
 
-function extension(type: string) {
-  return type === "image/png" ? "png" : type === "image/webp" ? "webp" : "jpg";
+export async function saveReceivableReport(input: {
+  expectedVersion: number;
+  projectId: string;
+  yearMonth: string;
+  report: ReceivableReportMetadata;
+  acceptances: ReceivableAcceptanceUpdate[];
+}): Promise<ReceivableSaveResult> {
+  const { data, error } = await supabase.rpc("spc_save_receivable_report", {
+    p_expected_version: input.expectedVersion,
+    p_project_id: input.projectId,
+    p_year_month: input.yearMonth,
+    p_report: input.report,
+    p_acceptance_updates: input.acceptances,
+  });
+  if (error) throw withSupabaseErrorContext(error, { action: "receivable-save", phase: "save", rpc: "spc_save_receivable_report" });
+  return data as ReceivableSaveResult;
 }
 
-export async function uploadEmbeddedPhotos<T>(value: T): Promise<T> {
-  const cloned = structuredClone(value) as unknown;
-  const visit = async (node: unknown): Promise<void> => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) { for (const item of node) await visit(item); return; }
-    const record = node as Record<string, unknown>;
-    if (typeof record.id === "string" && typeof record.data === "string" && record.data.startsWith("data:image/")) {
-      const blob = await (await fetch(record.data)).blob();
-      if (blob.size > 10 * 1024 * 1024) throw new Error("單張照片不可超過 10MB");
-      const path = `spc/${record.id}.${extension(blob.type)}`;
-      const { error } = await supabase.storage.from("spc-photos").upload(path, blob, { contentType: blob.type, upsert: true });
-      if (error) throw error;
-      const { data: signed, error: signedError } = await supabase.storage.from("spc-photos").createSignedUrl(path, 60 * 60);
-      if (signedError) throw signedError;
-      record.data = signed.signedUrl;
-    }
-    for (const child of Object.values(record)) await visit(child);
-  };
-  await visit(cloned);
-  return cloned as T;
+export async function uploadEmbeddedPhotos<T>(value: T, checkpoint?: (value: T) => Promise<void>): Promise<T> {
+  return uploadUnresolvedPhotos(value, async (path, blob) => {
+    const { error } = await supabase.storage.from("spc-photos").upload(path, blob, { contentType: blob.type, upsert: false });
+    if (!error) return;
+    if (String((error as { statusCode?: string }).statusCode) !== "409") throw error;
+    const existing = await supabase.storage.from("spc-photos").download(path);
+    if (existing.error) throw existing.error;
+    const digest = async (content: Blob) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await content.arrayBuffer()))).join(",");
+    if (await digest(existing.data) !== await digest(blob)) throw new Error("SPC_PHOTO_CONTENT_CONFLICT：既有照片不同，已保留來源並停止同步");
+  }, checkpoint);
 }
 
 export function storagePhotoPaths(value: unknown): Set<string> {

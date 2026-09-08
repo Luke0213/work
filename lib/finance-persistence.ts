@@ -1,6 +1,7 @@
 import { threeWayMerge, isDeletedEntity } from "./three-way-merge.ts";
-import type { AcceptanceExportRecord, AcceptanceReportMetadata, ReceivableDetailDraft } from "./acceptance-exports.ts";
+import type { AcceptanceExportRecord, AcceptanceReportMetadata, ReceivableDetailDraft, ReceivableReportMetadata } from "./acceptance-exports.ts";
 import { containsWorkspaceChanges } from "./workspace-persistence.ts";
+import { intendedFingerprint } from "./sync-coordinator.ts";
 
 export const updateReportSource = <T extends { acceptances: Array<{ id: string; report?: AcceptanceReportMetadata }> }>(unit: T, draft: AcceptanceReportMetadata & { unitId: string; acceptanceId: string }): T => ({
   ...unit,
@@ -90,7 +91,7 @@ type ReceivableAcceptance = {
 };
 type ReceivableUnit = { id: string; acceptances: ReceivableAcceptance[] };
 
-const receivableSharedFields = [
+export const receivableSharedFields = [
   ["date", "shipmentDateText"],
   ["model", "productText"],
   ["unitDisplay", "unitDisplayText"],
@@ -98,6 +99,57 @@ const receivableSharedFields = [
   ["unitPrice", "unitPriceText"],
   ["note", "noteText"],
 ] as const satisfies ReadonlyArray<readonly [keyof ReceivableDetailDraft, keyof AcceptanceReportMetadata]>;
+
+export type ReceivableAcceptanceFields = Partial<Pick<AcceptanceReportMetadata,
+  "shipmentDateText" | "productText" | "unitDisplayText" | "pingText" | "unitPriceText" | "noteText">>;
+export type ReceivableAcceptanceUpdate = { unitId: string; acceptanceId: string; fields: ReceivableAcceptanceFields };
+export type ReceivableSaveResult = {
+  version: number;
+  projectId: string;
+  yearMonth: string;
+  report: ReceivableReportMetadata;
+  acceptances: ReceivableAcceptanceUpdate[];
+};
+
+export function buildReceivableAcceptanceUpdates(
+  records: AcceptanceExportRecord[], original: ReceivableDetailDraft[], edited: ReceivableDetailDraft[],
+): ReceivableAcceptanceUpdate[] {
+  if (records.length !== original.length || records.length !== edited.length) {
+    throw new Error("應收明細列已變更，未保存任何修改");
+  }
+  return records.map((record, index) => {
+    if (!record.unitId || !record.acceptanceId) throw new Error("找不到應收明細對應的正式驗收紀錄，未保存任何修改");
+    const fields: ReceivableAcceptanceFields = {};
+    for (const [detailKey, reportKey] of receivableSharedFields) {
+      if (edited[index][detailKey] !== original[index][detailKey]) fields[reportKey] = edited[index][detailKey];
+    }
+    return { unitId: record.unitId, acceptanceId: record.acceptanceId, fields };
+  }).filter((update) => Object.keys(update.fields).length > 0);
+}
+
+export function receivableSaveIsCommitted(input: {
+  projectId: string; yearMonth: string; report: ReceivableReportMetadata; acceptances: ReceivableAcceptanceUpdate[];
+}, committed: ReceivableSaveResult): boolean {
+  return committed.projectId === input.projectId
+    && committed.yearMonth === input.yearMonth
+    && Number.isSafeInteger(committed.version)
+    && intendedFingerprint(committed.report) === intendedFingerprint(input.report)
+    && intendedFingerprint(committed.acceptances) === intendedFingerprint(input.acceptances);
+}
+
+export function applyCommittedReceivableSave<T extends { id: string; receivableReports?: Record<string, ReceivableReportMetadata>; units: Array<{
+  id: string; acceptances: Array<{ id: string; report?: AcceptanceReportMetadata }>;
+}> }>(project: T, committed: ReceivableSaveResult): T {
+  if (project.id !== committed.projectId) return project;
+  const updates = new Map(committed.acceptances.map((update) => [`${update.unitId}:${update.acceptanceId}`, update.fields]));
+  return { ...project,
+    receivableReports: { ...project.receivableReports, [committed.yearMonth]: committed.report },
+    units: project.units.map((unit) => ({ ...unit, acceptances: unit.acceptances.map((acceptance) => {
+      const fields = updates.get(`${unit.id}:${acceptance.id}`);
+      return fields ? { ...acceptance, report: { ...acceptance.report, ...fields } } : acceptance;
+    }) })),
+  };
+}
 
 export function applyReceivableSharedFields<
   T extends { units: U[] },

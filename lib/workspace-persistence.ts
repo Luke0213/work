@@ -1,10 +1,5 @@
+import { photoReference } from "./photo-reference.ts";
 import { isProtectedEntityCollection } from "./three-way-merge.ts";
-
-const storageScheme = "spc-storage://";
-const storageMarkers = [
-  "/storage/v1/object/public/spc-photos/",
-  "/storage/v1/object/sign/spc-photos/",
-] as const;
 
 const record = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
@@ -13,16 +8,6 @@ const isEntityArray = (value: unknown): value is Array<Record<string, unknown> &
   Array.isArray(value) && value.every((item) => record(item) && typeof item.id === "string");
 const isNonEmptyEntityArray = (value: unknown): value is Array<Record<string, unknown> & { id: string }> =>
   isEntityArray(value) && value.length > 0;
-
-function photoReference(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  if (value.startsWith(storageScheme)) return value.slice(storageScheme.length);
-  for (const marker of storageMarkers) {
-    const index = value.indexOf(marker);
-    if (index >= 0) return decodeURIComponent(value.slice(index + marker.length).split("?")[0]);
-  }
-  return null;
-}
 
 function changedValueIsCommitted(base: unknown, intended: unknown, committed: unknown, path = ""): boolean {
   if (equal(base, intended)) return true;

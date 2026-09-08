@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { applyBillingChanges, applyReceivableSharedFields, canApplySharedReload, containsChanges, financeSnapshot, rebaseProjectEdit, updateReportSource } from "../lib/finance-persistence.ts";
+import { applyBillingChanges, applyCommittedReceivableSave, applyReceivableSharedFields, buildReceivableAcceptanceUpdates, canApplySharedReload, containsChanges, financeSnapshot, receivableSaveIsCommitted, rebaseProjectEdit, updateReportSource } from "../lib/finance-persistence.ts";
 import { buildAcceptanceExportRecord, buildAcceptanceExportRecords, loadReceivableReportDraft, receivableReportMetadata, createShipmentWorkbook, shipmentDisplayValues } from "../lib/acceptance-exports.ts";
 import { buildDailyAcceptanceEntries } from "../lib/daily-acceptances.ts";
 import { threeWayMerge } from "../lib/three-way-merge.ts";
@@ -195,6 +195,32 @@ test("receivable shared save fails closed and preserves unrelated acceptance dat
   assert.throws(() => applyReceivableSharedFields(protectedProject, records, [], edited.details));
 });
 
+test("targeted receivable payload and committed DTO cover only changed report fields", () => {
+  const source: any = reload({ ...project, units: [
+    { ...project.units[0], acceptances: [{ ...project.units[0].acceptances[0], report: { noteText: "old", vendorText: "keep" } }] },
+    { ...project.units[0], id: "u2", acceptances: [{ ...project.units[0].acceptances[0], id: "a2" }] },
+  ] });
+  const records = buildAcceptanceExportRecords(source).filter((record) => record.unitId === "u1");
+  const original = loadReceivableReportDraft(source, records, "2026-09");
+  const edited = reload(original);
+  edited.details[0].note = "new note";
+  edited.details[0].unitPrice = "1200";
+  edited.details[0].sizeCm = "18x122";
+  const acceptances = buildReceivableAcceptanceUpdates(records, original.details, edited.details);
+  assert.deepEqual(acceptances, [{ unitId: "u1", acceptanceId: "a1", fields: { unitPriceText: "1200", noteText: "new note" } }]);
+  const report = receivableReportMetadata(edited, records);
+  const committed = { version: 8, projectId: "p1", yearMonth: "2026-09", report, acceptances };
+  assert.equal(receivableSaveIsCommitted({ projectId: "p1", yearMonth: "2026-09", report, acceptances }, committed), true);
+  assert.equal(receivableSaveIsCommitted({ projectId: "p1", yearMonth: "2026-09", report, acceptances }, { ...committed, acceptances: [] }), false);
+  const saved: any = applyCommittedReceivableSave(source, committed);
+  assert.equal(saved.receivableReports["2026-09"].detailsByUnit.u1.sizeCm, "18x122");
+  assert.equal(saved.units[0].acceptances[0].report.unitPriceText, "1200");
+  assert.equal(saved.units[0].acceptances[0].report.noteText, "new note");
+  assert.equal(saved.units[0].acceptances[0].report.vendorText, "keep");
+  assert.deepEqual(saved.units[0].acceptances[0].photos, source.units[0].acceptances[0].photos);
+  assert.deepEqual(saved.units[1], source.units[1]);
+});
+
 test("receivable-only metadata remains scoped by month", () => {
   const records = buildAcceptanceExportRecords(project);
   const september = loadReceivableReportDraft(project, records, "2026-09");
@@ -283,17 +309,20 @@ test("conflict retry merges edits made while save was awaiting a response", () =
 test("save wiring verifies reload before baseline/outbox acknowledgement and awaits explicit saves", () => {
   const source = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
   const save = source.slice(source.indexOf("const saveState ="), source.indexOf("const refreshSharedData ="));
-  assert.ok(save.indexOf("await loadWorkspace()") < save.indexOf("containsChanges("));
+  assert.ok(save.indexOf('loadWorkspace({ action: "workspace-save", phase: phase || "verification" })') < save.indexOf("containsChanges("));
   assert.ok(save.indexOf("containsChanges(") < save.indexOf("baselineRef.current = structuredClone(shared)"));
   assert.ok(save.indexOf("containsChanges(") < save.indexOf("completeSyncedOutbox"));
   assert.doesNotMatch(save, /catch \{ \/\* the save succeeded/);
-  assert.match(save, /threeWayMerge\(saveBase, latestRef.current, remote\)/);
+  assert.match(save, /threeWayMerge\(result\.attempt\.source, latestRef.current, shared\)/);
   const billing = source.slice(source.indexOf("function Billing("), source.indexOf("type CompletionExportDraft"));
   assert.match(billing, /await persistFinance\(billingBaseRef.current/);
   assert.match(billing, /await persistFinance\(reportBaseRef.current/);
-  assert.match(billing, /await persistFinance\(receivableBaseRef.current/);
-  assert.ok(billing.indexOf("applyReceivableSharedFields(") < billing.indexOf("receivableReports: { ...withSharedFields.receivableReports"));
-  assert.ok(billing.indexOf("await persistFinance(receivableBaseRef.current") < billing.indexOf("setReceivableMessage(\"✓ 本月應收資料已與 Supabase 同步並核對\")"));
+  const receivableSave = billing.slice(billing.indexOf("saveReceivableSource = async"), billing.indexOf("openReceivablePreview = async"));
+  assert.match(receivableSave, /buildReceivableAcceptanceUpdates\(/);
+  assert.match(receivableSave, /await saveOfflineDraft\(/);
+  assert.match(receivableSave, /await saveReceivable\(p.id, ym, metadata, acceptanceUpdates\)/);
+  assert.ok(receivableSave.indexOf("await saveReceivable(") < receivableSave.indexOf("await removeOfflineDraft(recoveryKey)"));
+  assert.doesNotMatch(receivableSave, /persistFinance|applyReceivableSharedFields|saveWorkspace|loadWorkspace|spc_merge_workspace/);
   assert.doesNotMatch(billing, /patch\(\{ units: p.units/);
   assert.doesNotMatch(billing, /\?{4}/);
 });

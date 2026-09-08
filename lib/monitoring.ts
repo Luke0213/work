@@ -1,12 +1,16 @@
 import { supabase } from "./supabase";
+import { formatSupabaseError, supabaseErrorDetails } from "./supabase-error.ts";
 
 export type SystemHealth = {
   projects: number; units: number; errors24h: number; backups: number;
   latestBackup: string | null; storageFiles: number; storageBytes: number;
 };
 
-export async function reportClientError(message: string, source = "browser", detail: Record<string, unknown> = {}) {
-  await supabase.rpc("spc_report_error", { p_message: message, p_source: source, p_detail: detail });
+export async function reportClientError(error: unknown, source = "browser", detail: Record<string, unknown> = {}) {
+  await supabase.rpc("spc_report_error", {
+    p_message: formatSupabaseError(error), p_source: source,
+    p_detail: { ...detail, ...(typeof error === "object" && error ? { error: supabaseErrorDetails(error) } : {}) },
+  });
 }
 
 export async function getSystemHealth(): Promise<SystemHealth> {
